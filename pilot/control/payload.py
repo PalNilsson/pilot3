@@ -30,6 +30,7 @@ from pilot.util.processes import threads_aborted
 from pilot.util.queuehandling import put_in_queue
 from pilot.common.errorcodes import ErrorCodes
 from pilot.common.exception import ExcThread
+from pilot.util.realtimelogger import get_realtimeLogger
 
 import logging
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ def control(queues, traces, args):
     :return:
     """
 
-    targets = {'validate_pre': validate_pre, 'execute_payloads': execute_payloads, 'validate_post': validate_post,
+    targets = {'validate_pre': validate_pre, 'execute_payloads': execute_payloads, 'run_realtimelog':run_realtimelog, 'validate_post': validate_post,
                'failed_post': failed_post}
     threads = [ExcThread(bucket=queue.Queue(), target=target, kwargs={'queues': queues, 'traces': traces, 'args': args},
                          name=name) for name, target in list(targets.items())]  # Python 3
@@ -116,6 +117,7 @@ def validate_pre(queues, traces, args):
 
         if _validate_payload(job):
             #queues.validated_payloads.put(job)
+            put_in_queue(job, queues.realtimelog_payloads)
             put_in_queue(job, queues.validated_payloads)
         else:
             #queues.failed_payloads.put(job)
@@ -314,6 +316,48 @@ def execute_payloads(queues, traces, args):  # noqa: C901
         logger.debug('will not set job_aborted yet')
 
     logger.info('[payload] execute_payloads thread has finished')
+
+
+#yesw-Beg
+def run_realtimelog(queues, traces, args):
+    """
+    Validate finished payloads.
+    If payload finished correctly, add the job to the data_out queue. If it failed, add it to the data_out queue as
+    well but only for log stage-out (in failed_post() below).
+
+    :param queues: internal queues for job handling.
+    :param traces: tuple containing internal pilot states.
+    :param args: Pilot arguments (e.g. containing queue name, queuedata dictionary, etc).
+    :return:
+    """
+
+    while not args.graceful_stop.is_set():
+        time.sleep(0.5)
+        try:
+            job = queues.realtimelog_payloads.get(block=True, timeout=1)
+        except queue.Empty:
+            continue
+
+        realtimeLogger = get_realtimeLogger(args)
+
+        # If not realtime logger is found, do nothinng and exit
+        if realtimeLogger is None:
+            logger.debug('realtime Logger is NOT found, exit now')
+            break
+        else:
+            logger.debug('realtime Logger is found')
+
+        realtimeLogger.sendingLogs(args, job)
+
+    # proceed to set the job_aborted flag?
+    if threads_aborted():
+        logger.debug('will proceed to set job_aborted')
+        args.job_aborted.set()
+    else:
+        logger.debug('will not set job_aborted yet')
+
+    logger.info('[payload] run_realTimeLog thread has finished')
+#yesw-end
 
 
 def set_cpu_consumption_time(job):

@@ -337,6 +337,17 @@ def get_args():
                             default=True,
                             help='Use rucio traces')
 
+    # RealTimeLogger options
+    arg_parser.add_argument('--realtime-logserver',
+                            dest='realtime_logserver',
+                            default=None,
+                            help='Type and/name of realtime logger')
+
+    arg_parser.add_argument('--realtime-logname',
+                            dest='realtime_logname',
+                            default=None,
+                            help='The log name in the realtime logger')
+
     # HPC options
     arg_parser.add_argument('--hpc-resource',
                             dest='hpc_resource',
