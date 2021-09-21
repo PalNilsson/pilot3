@@ -337,7 +337,7 @@ def run_realtimelog(queues, traces, args):
         except queue.Empty:
             continue
 
-        realtime_logger = get_realtimeLogger(args)
+        realtime_logger = get_realtime_logger(args)
 
         # If not realtime logger is found, do nothinng and exit
         if realtime_logger is None:
