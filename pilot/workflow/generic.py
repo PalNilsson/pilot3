@@ -126,6 +126,7 @@ def run(args):
     queues.current_data_in = queue.Queue()
     queues.validated_jobs = queue.Queue()
     queues.validated_payloads = queue.Queue()
+    queues.realtimelog_payloads = queue.Queue()
     queues.monitored_payloads = queue.Queue()
 
     queues.finished_jobs = queue.Queue()

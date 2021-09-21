@@ -37,11 +37,12 @@ class RealTimeLogger(Logger):
         self.logFiles = []
         self.openFiles = {}
 
-        name = args.realtime_logname
-        if name:
-            logServer = args.realtime_logserver
-        else:
-            logServer = ""
+        if args.use_realtime_logging:
+            name = args.realtime_logname
+            if name:
+                logServer = args.realtime_logging_server
+            else:
+                logServer = ""
         items = logServer.split(':')
         logType = items[0].lower()
         h = None

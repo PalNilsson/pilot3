@@ -319,13 +319,17 @@ def get_args():
                             help='Cleanup work directory after pilot has finished')
     arg_parser.add_argument('--use-realtime-logging',
                             dest='use_realtime_logging',
-                            type=str2bool,
+                            action='store_true',
                             default=False,
-                            help='Use near real-time logging')
+                            help='Use near real-time logging, default=False')
     arg_parser.add_argument('--realtime-logging-server',
                             dest='realtime_logging_server',
-                            default='',
-                            help='Near real-time logging server')
+                            default=None,
+                            help='Type[/host/port] of realtime logging server, in syntax type[:host:port]')
+    arg_parser.add_argument('--realtime-logname',
+                            dest='realtime_logname',
+                            default=None,
+                            help='The log name in the realtime logging server')
 
     # Harvester and Nordugrid specific options
     arg_parser.add_argument('--input-dir',
@@ -345,17 +349,6 @@ def get_args():
                             type=str2bool,
                             default=True,
                             help='Use rucio traces')
-
-    # RealTimeLogger options
-    arg_parser.add_argument('--realtime-logserver',
-                            dest='realtime_logserver',
-                            default=None,
-                            help='Type and/name of realtime logger')
-
-    arg_parser.add_argument('--realtime-logname',
-                            dest='realtime_logname',
-                            default=None,
-                            help='The log name in the realtime logger')
 
     # HPC options
     arg_parser.add_argument('--hpc-resource',
