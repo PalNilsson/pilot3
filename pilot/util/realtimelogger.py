@@ -56,10 +56,10 @@ class RealTimeLogger(Logger):
         elif logtype == "fluent":
             if len(items) < 3:
                 RealTimeLogger.glogger = None
-            fluentServer = items[1]
-            fluentPort = items[2]
+            fluentserver = items[1]
+            fluentport = items[2]
             from fluent import handler
-            h = handler.FluentHandler(name, host=fluentServer, port=fluentPort)
+            h = handler.FluentHandler(name, host=fluentserver, port=fluentport)
 
         elif logtype == "logstash":
             pass
@@ -91,16 +91,16 @@ class RealTimeLogger(Logger):
             logobj["message"] = msg
         self.info(logobj)
 
-    def add_logfiles(self, jobOrFilenames, reset=True):
+    def add_logfiles(self, job_or_filenames, reset=True):
         self.close_files()
         if reset:
             self.logFiles = []
-        if type(jobOrFilenames) == list:
-            logfiles = jobOrFilenames
+        if type(job_or_filenames) == list:
+            logfiles = job_or_filenames
             for logfile in logfiles:
                 self.logfiles += [logfile]
         else:
-            job = jobOrFilenames
+            job = job_or_filenames
             stdout = os.path.join(job.workdir, config.Payload.payloadstdout)
             self.logFiles += [stdout]
             stderr = os.path.join(job.workdir, config.Payload.payloadstderr)
