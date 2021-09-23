@@ -10,6 +10,7 @@
 import os
 import time
 import json
+import re
 from pilot.util.config import config
 from logging import Logger, INFO
 import logging
@@ -19,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_realtime_logger(args=None):
-    if RealTimeLogger.gLogger is None:
+    if RealTimeLogger.glogger is None:
         RealTimeLogger(args)
-    return RealTimeLogger.gLogger
+    return RealTimeLogger.glogger
 
 
 # RealTimeLogger is called if args.realTimeLogger is on
@@ -34,6 +35,7 @@ class RealTimeLogger(Logger):
 
         self.jobInfo = {}
         self.logFiles = []
+        self.logFiles_default = []
         self.openFiles = {}
 
         if args.use_realtime_logging:
@@ -42,6 +44,10 @@ class RealTimeLogger(Logger):
                 logserver = args.realtime_logging_server
             else:
                 logserver = ""
+            logfiles = os.environ.get('REALTIME_LOGFILES')
+            if logfiles is not None:
+                self.logFiles_default = re.split('[:,]', logfiles)
+               
         items = logserver.split(':')
         logtype = items[0].lower()
         h = None
@@ -101,10 +107,15 @@ class RealTimeLogger(Logger):
                 self.logfiles += [logfile]
         else:
             job = job_or_filenames
-            stdout = os.path.join(job.workdir, config.Payload.payloadstdout)
-            self.logFiles += [stdout]
-            stderr = os.path.join(job.workdir, config.Payload.payloadstderr)
-            self.logFiles += [stderr]
+            for logfile in self.logFiles_default:
+                if not logfile.startswith('/'):
+                    logfile = os.path.join(job.workdir, logfile)
+                self.logFiles += [logfile]
+            if len(self.logFiles_default) == 0:
+                stdout = os.path.join(job.workdir, config.Payload.payloadstdout)
+                self.logFiles += [stdout]
+                # stderr = os.path.join(job.workdir, config.Payload.payloadstderr)
+                # self.logFiles += [stderr]
         if len(self.logFiles) > 0:
             logger.info('Added log files:%s', self.logFiles)
 
@@ -137,9 +148,7 @@ class RealTimeLogger(Logger):
                                 openfile = open(logfile)
                                 openfile.seek(0)
                                 self.openFiles[logfile] = openfile
-                                logger.debug('Opened log files:%s', logfile)
-                            else:
-                                self.openFiles[logfile] = None
+                                logger.debug('Opened logfile:%s', logfile)
                 self.send_loginfiles()
             else:
                 self.send_loginfiles()  # send the remaining logs after the job completion

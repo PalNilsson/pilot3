@@ -326,6 +326,10 @@ def get_args():
                             dest='realtime_logging_server',
                             default=None,
                             help='Type[/host/port] of realtime logging server, in syntax type[:host:port]')
+    # arg_parser.add_argument('--realtime-logfiles',
+    #                         dest='realtime_logfiles',
+    #                         default=None,
+    #                         help='The log filenames to be sent to the realtime logging server')
     arg_parser.add_argument('--realtime-logname',
                             dest='realtime_logname',
                             default=None,
