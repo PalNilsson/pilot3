@@ -47,7 +47,7 @@ class RealTimeLogger(Logger):
             logfiles = os.environ.get('REALTIME_LOGFILES')
             if logfiles is not None:
                 self.logFiles_default = re.split('[:,]', logfiles)
-               
+
         items = logserver.split(':')
         logtype = items[0].lower()
         h = None
