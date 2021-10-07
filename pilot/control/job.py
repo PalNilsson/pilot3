@@ -1852,7 +1852,7 @@ def retrieve(queues, traces, args):  # noqa: C901
         if not res:
             getjob_failures += 1
             if getjob_failures >= args.getjob_failures:
-                logger.warning('did not get a job -- max number of job request failures reached: %d', getjob_failures)
+                logger.warning('did not get a job -- max number of job request failures reached: %d -- setting graceful stop', getjob_failures)
                 args.graceful_stop.set()
                 break
 
@@ -1869,8 +1869,8 @@ def retrieve(queues, traces, args):  # noqa: C901
             if 'StatusCode' in res and res['StatusCode'] != '0' and res['StatusCode'] != 0:
                 getjob_failures += 1
                 if getjob_failures >= args.getjob_failures:
-                    logger.warning('did not get a job -- max number of job request failures reached: %d',
-                                   getjob_failures)
+                    logger.warning('did not get a job -- max number of job request failures reached: %d -- setting graceful stop', getjob_failures)
+                    args.graceful_stop.set()
                     break
 
                 logger.warning('did not get a job -- sleep 60s and repeat -- status: %s', res['StatusCode'])

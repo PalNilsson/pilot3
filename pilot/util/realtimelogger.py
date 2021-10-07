@@ -47,7 +47,7 @@ class RealTimeLogger(Logger):
             logfiles = os.environ.get('REALTIME_LOGFILES')
             if logfiles is not None:
                 self.logFiles_default = re.split('[:,]', logfiles)
-
+               
         items = logserver.split(':')
         logtype = items[0].lower()
         h = None
@@ -135,10 +135,8 @@ class RealTimeLogger(Logger):
 
     def sending_logs(self, args, job):
         logger.info('Starting RealTimeLogger.sending_logs')
-        if len(self.jobInfo) == 0:
-            self.set_jobinfo(job)
-        if len(self.logFiles) == 0:
-            self.add_logfiles(job)
+        self.set_jobinfo(job)
+        self.add_logfiles(job)
         while not args.graceful_stop.is_set():
             if job.state == '' or job.state == 'starting' or job.state == 'running':
                 if len(self.logFiles) > len(self.openFiles):
