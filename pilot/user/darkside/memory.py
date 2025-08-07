@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,33 +17,30 @@
 # under the License.
 #
 # Authors:
-# - Alexey Anisenkov, anisyonk@cern.ch, 2018
-# - Paul Nilsson, paul.nilsson@cern.ch, 2023
-
-"""
-Job specific Info Service
-It could customize/overwrite settings provided by the main Info Service
-
-:author: Alexey Anisenkov
-:contact: anisyonk@cern.ch
-:date: January 2018
-"""
-
-from .infoservice import InfoService
-from .jobinfo import JobInfoProvider
-
-import logging
-logger = logging.getLogger(__name__)
+# - Paul Nilsson, paul.nilsson@cern.ch, 2018-24
 
 
-class JobInfoService(InfoService):  ## TO BE DEPRECATED/REMOVED
+def allow_memory_usage_verifications() -> bool:
     """
-        Info service: Job specific
-        Job could overwrite settings provided by Info Service
+    Return True if memory usage verifications should be performed.
 
-        *** KEPT for a while in repo .. most probably will be deprecated and removed soon **
+    :return: False for generic jobs (bool).
     """
+    return False
 
-    def __init__(self, job):
 
-        self.jobinfo = JobInfoProvider(job)
+def memory_usage(job: object, resource_type: str) -> tuple[int, str]:
+    """
+    Perform memory usage verification.
+
+    :param job: job object (object)
+    :param resource_type: resource type (str)
+    :return: exit code (int), diagnostics (str).
+    """
+    if job or resource_type:  # to bypass pylint score 0
+        pass
+
+    exit_code = 0
+    diagnostics = ""
+
+    return exit_code, diagnostics

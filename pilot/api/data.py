@@ -20,7 +20,7 @@
 # - Mario Lassnig, mario.lassnig@cern.ch, 2017
 # - Paul Nilsson, paul.nilsson@cern.ch, 2017-2024
 # - Tobias Wegner, tobias.wegner@cern.ch, 2017-2018
-# - Alexey Anisenkov, anisyonk@cern.ch, 2018-2019
+# - Alexey Anisenkov, anisyonk@cern.ch, 2018-2024
 
 """API for data transfers."""
 
@@ -80,8 +80,14 @@ class StagingClient:
     # list of allowed schemas to be used for transfers from REMOTE sites
     remoteinput_allowed_schemas = ['root', 'gsiftp', 'dcap', 'srm', 'storm', 'https']
 
-    def __init__(self, infosys_instance: Any = None, acopytools: dict = None, logger: Any = None,
-                 default_copytools: str = 'rucio', trace_report: dict = None, ipv: str = 'IPv6', workdir: str = ""):
+    def __init__(self,
+                 infosys_instance: Any = None,
+                 acopytools: dict = None,
+                 logger: Any = None,
+                 default_copytools: str = 'rucio',
+                 trace_report: dict = None,
+                 ipv: str = 'IPv6',
+                 workdir: str = ""):
         """
         Set default/init values.
 
@@ -125,7 +131,7 @@ class StagingClient:
         self.trace_report = trace_report if trace_report else TraceReport(pq=os.environ.get('PILOT_SITENAME', ''), ipv=self.ipv, workdir=self.workdir)
 
         if not self.acopytools:
-            msg = f'failed to initilize StagingClient: no acopytools options found, acopytools={self.acopytools}'
+            msg = f'failed to initialize StagingClient: no acopytools options found, acopytools={self.acopytools}'
             logger.error(msg)
             self.trace_report.update(clientState='BAD_COPYTOOL', stateReason=msg)
             self.trace_report.send()
@@ -190,19 +196,22 @@ class StagingClient:
         """
         return None
 
-    def prepare_inputddms(self, files: list):
+    def prepare_inputddms(self, files: list, activities: list = None):
         """
         Prepare input DDMs.
 
         Populates filespec.inputddms for each entry from `files` list.
 
         :param files: list of `FileSpec` objects
+        :param activities: ordered list of activities to resolve `astorages` (optional)
         """
         astorages = self.infosys.queuedata.astorages if self.infosys and self.infosys.queuedata else {}
-        storages = astorages.get('read_lan', [])
+        activities = activities or ['read_lan']
 
-        #activity = activities[0]
+        storages = next((astorages.get(a) for a in activities if astorages.get(a)), None) or []
+
         #if not storages:  ## ignore empty astorages
+        #    activity = activities[0]
         #    raise PilotException("Failed to resolve input sources: no associated storages defined for activity=%s (%s)"
         #                         % (activity, ','.join(activities)), code=ErrorCodes.NOSTORAGE, state='NO_ASTORAGES_DEFINED')
 
@@ -221,7 +230,7 @@ class StagingClient:
         """
         number = 1
         maxnumber = 10
-        self.logger.info(f'{label} list of replicas: (max {maxnumber})')
+        self.logger.debug(f'{label} list of replicas: (max {maxnumber})')
         for pfn, xdat in replicas:
             self.logger.debug(f"{number}. "
                               f"lfn={pfn}, "
@@ -514,7 +523,7 @@ class StagingClient:
         """
         raise NotImplementedError()
 
-    def transfer(self, files: list, activity: list or str = 'default', **kwargs: dict) -> list:  # noqa: C901
+    def transfer(self, files: list, activity: list or str = 'default', raise_exception: bool = True, **kwargs: dict) -> list:  # noqa: C901
         """
         Perform file transfer.
 
@@ -522,8 +531,9 @@ class StagingClient:
 
         :param files: list of `FileSpec` objects (list)
         :param activity: list of activity names used to determine appropriate copytool (list or str)
+        :param raise_exception: boolean flag used to ignore transfer errors
         :param kwargs: extra kwargs to be passed to copytool transfer handler (dict)
-        :raise: PilotException in case of controlled error
+        :raise: PilotException in case of controlled error if `raise_exception` is `True`
         :return: list of processed `FileSpec` objects (list).
         """
         self.trace_report.update(relativeStart=time.time(), transferStart=time.time())
@@ -540,7 +550,8 @@ class StagingClient:
                 break
 
         if not copytools:
-            raise PilotException(f'failed to resolve copytool by preferred activities={activity}, acopytools={self.acopytools}')
+            raise PilotException(f'failed to resolve copytool by preferred activities={activity}, acopytools={self.acopytools}',
+                                 code=ErrorCodes.UNKNOWNCOPYTOOL)
 
         # populate inputddms if needed
         self.prepare_inputddms(files)
@@ -612,7 +623,7 @@ class StagingClient:
             # propagate message from first error back up
             # errmsg = str(caught_errors[0]) if caught_errors else ''
             if caught_errors and "Cannot authenticate" in str(caught_errors):
-                code = ErrorCodes.STAGEINAUTHENTICATIONFAILURE
+                code = ErrorCodes.STAGEINAUTHENTICATIONFAILURE if self.mode == 'stage-in' else ErrorCodes.STAGEOUTAUTHENTICATIONFAILURE  # is it stage-in/out?
             elif caught_errors and "bad queue configuration" in str(caught_errors):
                 code = ErrorCodes.BADQUEUECONFIGURATION
             elif caught_errors and isinstance(caught_errors[0], PilotException):
@@ -625,7 +636,8 @@ class StagingClient:
                 code = ErrorCodes.STAGEINFAILED if self.mode == 'stage-in' else ErrorCodes.STAGEOUTFAILED  # is it stage-in/out?
             details = str(caught_errors) + ":" + f'failed to transfer files using copytools={copytools}'
             self.logger.fatal(details)
-            raise PilotException(details, code=code)
+            if raise_exception:
+                raise PilotException(details, code=code)
 
         return files
 
@@ -1048,7 +1060,7 @@ class StageInClient(StagingClient):
         else:
             if disk_space:
                 available_space = convert_mb_to_b(disk_space)
-                self.logger.info("locally available space: {available_space} B")
+                self.logger.info(f"locally available space: {available_space} B")
 
                 # are we within the limit?
                 if totalsize > available_space:
@@ -1063,7 +1075,7 @@ class StageOutClient(StagingClient):
 
     mode = "stage-out"
 
-    def prepare_destinations(self, files: list, activities: list or str) -> list:
+    def prepare_destinations(self, files: list, activities: list or str, alt_exclude: list = None) -> list:
         """
         Resolve destination RSE (filespec.ddmendpoint) for each entry from `files` according to requested `activities`.
 
@@ -1071,8 +1083,12 @@ class StageOutClient(StagingClient):
 
         :param files: list of FileSpec objects to be processed (list)
         :param activities: ordered list of activities to be used to resolve astorages (list or str)
+        :param alt_exclude: global list of destinations that should be excluded / not used for alternative stage-out
         :return: updated fspec entries (list).
         """
+
+        alt_exclude = list(alt_exclude or [])
+
         if not self.infosys.queuedata:  # infosys is not initialized: not able to fix destination if need, nothing to do
             return files
 
@@ -1099,22 +1115,46 @@ class StageOutClient(StagingClient):
             raise PilotException(f"Failed to resolve destination: no associated storages defined for activity={activity} ({act})",
                                  code=ErrorCodes.NOSTORAGE, state='NO_ASTORAGES_DEFINED')
 
-        # take the fist choice for now, extend the logic later if need
-        ddm = storages[0]
+        def resolve_alt_destination(primary, exclude=None):
+            """ resolve alt destination as the next to primary entry not equal to `primary` and `exclude` """
 
-        self.logger.info(f"[prepare_destinations][{activity}]: allowed (local) destinations: {storages}")
-        self.logger.info(f"[prepare_destinations][{activity}]: resolved default destination ddm={ddm}")
+            cur = storages.index(primary) if primary in storages else 0
+            inext = (cur + 1) % len(storages)  # cycle storages, take the first elem when reach end
+            exclude = set([primary] + list(exclude or []))
+            alt = None
+            for attempt in range(len(exclude) or 1):  # apply several tries to jump exclude entries (in case of dublicated data will stack)
+                inext = (cur + 1) % len(storages)  # cycle storages, start from the beginning when reach end
+                if storages[inext] not in exclude:
+                    alt = storages[inext]
+                    break
+                cur += 1
+            return alt
+
+        # default destination
+        ddm = storages[0]  # take the fist choice for now, extend the logic later if need
+        ddm_alt = resolve_alt_destination(ddm, exclude=alt_exclude)
+
+        self.logger.info(f"[prepare_destinations][{activity}]: allowed (local) destinations: {storages}, alt_exclude={alt_exclude}")
+        self.logger.info(f"[prepare_destinations][{activity}]: resolved default destination: ddm={ddm}, ddm_alt={ddm_alt}")
 
         for e in files:
             if not e.ddmendpoint:  # no preferences => use default destination
                 self.logger.info("[prepare_destinations][%s]: fspec.ddmendpoint is not set for lfn=%s"
-                                 " .. will use default ddm=%s as (local) destination", activity, e.lfn, ddm)
+                                 " .. will use default ddm=%s as (local) destination; ddm_alt=%s", activity, e.lfn, ddm, ddm_alt)
                 e.ddmendpoint = ddm
-            elif e.ddmendpoint not in storages:  # fspec.ddmendpoint is not in associated storages => assume it as final (non local) alternative destination
+                e.ddmendpoint_alt = ddm_alt
+            #elif e.ddmendpoint not in storages and is_unified:  ## customize nucleus logic if need
+            #   pass
+            elif e.ddmendpoint not in storages:  # fspec.ddmendpoint is not in associated storages => use it as (non local) alternative destination
                 self.logger.info("[prepare_destinations][%s]: Requested fspec.ddmendpoint=%s is not in the list of allowed (local) destinations"
-                                 " .. will consider default ddm=%s for transfer and tag %s as alt. location", activity, e.ddmendpoint, ddm, e.ddmendpoint)
-                e.ddmendpoint = ddm
-                e.ddmendpoint_alt = e.ddmendpoint  # consider me later
+                                 " .. will consider default ddm=%s as primary and set %s as alt. location", activity, e.ddmendpoint, ddm, e.ddmendpoint)
+                e.ddmendpoint_alt = e.ddmendpoint if e.ddmendpoint not in alt_exclude else None
+                e.ddmendpoint = ddm  # use default destination, check/verify nucleus case
+            else:  # set corresponding ddmendpoint_alt if exist (next entry in cycled storages list)
+                e.ddmendpoint_alt = resolve_alt_destination(e.ddmendpoint, exclude=alt_exclude)
+
+            self.logger.info("[prepare_destinations][%s]: use ddmendpoint_alt=%s for fspec.ddmendpoint=%s",
+                             activity, e.ddmendpoint_alt, e.ddmendpoint)
 
         return files
 

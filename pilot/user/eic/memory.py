@@ -17,24 +17,30 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2019-23
-
-"""Functions for Summit."""
-
-import logging
-from typing import Any
-
-logger = logging.getLogger(__name__)
+# - Paul Nilsson, paul.nilsson@cern.ch, 2025
 
 
-def get_setup(job: Any = None) -> list:
+def allow_memory_usage_verifications() -> bool:
     """
-    Return the resource specific setup.
+    Return True if memory usage verifications should be performed.
 
-    :param job: optional job object (Any)
-    :return: setup commands (list).
+    :return: False for generic jobs (bool).
     """
-    if not job:
-        logger.warning('job object not sent to get_setup')
+    return False
 
-    return []
+
+def memory_usage(job: object, resource_type: str) -> tuple[int, str]:
+    """
+    Perform memory usage verification.
+
+    :param job: job object (object)
+    :param resource_type: resource type (str)
+    :return: exit code (int), diagnostics (str).
+    """
+    if job or resource_type:  # to bypass pylint score 0
+        pass
+
+    exit_code = 0
+    diagnostics = ""
+
+    return exit_code, diagnostics

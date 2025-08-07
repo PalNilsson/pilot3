@@ -17,12 +17,13 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-2024
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
 # - Wen Guan, wen.guan@cern.ch, 2018
 
 """Error codes set by the pilot."""
 
 import re
+from json import dump
 from typing import Any
 
 
@@ -179,6 +180,13 @@ class ErrorCodes:
     LOGCREATIONTIMEOUT = 1376
     CVMFSISNOTALIVE = 1377
     LSETUPTIMEDOUT = 1378
+    PREEMPTION = 1379
+    ARCPROXYFAILURE = 1380
+    ARCPROXYLIBFAILURE = 1381
+    PROXYTOOSHORT = 1382  # used at the beginning of the pilot to indicate that the proxy is too short
+    STAGEOUTAUTHENTICATIONFAILURE = 1383
+    QUEUENOTSETUPFORCONTAINERS = 1384
+    NOJOBSINPANDA = 1385  # internally used code
 
     _error_messages = {
         GENERALERROR: "General pilot error, consult batch log",
@@ -320,6 +328,13 @@ class ErrorCodes:
         LOGCREATIONTIMEOUT: "Log file creation timed out",
         CVMFSISNOTALIVE: "CVMFS is not responding",
         LSETUPTIMEDOUT: "Lsetup command timed out during remote file open",
+        PREEMPTION: "Job was preempted",
+        ARCPROXYFAILURE: "General arcproxy failure",
+        ARCPROXYLIBFAILURE: "Arcproxy failure while loading shared libraries",
+        PROXYTOOSHORT: "Proxy is too short",
+        STAGEOUTAUTHENTICATIONFAILURE: "Authentication failure during stage-out",
+        QUEUENOTSETUPFORCONTAINERS: "Queue is not set up for containers",
+        NOJOBSINPANDA: "No jobs in PanDA",
     }
 
     put_error_codes = [1135, 1136, 1137, 1141, 1152, 1181]
@@ -330,11 +345,11 @@ class ErrorCodes:
         ErrorCodes.pilot_error_codes = []
         ErrorCodes.pilot_error_diags = []
 
-    def get_kill_signal_error_code(self, signal: str) -> int:
+    def get_kill_signal_error_code(self, signal_name: str) -> int:
         """
         Match a kill signal with a corresponding Pilot error code.
 
-        :param signal: signal name (str).
+        :param signal_name: signal name (str).
         :return: Pilot error code (int).
         """
         signals_dictionary = {
@@ -344,9 +359,10 @@ class ErrorCodes:
             "SIGXCPU": self.SIGXCPU,
             "SIGUSR1": self.SIGUSR1,
             "SIGBUS": self.SIGBUS,
+            "SIGINT": self.SIGINT,
         }
 
-        return signals_dictionary.get(signal, self.KILLSIGNAL)
+        return signals_dictionary.get(signal_name, self.KILLSIGNAL)
 
     def get_error_message(self, errorcode: int) -> str:
         """
@@ -431,13 +447,17 @@ class ErrorCodes:
 
         return report
 
-    def resolve_transform_error(self, exit_code: int, stderr: str) -> int:
+    def resolve_transform_error(self, exit_code: int, stderr: str) -> tuple[int, str]:
         """
         Assign a pilot error code to a specific transform error.
 
-        :param exit_code: transform exit code (int)
-        :param stderr: transform stderr (str)
-        :return: pilot error code (int).
+        Args:
+            exit_code (int): Transform exit code.
+            stderr (str): Transform stderr.
+
+        Returns:
+            int: Pilot error code.
+            str: Error message if extracted from stderr, otherwise an empty string.
         """
         error_map = {
             "Not mounting requested bind point": self.SINGULARITYBINDPOINTFAILURE,
@@ -450,28 +470,51 @@ class ErrorCodes:
             "Apptainer is not installed": self.APPTAINERNOTINSTALLED,
             "cannot create directory": self.MKDIR,
             "General payload setup verification error": self.SETUPFAILURE,
+            "No such file or directory": self.NOSUCHFILE,
         }
 
+        def get_key_by_value(d: dict, value: str) -> str:
+            """Return the key corresponding to a given value."""
+            for k, v in d.items():
+                if v == value:
+                    return k
+            return ""
+
         # Check if stderr contains any known error messages
+        apptainer_codes = {
+            self.SINGULARITYBINDPOINTFAILURE,
+            self.SINGULARITYNOLOOPDEVICES,
+            self.SINGULARITYIMAGEMOUNTFAILURE,
+            self.SINGULARITYIMAGEMOUNTFAILURE,
+            self.SINGULARITYGENERALFAILURE,
+            self.SINGULARITYFAILEDUSERNAMESPACE,
+            self.SINGULARITYNOTINSTALLED,
+            self.APPTAINERNOTINSTALLED
+        }
         for error_message, error_code in error_map.items():
             if error_message in stderr:
-                return error_code
+                # only allow overwriting exit code 0 for specific errors (read: apptainer)
+                if exit_code == 0 and error_code in apptainer_codes:
+                    return error_code, error_message
+                else:
+                    continue
 
         # Handle specific exit codes
+        key = get_key_by_value(error_map, exit_code)
         if exit_code == 2:
-            return self.LSETUPTIMEDOUT
+            return self.LSETUPTIMEDOUT, key
         if exit_code == 3:
-            return self.REMOTEFILEOPENTIMEDOUT
+            return self.REMOTEFILEOPENTIMEDOUT, key
         if exit_code == 251:
-            return self.UNKNOWNTRFFAILURE
+            return self.UNKNOWNTRFFAILURE, key
         if exit_code == -1:
-            return self.UNKNOWNTRFFAILURE
+            return self.UNKNOWNTRFFAILURE, key
         if exit_code == self.COMMANDTIMEDOUT:
-            return exit_code
+            return exit_code, key
         if exit_code != 0:
-            return self.PAYLOADEXECUTIONFAILURE
+            return self.PAYLOADEXECUTIONFAILURE, key
 
-        return exit_code  # Return original exit code if no specific error is found
+        return exit_code, key  # Return original exit code if no specific error is found
 
     def extract_stderr_error(self, stderr: str) -> str:
         """
@@ -578,6 +621,50 @@ class ErrorCodes:
             error_message = diag
 
         return error_message
+
+    @classmethod
+    def get_error_name(cls, code: int) -> str:
+        """
+        Returns the name of the error constant given its value.
+        Assumes that error constants are defined as uppercase integers in the class.
+        """
+        for name, value in cls.__dict__.items():
+            if isinstance(value, int) and value == code and name.isupper():
+                return name
+
+        return str(code)  # fallback if not found
+
+    @classmethod
+    def generate_json(cls, filename: str = "error_codes.json"):
+        """
+        Generate a JSON object containing the error codes and diagnostics.
+
+        Args:
+            str filename: The name of the JSON file to save the error codes and diagnostics.
+        """
+        error_dict = {}
+        for error_code, message in cls._error_messages.items():
+            error_name = cls.get_error_name(error_code)
+            error_dict[error_code] = [error_name, message]
+
+        with open(filename, "w", encoding='utf-8') as f:
+            dump(error_dict, f, indent=4)
+
+    @classmethod
+    def convert_acronym_to_code(cls, filename: str = "acronyms.json"):
+        """
+        Convert the acronyms in the ErrorCode class and store them in a JSON with the error codes as values.
+
+        Args:
+            str filename: The name of the JSON file to save the acronyms and error codes.
+        """
+        error_codes = {}
+        for error_code, _ in cls._error_messages.items():
+            error_name = cls.get_error_name(error_code)
+            error_codes[error_name] = error_code
+
+        with open(filename, "w", encoding='utf-8') as f:
+            dump(error_codes, f, indent=4)
 
     @classmethod
     def is_recoverable(cls, code: int = 0) -> bool:

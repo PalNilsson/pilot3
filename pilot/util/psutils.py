@@ -17,8 +17,9 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2023
+# - Paul Nilsson, paul.nilsson@cern.ch, 2023-25
 
+import getpass
 import logging
 import os
 import subprocess
@@ -121,7 +122,7 @@ def find_pid_by_command_and_ppid(command: str, payload_pid: int) -> int:
                 logger.debug(f"command={command} is in {process.info['cmdline'][0]}")
                 logger.debug(f"ok returning pid={process.info['pid']}")
                 return process.info['pid']
-        except (psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.AccessDenied, psutil.ZombieProcess, KeyError):
             pass
 
     return None
@@ -178,7 +179,7 @@ def get_all_descendant_processes(parent_pid: int, top_pid: int = os.getpid()) ->
                     descendants.append((child_pid, cmdline))
                     descendants.extend(find_descendant_processes(child_pid, top_pid))
             return descendants
-        except (psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.AccessDenied, psutil.ZombieProcess, KeyError):
             return []
     all_descendant_processes = find_descendant_processes(parent_pid, top_pid)
 
@@ -267,3 +268,209 @@ def get_command_by_pid(pid: int) -> str or None:
     except psutil.NoSuchProcess:
         logger.warning(f"process with PID {pid} not found")
         return None
+
+
+def find_process_by_jobid(jobid: int) -> int or None:
+    """
+    Find the process ID of a process whose command arguments contain the given job ID.
+
+    :param jobid: the job ID to search for (int)
+    :return: the process ID of the matching process, or None if no match is found (int or None).
+    """
+    if not _is_psutil_available:
+        logger.warning('find_process_by_jobid(): psutil not available - aborting')
+        return None
+
+    for proc in psutil.process_iter():
+        try:
+            cmd_line = proc.cmdline()
+        except psutil.NoSuchProcess:
+            continue
+
+        for arg in cmd_line:
+            if str(jobid) in arg and 'xrootd' not in arg:
+                return proc.pid
+
+    return None
+
+
+def find_actual_payload_pid(bash_pid: int, payload_cmd: str) -> int or None:
+    """
+    Find the actual payload PID.
+
+    Identify all subprocesses of the given bash PID and search for the payload command. Return its PID.
+
+    :param bash_pid: bash PID (int)
+    :param payload_cmd: payload command (partial) (str)
+    :return: payload PID (int or None).
+    """
+    if not _is_psutil_available:
+        logger.warning('find_actual_payload_pid(): psutil not available - aborting')
+        return None
+
+    children = get_subprocesses(bash_pid)
+    if not children:
+        logger.warning(f'no children found for bash PID {bash_pid}')
+        return bash_pid
+
+    for pid in children:
+        cmd = get_command_by_pid(pid)
+        logger.debug(f'pid={pid} cmd={cmd}')
+        if payload_cmd in cmd:
+            logger.info(f'found payload PID={pid} for bash PID={bash_pid}')
+            return pid
+
+    logger.warning(f'could not find payload PID for bash PID {bash_pid}')
+    return None
+
+
+def find_lingering_processes(parent_pid: int) -> list:
+    """
+    Find processes that are still running after the specified parent process has terminated.
+
+    :param parent_pid: The PID of the parent process (int)
+    :return: A list of lingering process PIDs (list).
+    """
+    if not _is_psutil_available:
+        logger.warning('psutil not available, cannot find lingering processes - aborting')
+        return []
+
+    lingering_processes = []
+    try:
+        parent_process = psutil.Process(parent_pid)
+        for child in parent_process.children(recursive=True):
+            try:
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    lingering_processes.append(child.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+                logger.warning(f"[harmless] failed to get status for child process {child.pid}: {e}")
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, psutil.FileNotFoundError) as e:
+        logger.warning(f"[harmless] failed to get parent process {parent_pid}: {e}")
+
+    return lingering_processes
+
+
+def check_cpu_load():
+    """
+    Check if the system is under heavy CPU load.
+
+    High CPU load is here defined to be above 80%.
+
+    :return: True (system is under heavy CPU load), False (system load is normal).
+    """
+    if not _is_psutil_available:
+        logger.warning('psutil not available, cannot check CPU load (pretending it is normal)')
+        return False
+
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.5)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+        logger.warning(f"Failed to read CPU percent: {e}")
+        logger.info("system is under heavy CPU load (assumed)")
+        return True
+    if cpu_percent > 80:
+        logger.info("system is under heavy CPU load")
+        return True
+    else:
+        logger.info("system load is normal")
+        return False
+
+
+def get_process_info(cmd: str, user: str = "", pid: int = 0) -> list:
+    """
+    Return process info for given command.
+
+    The function returns a list with format [cpu, mem, command, number of commands] for
+    a given command (e.g. python3 pilot3/pilot.py).
+
+    :param cmd: command (str)
+    :param user: user (str)
+    :param pid: process id (int)
+    :return: list with process info (l[0]=cpu usage(%), l[1]=mem usage(%), l[2]=command(string)) (list).
+    """
+    if not _is_psutil_available:
+        logger.warning('psutil not available, cannot check pilot CPU load')
+        return []
+
+    processes = []
+    num = 0
+
+    for proc in psutil.process_iter(['pid', 'username', 'cpu_percent', 'memory_percent', 'cmdline']):
+        try:
+            if user and proc.info['username'] != user:
+                continue
+            cmdline = proc.info['cmdline']
+            if cmdline and cmd in ' '.join(cmdline):
+                num += 1
+                if proc.info['pid'] == pid:
+                    processes = [proc.info['cpu_percent'], proc.info['memory_percent'], ' '.join(cmdline)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, KeyError):
+            continue
+
+    if processes:
+        processes.append(num)
+
+    return processes
+
+
+def list_processes_and_threads() -> list:
+    """
+    List all processes and threads owned by the current user.
+
+    This function corresponds to the command "ps -eo pid,ppid -m".
+
+    :return: list of processes and threads (list).
+    """
+    if not _is_psutil_available:
+        logger.warning('psutil not available, cannot check pilot CPU load')
+        return []
+
+    current_user = getpass.getuser()
+    processes = []
+    # Gather only processes owned by the current user (and skip PID 1)
+    for proc in psutil.process_iter(attrs=['pid', 'ppid', 'username']):
+        try:
+            info = proc.info
+            if info.get('username') != current_user:
+                continue
+            if info['pid'] == 1:
+                continue
+            processes.append((info['pid'], info['ppid'], proc))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # Sort by PID so the output order roughly matches ps
+    processes.sort(key=lambda x: x[0])
+
+    lines = []
+    lines.append(f"{'PID':>6} {'PPID':>6}")
+    for pid, ppid, proc in processes:
+        ppid_str = str(ppid) if ppid is not None else '-'
+        # Print the main process line
+        lines.append(f"{pid:6} {ppid_str:6}")
+        # Try to fetch threads (if available)
+        try:
+            threads = proc.threads()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            threads = []
+        # Filter out the main thread (whose id equals the process id)
+        extra_threads = [t for t in threads if t.id != pid]
+        if extra_threads:
+            # Mimic ps -m: print one extra line with dashes for threads
+            lines.append(f"{'-':6} {'-':6}")
+
+    return lines
+
+
+def get_clock_speed() -> float or None:
+    """
+    Return the clock speed in MHz.
+
+    :return: clock speed (float or None).
+    """
+    if not _is_psutil_available:
+        logger.warning('get_clock_speed(): psutil not available - aborting')
+        return None
+
+    freq = psutil.cpu_freq()  # scpufreq(current=2300, min=2300, max=2300)
+    return freq.current if freq is not None else 0.0

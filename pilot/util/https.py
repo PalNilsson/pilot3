@@ -19,58 +19,75 @@
 # Authors:
 # - Daniel Drizhuk, d.drizhuk@gmail.com, 2017
 # - Mario Lassnig, mario.lassnig@cern.ch, 2017
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-2024
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
 
 """Functions for https interactions."""
 
+import ast
 try:
     import certifi
 except ImportError:
     certifi = None
+import http.client as http_client
 import json
 import logging
 import os
-import pipes
 import platform
 import random
 try:
     import requests
 except ImportError:
     requests = None
+import shlex
 import socket
 import ssl
 import sys
 import urllib.request
 import urllib.error
 import urllib.parse
+
+from collections.abc import Callable
 from collections import namedtuple
 from gzip import GzipFile
 from io import BytesIO
-from re import findall
-from time import sleep, time
-from typing import Callable, Any
+from re import (
+    findall,
+    sub
+)
+from time import (
+    sleep,
+    time
+)
+from typing import Any
 from urllib.parse import parse_qs
 
+from pilot.common.errorcodes import ErrorCodes
+from pilot.common.exception import FileHandlingFailure
+from pilot.info.jobdata import JobData
+
+from .auxiliary import is_kubernetes_resource
 from .config import config
 from .constants import get_pilot_version
 from .container import execute
-from .filehandling import write_file, read_file
-from pilot.common.errorcodes import ErrorCodes
-from pilot.common.exception import FileHandlingFailure
+from .filehandling import (
+    read_file,
+    rename,
+    write_file,
+)
 
 logger = logging.getLogger(__name__)
 errors = ErrorCodes()
 
 _ctx = namedtuple('_ctx', 'ssl_context user_agent capath cacert')
 _ctx.ssl_context = None
-_ctx.user_agent = None
+_ctx.user_agent = "Pilot3"  # default value (must be string not None)
 _ctx.capath = None
 _ctx.cacert = None
 
 # anisyonk: public copy of `_ctx` to avoid logic break since ssl_context is reset inside the request() -- FIXME
 # anisyonk: public instance, should be properly initialized by `https_setup()`
 # anisyonk: use lightweight class definition instead of namedtuple since tuple is immutable and we don't need/use any tuple features here
-ctx = type('ctx', (object,), dict(ssl_context=None, user_agent='Pilot3 client', capath=None, cacert=None))
+ctx = type('ctx', (object,), {'ssl_context': None, 'user_agent': 'Pilot3 client', 'capath': None, 'cacert': None})
 
 
 def _tester(func: Callable[..., Any], *args: Any) -> Any:
@@ -93,7 +110,7 @@ def _tester(func: Callable[..., Any], *args: Any) -> Any:
     return None
 
 
-def capath(args: Any = None) -> Any:
+def capath(args: object = None) -> Any:
     """
     Try to get :abbr:`CA (Certification Authority)` path with certificates.
 
@@ -102,7 +119,7 @@ def capath(args: Any = None) -> Any:
     2. :envvar:`X509_CERT_DIR` from env
     3. Path ``/etc/grid-security/certificates``
 
-    :param args: arguments, parsed by argparse (Any)
+    :param args: arguments, parsed by argparse (object)
     :returns: directory path (str), or None.
     """
     return _tester(os.path.isdir,
@@ -111,11 +128,11 @@ def capath(args: Any = None) -> Any:
                    '/etc/grid-security/certificates')
 
 
-def cacert_default_location() -> Any:
+def cacert_default_location() -> str or None:
     """
     Try to get current user ID through `os.getuid`, and get the posix path for x509 certificate.
 
-    :returns: `str` -- posix default x509 path, or `None`
+    :returns: `str` -- posix default x509 path, or `None` (str or None).
     """
     try:
         return f'/tmp/x509up_u{os.getuid()}'
@@ -125,7 +142,7 @@ def cacert_default_location() -> Any:
     return None
 
 
-def cacert(args: Any = None) -> Any:
+def cacert(args: object = None) -> str:
     """
     Try to get :abbr:`CA (Certification Authority)` certificate or X509.
 
@@ -135,16 +152,18 @@ def cacert(args: Any = None) -> Any:
     2. :envvar:`X509_USER_PROXY` from env
     3. Path ``/tmp/x509up_uXXX``, where ``XXX`` refers to ``UID``
 
-    :param args: arguments, parsed by argparse (Any)
-    :returns: `str` -- certificate file path, or `None` (Any).
+    :param args: arguments, parsed by argparse (object)
+    :return: certificate file path (str).
     """
-    return _tester(os.path.isfile,
-                   args and args.cacert,
-                   os.environ.get('X509_USER_PROXY'),
-                   cacert_default_location())
+    cert_path = _tester(os.path.isfile,
+                        args and args.cacert,
+                        os.environ.get('X509_USER_PROXY'),
+                        cacert_default_location())
+
+    return cert_path if cert_path else ""
 
 
-def https_setup(args: Any = None, version: str = ""):
+def https_setup(args: object = None, version: str = ""):
     """
     Set up the context for HTTPS requests.
 
@@ -152,7 +171,7 @@ def https_setup(args: Any = None, version: str = ""):
     2. Sets up :mailheader:`User-Agent`
     3. Tries to create `ssl.SSLContext` for future use (falls back to :command:`curl` if fails)
 
-    :param args: arguments, parsed by argparse (Any)
+    :param args: arguments, parsed by argparse (object)
     :param version: pilot version string (for :mailheader:`User-Agent`) (str).
     """
     version = version or get_pilot_version()
@@ -165,7 +184,8 @@ def https_setup(args: Any = None, version: str = ""):
         _ctx.ssl_context = ssl.create_default_context(capath=_ctx.capath,
                                                       cafile=_ctx.cacert)
     except Exception as exc:
-        logger.warning(f'SSL communication is impossible due to SSL error: {exc} -- falling back to curl')
+        logger.info(f"capath={_ctx.capath}, cacert={_ctx.cacert}")
+        logger.warning(f'SSL communication is impossible due to SSL error: {exc}')
         _ctx.ssl_context = None
 
     # anisyonk: clone `_ctx` to avoid logic break since ssl_context is reset inside the request() -- FIXME
@@ -242,7 +262,7 @@ def request(url: str, data: dict = None, plain: bool = False, secure: bool = Tru
                 failed = True
                 break
             try:
-                status, output, stderr = execute(req, obscure=obscure, timeout=130)
+                status, output, stderr = execute(req, obscure=obscure, timeout=config.Pilot.http_maxtime)
             except Exception as exc:
                 logger.warning(f'exception: {exc}')
                 failed = True
@@ -250,45 +270,64 @@ def request(url: str, data: dict = None, plain: bool = False, secure: bool = Tru
             else:
                 if status == 0:
                     break
-                else:
-                    logger.warning(f'request failed for IPv={_ipv} ({status}): stdout={output}, stderr={stderr}')
-                    continue
+                logger.warning(f'request failed for IPv={_ipv} ({status}): stdout={output}, stderr={stderr}')
+                continue
         if failed:
             return None
 
         # return output if plain otherwise return json.loads(output)
         if plain:
             return output
-        else:
-            try:
-                ret = json.loads(output)
-            except Exception as exc:
-                logger.warning(f'json.loads() failed to parse output={output}: {exc}')
-                return None
-            else:
-                return ret
-    else:
-        req = execute_urllib(url, data, plain, secure)
-        context = _ctx.ssl_context if secure else None
-
-        ec, output = get_urlopen_output(req, context)
-        if ec:
+        try:
+            ret = json.loads(output)
+        except Exception as exc:
+            logger.warning(f'json.loads() failed to parse output={output}: {exc}')
             return None
+        return ret
 
-        return output.read() if plain else json.load(output)
+    req = execute_urllib(url, data, plain, secure)
+    context = _ctx.ssl_context if secure else None
+
+    ec, output = get_urlopen_output(req, context)
+    if ec:
+        return None
+
+    return output.read() if plain else json.load(output)
 
 
 def update_ctx():
     """Update the ctx object in case X509_USER_PROXY has been updated."""
-    x509 = os.environ.get('X509_USER_PROXY', _ctx.cacert)
-    if x509 != _ctx.cacert and os.path.exists(x509):
+    cert = str(_ctx.cacert)  # to bypass pylint W0143 warning
+    x509 = os.environ.get('X509_USER_PROXY', cert)
+    if x509 != cert and os.path.exists(x509):
         _ctx.cacert = x509
-    certdir = os.environ.get('X509_CERT_DIR', _ctx.capath)
-    if certdir != _ctx.capath and os.path.exists(certdir):
+
+    path = str(_ctx.capath)  # to bypass pylint W0143 warning
+    certdir = os.environ.get('X509_CERT_DIR', path)
+    if certdir != path and os.path.exists(certdir):
         _ctx.capath = certdir
 
 
-def get_curl_command(plain: bool, dat: str, ipv: str) -> (Any, str):
+def get_local_oidc_token_info() -> tuple[str or None, str or None]:
+    """
+    Get the OIDC token locally.
+
+    :return: token (str), token origin (str) (tuple).
+    """
+    # first check if there is a token that was downloaded by the pilot
+    refreshed_auth_token = os.environ.get('OIDC_REFRESHED_AUTH_TOKEN')
+    if refreshed_auth_token and os.path.exists(refreshed_auth_token):
+        auth_token = refreshed_auth_token
+    else:  # no refreshed token, try to get the initial longlasting token
+        auth_token = os.environ.get('OIDC_AUTH_TOKEN', os.environ.get('PANDA_AUTH_TOKEN'))
+
+    # origin of the token (panda_dev.pilot, ..)
+    auth_origin = os.environ.get('OIDC_AUTH_ORIGIN', os.environ.get('PANDA_AUTH_ORIGIN'))
+
+    return auth_token, auth_origin
+
+
+def get_curl_command(plain: bool, dat: str, ipv: str) -> tuple[Any, str]:
     """
     Get the curl command.
 
@@ -298,8 +337,7 @@ def get_curl_command(plain: bool, dat: str, ipv: str) -> (Any, str):
     :return: curl command (str or None), sensitive string to be obscured before dumping to log (str).
     """
     auth_token_content = ''
-    auth_token = os.environ.get('OIDC_AUTH_TOKEN', os.environ.get('PANDA_AUTH_TOKEN', None))  # file name of the token
-    auth_origin = os.environ.get('OIDC_AUTH_ORIGIN', os.environ.get('PANDA_AUTH_ORIGIN', None))  # origin of the token (panda_dev.pilot)
+    auth_token, auth_origin = get_local_oidc_token_info()
 
     command = 'curl'
     if ipv == 'IPv4':
@@ -309,7 +347,6 @@ def get_curl_command(plain: bool, dat: str, ipv: str) -> (Any, str):
         # /cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase/etc/grid-security-emi/certificates --compressed
         # -H "Authorization: Bearer <contents of PANDA_AUTH_TOKEN>" -H "Origin: <PANDA_AUTH_VO>"
         path = locate_token(auth_token)
-        auth_token_content = ""
         if os.path.exists(path):
             auth_token_content = read_file(path)
             if not auth_token_content:
@@ -321,41 +358,59 @@ def get_curl_command(plain: bool, dat: str, ipv: str) -> (Any, str):
         if not auth_token_content:
             logger.warning('OIDC_AUTH_TOKEN/PANDA_AUTH_TOKEN content could not be read')
             return None, ''
+
         req = f'{command} -sS --compressed --connect-timeout {config.Pilot.http_connect_timeout} ' \
               f'--max-time {config.Pilot.http_maxtime} '\
-              f'--capath {pipes.quote(_ctx.capath or "")} ' \
-              f'-H "Authorization: Bearer {pipes.quote(auth_token_content)}" ' \
-              f'-H {pipes.quote("Accept: application/json") if not plain else ""} ' \
-              f'-H "Origin: {pipes.quote(auth_origin)}" {dat}'
+              f'--capath {shlex.quote(_ctx.capath or "")} ' \
+              f'-H "Authorization: Bearer {shlex.quote(auth_token_content)}" ' \
+              f'-H {shlex.quote("Accept: application/json") if not plain else ""} ' \
+              f'-H "Origin: {shlex.quote(auth_origin)}" {dat}'
     else:
         req = f'{command} -sS --compressed --connect-timeout {config.Pilot.http_connect_timeout} ' \
               f'--max-time {config.Pilot.http_maxtime} '\
-              f'--capath {pipes.quote(_ctx.capath or "")} ' \
-              f'--cert {pipes.quote(_ctx.cacert or "")} ' \
-              f'--cacert {pipes.quote(_ctx.cacert or "")} ' \
-              f'--key {pipes.quote(_ctx.cacert or "")} '\
-              f'-H {pipes.quote(f"User-Agent: {_ctx.user_agent}")} ' \
-              f'-H {pipes.quote("Accept: application/json") if not plain else ""} {dat}'
+              f'--capath {shlex.quote(_ctx.capath or "")} ' \
+              f'--cert {shlex.quote(_ctx.cacert or "")} ' \
+              f'--cacert {shlex.quote(_ctx.cacert or "")} ' \
+              f'--key {shlex.quote(_ctx.cacert or "")} '\
+              f'-H {shlex.quote(f"User-Agent: {_ctx.user_agent}")} ' \
+              f'-H {shlex.quote("Accept: application/json") if not plain else ""} {dat}'
 
-    #logger.info('request: %s', req)
     return req, auth_token_content
 
 
-def locate_token(auth_token: str) -> str:
+def locate_token(auth_token: str, key: bool = False) -> str:
     """
-    Locate the token file.
+    Locate the OIDC token file.
+
+    Primary means the original token file, not the refreshed one.
+    The primary token is needed for downloading new tokens (i.e. 'refreshed' ones).
+
+    Note that auth_token is only the file name for the primary token, but has the full path for any
+    refreshed token.
 
     :param auth_token: file name of token (str)
+    :param key: if true, token key is used (bool)
     :return: path to token (str).
     """
-    _primary = os.path.dirname(os.environ.get('OIDC_AUTH_DIR', os.environ.get('PANDA_AUTH_DIR', os.environ.get('X509_USER_PROXY', ''))))
-    paths = [os.path.join(_primary, auth_token),
+    primary_basedir = os.path.dirname(os.environ.get('OIDC_AUTH_DIR', os.environ.get('PANDA_AUTH_DIR', os.environ.get('X509_USER_PROXY', ''))))
+    paths = [os.path.join(primary_basedir, auth_token),
              os.path.join(os.environ.get('PILOT_SOURCE_DIR', ''), auth_token),
-             os.path.join(os.environ.get('PILOT_WORK_DIR', ''), auth_token)]
+             os.path.join(os.environ.get('PILOT_WORK_DIR', ''), auth_token),
+             os.path.join(os.environ.get('HOME', ''), auth_token)]
+
+    # if the refreshed token exists, prepend it to the paths list and use it first
+    if not key:
+        _refreshed = os.environ.get('OIDC_REFRESHED_AUTH_TOKEN')  # full path to any refreshed token
+        if _refreshed and os.path.exists(_refreshed):
+            paths.insert(0, _refreshed)
+
+    # remove duplicates
+    paths = list(set(paths))
+
     path = ""
     for _path in paths:
-        logger.debug(f'looking for {_path}')
         if os.path.exists(_path):
+            logger.debug(f'found {_path}')
             path = _path
             break
 
@@ -365,13 +420,13 @@ def locate_token(auth_token: str) -> str:
     return path
 
 
-def get_vars(url: str, data: dict) -> (str, str):
+def get_vars(url: str, data: dict) -> tuple[str, str]:
     """
     Get the filename and strdata for the curl config file.
 
     :param url: URL (str)
     :param data: data to be written to file (dict)
-    :return: filename (str), strdata (str).
+    :return: filename (str), strdata (str) (tuple).
     """
     strdata = ""
     for key in data:
@@ -396,14 +451,14 @@ def get_curl_config_option(writestatus: bool, url: str, data: dict, filename: st
     """
     if not writestatus:
         logger.warning('failed to create curl config file (will attempt to urlencode data directly)')
-        dat = pipes.quote(url + '?' + urllib.parse.urlencode(data) if data else '')
+        dat = shlex.quote(url + '?' + urllib.parse.urlencode(data) if data else '')
     else:
         dat = f'--config {filename} {url}'
 
     return dat
 
 
-def execute_urllib(url: str, data: dict, plain: bool, secure: bool) -> Any:
+def execute_urllib(url: str, data: dict, plain: bool, secure: bool) -> urllib.request.Request:
     """
     Execute the request using urllib.
 
@@ -413,7 +468,7 @@ def execute_urllib(url: str, data: dict, plain: bool, secure: bool) -> Any:
     :param secure: default: True, i.e. use certificates (bool)
     :return: urllib request structure (Any).
     """
-    req = urllib.request.Request(url, urllib.parse.urlencode(data))
+    req = urllib.request.Request(url, urllib.parse.urlencode(data).encode('ascii'))
     if not plain:
         req.add_header('Accept', 'application/json')
     if secure:
@@ -422,13 +477,13 @@ def execute_urllib(url: str, data: dict, plain: bool, secure: bool) -> Any:
     return req
 
 
-def get_urlopen_output(req: Any, context: Any) -> (int, str):
+def get_urlopen_output(req: urllib.request.Request, context: ssl.SSLContext) -> tuple[int, str]:
     """
     Get the output from the urlopen request.
 
-    :param req: urllib request structure (Any)
-    :param context: ssl context (Any)
-    :return: exit code (int), output (str).
+    :param req: urllib request structure (urllib.request.Request)
+    :param context: ssl context (ssl.SSLContext)
+    :return: exit code (int), output (str) (tuple).
     """
     exitcode = -1
     output = ""
@@ -437,27 +492,28 @@ def get_urlopen_output(req: Any, context: Any) -> (int, str):
         output = urllib.request.urlopen(req, context=context)
     except urllib.error.HTTPError as exc:
         logger.warning(f'server error ({exc.code}): {exc.read()}')
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as exc:
         logger.warning(f'connection error: {exc.reason}')
     else:
         exitcode = 0
     logger.debug(f'ok url opened: exitcode={exitcode}')
+
     return exitcode, output
 
 
-def send_update(update_function: str, data: dict, url: str, port: str, job: Any = None, ipv: str = 'IPv6') -> dict:
+def send_update(update_function: str, data: dict, url: str, port: int, job: JobData = None, ipv: str = 'IPv6', max_attempts: int = 2) -> dict:
     """
     Send the update to the server using the given function and data.
 
     :param update_function: 'updateJob' or 'updateWorkerPilotStatus' (str)
     :param data: data (dict)
     :param url: server url (str)
-    :param port: server port (str)
-    :param job: job object (Any)
+    :param port: server port (int)
+    :param job: job object (JobData)
     :param ipv: internet protocol version, IPv4 or IPv6 (str)
+    :param max_attempts: maximum number of attempts to send the update (int)
     :return: server response (dict).
     """
-    max_attempts = 10
     attempt = 0
     done = False
     res = None
@@ -475,7 +531,7 @@ def send_update(update_function: str, data: dict, url: str, port: str, job: Any 
     # do not allow any delayed heartbeat messages for running state, if the job has completed (ie another call to this
     # function was already made by another thread for finished/failed state)
     if job:  # ignore for updateWorkerPilotStatus calls
-        if job.completed and (job.state == 'running' or job.state == 'starting'):
+        if job.completed and job.state in {'running', 'starting'}:
             logger.warning(f'will not send job update for {job.state} state since the job has already completed')
             return None  # should be ignored
 
@@ -501,32 +557,43 @@ def send_update(update_function: str, data: dict, url: str, port: str, job: Any 
     return res
 
 
-def send_request(pandaserver: str, update_function: str, data: dict, job: Any, ipv: str) -> dict or None:
+def send_request(pandaserver: str, update_function: str, data: dict, job: JobData, ipv: str) -> dict or None:
     """
     Send the request to the server using the appropriate method.
 
     :param pandaserver: PanDA server URL (str)
     :param update_function: update function (str)
     :param data: data dictionary (dict)
-    :param job: job object (Any)
+    :param job: job object (JobData)
     :param ipv: internet protocol version (str)
     :return: server response (dict or None).
     """
     res = None
     time_before = int(time())
 
+    # adjust the server path if the new server API is being used
+    if "api/v" in update_function:  # e.g. api/v1
+        path = f"{pandaserver}/{update_function}"
+    else:
+        path = f'{pandaserver}/server/panda/{update_function}'
+
+    logger.debug(f"update_function = {update_function}, path = {path}")
     # first try the new request2 method based on urllib. If that fails, revert to the old request method using curl
     try:
-        res = request2(f'{pandaserver}/server/panda/{update_function}', data=data)
+        res = request2(f'{path}', data=data, panda=True)
     except Exception as exc:
         logger.warning(f'exception caught in https.request(): {exc}')
-    logger.debug(f'type(res)={type(res)}')
+
     if not res:
         logger.warning('failed to send request using urllib based request2(), will try curl based request()')
         try:
             res = request(f'{pandaserver}/server/panda/{update_function}', data=data, ipv=ipv)
         except Exception as exc:
             logger.warning(f'exception caught in https.request(): {exc}')
+
+    if isinstance(res, str):
+        logger.warning(f"panda server returned a string instead of a dictionary: {res}")
+        return None
 
     if res:
         txt = f'server {update_function} request completed in {int(time()) - time_before}s'
@@ -547,14 +614,14 @@ def send_request(pandaserver: str, update_function: str, data: dict, job: Any, i
     return res
 
 
-def get_panda_server(url: str, port: str, update_server: bool = True) -> str:
+def get_panda_server(url: str, port: int, update_server: bool = True) -> str:
     """
     Get the URL for the PanDA server.
 
     The URL will be randomized if the server can be contacted (otherwise fixed).
 
     :param url: URL string, if set in pilot option (port not included) (str)
-    :param port: port number, if set in pilot option (str)
+    :param port: port number, if set in pilot option (int)
     :param update_server: True if the server can be contacted, False otherwise (bool)
     :return: full URL (either from pilot options or from config file) (str).
     """
@@ -586,16 +653,16 @@ def get_panda_server(url: str, port: str, update_server: bool = True) -> str:
     if not update_server:
         return pandaserver
 
-    # set a timeout of 10 seconds to prevent potential hanging due to problems with DNS resolution, or if the DNS
+    # set a timeout to prevent potential hanging due to problems with DNS resolution, or if the DNS
     # server is slow to respond
-    socket.setdefaulttimeout(10)
+    socket.setdefaulttimeout(config.Pilot.http_maxtime)
 
     # add randomization for PanDA server
     default = 'pandaserver.cern.ch'
     if default in pandaserver:
         try:
             rnd = random.choice([socket.getfqdn(vv) for vv in set([v[-1][0] for v in socket.getaddrinfo(default, 25443, socket.AF_INET)])])
-        except socket.herror as exc:
+        except (socket.herror, socket.gaierror) as exc:
             logger.warning(f'failed to get address from socket: {exc} - will use default server ({pandaserver})')
         else:
             pandaserver = pandaserver.replace(default, rnd)
@@ -604,12 +671,12 @@ def get_panda_server(url: str, port: str, update_server: bool = True) -> str:
     return pandaserver
 
 
-def add_error_codes(data: dict, job: Any):
+def add_error_codes(data: dict, job: JobData):
     """
     Add error codes to data structure.
 
     :param data: data dictionary (dict)
-    :param job: job object (Any).
+    :param job: job object (JobData).
     """
     # error codes
     pilot_error_code = job.piloterrorcode
@@ -620,25 +687,55 @@ def add_error_codes(data: dict, job: Any):
     else:
         data['pilotErrorCode'] = pilot_error_code
 
+    def remove_timestamp(log_entry: str) -> str:
+        """
+        Removes the timestamp in the format 'YYYY-MM-DD HH:MM:SS,mmm' from a log entry.
+
+        :param log_entry: The log entry string containing a timestamp (str)
+        :return: The log entry without the timestamp (str).
+        """
+        return sub(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{1,3})?', '', log_entry).strip()
+
     # add error info
     pilot_error_diag = job.piloterrordiag
     pilot_error_diags = job.piloterrordiags
     if pilot_error_diags != []:
+        # filter out any timestamps that might mess up monitoring (https://its.cern.ch/jira/browse/ATLASPANDA-1324)
+        # pilot_error_diags = [remove_timestamp(diag) for diag in pilot_error_diags]
+        pilot_error_diags_cleaned = []
+        for diag in pilot_error_diags:
+            if isinstance(diag, str):
+                pilot_error_diags_cleaned.append(remove_timestamp(diag))
+            else:
+                # Optionally log or convert to string
+                pilot_error_diags_cleaned.append(remove_timestamp(str(diag)))
+                logger.warning(f'pilotErrorDiags contains non-string value: {diag} (converted to string)')
+        pilot_error_diags = pilot_error_diags_cleaned
+
         logger.warning(f'pilotErrorDiags = {pilot_error_diags} (will report primary/first error diag)')
         data['pilotErrorDiag'] = pilot_error_diags[0]
     else:
         data['pilotErrorDiag'] = pilot_error_diag
+
+    # special case for SIGTERM failures on Kubernetes resources
+    if data.get('pilotErrorCode') == errors.SIGTERM:
+        if is_kubernetes_resource():
+            logger.warning('resetting SIGTERM error to PREEMPTION for Kubernetes resource')
+            data['pilotErrorCode'] = errors.PREEMPTION
+            data['pilotErrorDiag'] = errors.get_error_code(errors.PREEMPTION)
+
     data['transExitCode'] = job.transexitcode
     data['exeErrorCode'] = job.exeerrorcode
     data['exeErrorDiag'] = job.exeerrordiag
 
 
-def get_server_command(url: str, port: str, cmd: str = 'getJob') -> str:
+def get_server_command(url: str, port: int, cmd: str = 'getJob') -> str:
     """
     Prepare the getJob server command.
 
     :param url: PanDA server URL (str)
-    :param port: PanDA server port (str)
+    :param port: PanDA server port (int)
+    :param cmd: command (str)
     :return: full server command (str).
     """
     if url != "":
@@ -657,10 +754,97 @@ def get_server_command(url: str, port: str, cmd: str = 'getJob') -> str:
 
     # randomize server name
     url = get_panda_server(url, port)
+
     return f'{url}/server/panda/{cmd}'
 
 
-def request2(url: str = "", data: dict = None, secure: bool = True, compressed: bool = True) -> str or dict:
+def get_headers(use_oidc_token: bool, auth_token_content: str = None, auth_origin: str = None,
+                content_type: str = "application/json", accept: bool = False) -> dict:
+    """
+    Get the headers for the request.
+
+    :param use_oidc_token: True if OIDC token should be used (bool)
+    :param auth_token_content: token content (str)
+    :param auth_origin: token origin (str)
+    :param content_type: content type (str)
+    :param accept: True if accept header should be added (bool)
+    :return: headers (dict).
+    """
+    if use_oidc_token:
+        headers = {
+            "Authorization": f"Bearer {shlex.quote(auth_token_content)}",
+            # "Accept": "application/json",  # what is the difference with "Content-Type"? See else: below
+            "Origin": shlex.quote(auth_origin),
+        }
+    else:
+        headers = {}
+
+    # always add the user agent
+    headers["User-Agent"] = _ctx.user_agent
+
+    # only add the content type if there is a body to send (that is of type application/json)
+    if content_type:
+        headers["Content-Type"] = content_type
+        if accept:
+            headers["Accept"] = content_type
+
+    return headers
+
+
+def get_ssl_context() -> ssl.SSLContext:
+    """
+    Get the SSL context.
+
+    :return: SSL context (ssl.SSLContext).
+    """
+    # should be
+    # ssl_context = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_CLIENT)
+    # but it doesn't work, so use this for now even if it throws a deprecation warning
+    # logger.info(f'ssl.OPENSSL_VERSION_INFO={ssl.OPENSSL_VERSION_INFO}')
+    try:  # for ssl version 3.0 and python 3.10+
+        # ssl_context = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context = ssl.SSLContext(protocol=None)
+    except Exception:  # for ssl version 1.0
+        ssl_context = ssl.SSLContext()
+
+    return ssl_context
+
+
+def get_auth_token_content(auth_token: str, key: bool = False) -> str:
+    """
+    Get the content of the auth token.
+
+    :param auth_token: token name (str)
+    :param key: if true, token key is used (bool)
+    :return: token content (str).
+    """
+    path = locate_token(auth_token, key=key)
+    if os.path.exists(path):
+        auth_token_content = read_file(path)
+        if not auth_token_content:
+            logger.warning(f'failed to read file {path}')
+            return ""
+        else:
+            logger.info(f'read contents from file {path} (length = {len(auth_token_content)})')
+    else:
+        if not path:
+            logger.warning('token could not be located (path is not set - make sure OIDC env vars are set)')
+        else:
+            logger.warning(f'path does not exist: {path}')
+        return ""
+
+    return auth_token_content
+
+
+class IPv4HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(self._create_connection, req)
+
+    def _create_connection(self, host, port=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        return socket.create_connection((host, port), timeout, source_address, family=socket.AF_INET)
+
+
+def request2(url: str = "", data: dict = None, secure: bool = True, compressed: bool = True, panda: bool = False) -> str or dict:  # noqa: C901
     """
     Send a request using HTTPS (using urllib module).
 
@@ -668,87 +852,88 @@ def request2(url: str = "", data: dict = None, secure: bool = True, compressed: 
     :param data: data to send (dict)
     :param secure: use secure connection (bool)
     :param compressed: compress data (bool)
+    :param panda: True for panda server interactions (bool)
     :return: server response (str or dict).
     """
     if data is None:
         data = {}
+
+    ipv = os.environ.get("PILOT_IP_VERSION")
+
     # https might not have been set up if running in a [middleware] container
     if not _ctx.cacert:
-        logger.debug('setting up unset https')
         https_setup(None, get_pilot_version())
 
-    # define additional headers
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": _ctx.user_agent,
-    }
+    # should tokens be used?
+    auth_token, auth_origin = get_local_oidc_token_info()
+    use_oidc_token = auth_token and auth_origin and panda
+    auth_token_content = get_auth_token_content(auth_token) if use_oidc_token else ""
+    if not auth_token_content and use_oidc_token:
+        logger.warning('OIDC_AUTH_TOKEN/PANDA_AUTH_TOKEN content could not be read')
+        return ""
 
-    logger.debug(f'headers={headers}')
+    # only add Accept to headers if new API is used
+    accept = True if "api/v" in url else False
+
+    # get the relevant headers
+    headers = get_headers(use_oidc_token, auth_token_content, auth_origin, accept=accept)
     logger.info(f'data = {data}')
 
-    # Encode data as compressed JSON
+    # encode data as compressed JSON
     if compressed:
+        if "api/v" in url:
+            headers['Content-Encoding'] = 'gzip'
         rdata_out = BytesIO()
         with GzipFile(fileobj=rdata_out, mode="w") as f_gzip:
             f_gzip.write(json.dumps(data).encode())
         data_json = rdata_out.getvalue()
     else:
         data_json = json.dumps(data).encode('utf-8')
-        #data_json = urllib.parse.quote(json.dumps(data))
-        #data_json = data_json.encode('utf-8')
-        #data_json = urllib.parse.urlencode(data).encode()
+    logger.info(f'headers = {hide_token(headers.copy())}')
 
-    # Set up the request
+    # set up the request
     req = urllib.request.Request(url, data_json, headers=headers)
 
-    # Create a context with certificate verification
-    #logger.debug(f'cacert={_ctx.cacert}')  # /alrb/x509up_u25606_prod
-    #logger.debug(f'capath={_ctx.capath}')  # /cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase/etc/grid-security-emi/certificates
-    #context = ssl.create_default_context(cafile=_ctx.cacert, capath=_ctx.capath)
-    #logger.debug(f'context={context}')
-
-    # should be
-    # ssl_context = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_CLIENT)
-    # but it doesn't work, so use this for now even if it throws a deprecation warning
-    logger.info(f'ssl.OPENSSL_VERSION_INFO={ssl.OPENSSL_VERSION_INFO}')
-    try:  # for ssl version 3.0 and python 3.10+
-        # ssl_context = ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_CLIENT)
-        ssl_context = ssl.SSLContext(protocol=None)
-    except Exception:  # for ssl version 1.0
-        ssl_context = ssl.SSLContext()
-
+    # create a context with certificate verification
+    ssl_context = get_ssl_context()
     #ssl_context.verify_mode = ssl.CERT_REQUIRED
-    ssl_context.load_cert_chain(certfile=_ctx.cacert, keyfile=_ctx.cacert)
+    if not use_oidc_token:
+        ssl_context.load_cert_chain(certfile=_ctx.cacert, keyfile=_ctx.cacert)
 
     if not secure:
         ssl_context.verify_mode = False
         ssl_context.check_hostname = False
 
+    if ipv == 'IPv4':
+        logger.info("will use IPv4 in server communication")
+        install_ipv4_opener()
+    else:
+        logger.info("will use IPv6 in server communication")
+
     # ssl_context = ssl.create_default_context(capath=_ctx.capath, cafile=_ctx.cacert)
     # Send the request securely
     try:
         logger.debug('sending data to server')
-        with urllib.request.urlopen(req, context=ssl_context) as response:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=config.Pilot.http_maxtime) as response:
             # Handle the response here
-            logger.debug(f"response.status={response.status}, response.reason={response.reason}")
+            logger.info(f"response.status={response.status}, response.reason={response.reason}")
             ret = response.read().decode('utf-8')
             if 'getProxy' not in url:
-                logger.debug(f"response={ret}")
+                logger.info(f"response={ret}")
         logger.debug('sent request to server')
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
-        logger.warning(f'failed to send request: {exc}')
-        ret = ""
+    except (urllib.error.URLError, urllib.error.HTTPError, http_client.RemoteDisconnected, TimeoutError, ssl.SSLError) as exc:
+        ret = f"failed to send request: {exc}"
+        logger.warning(ret)
     else:
         if secure and isinstance(ret, str):
-            if ret.startswith('{') and ret.endswith('}'):
-                logger.debug('loading string into dictionary')
+            if ret == 'Succeeded':  # this happens for sending modeOn (debug mode)
+                ret = {'StatusCode': '0'}
+            elif ret.startswith('{') and ret.endswith('}'):
                 try:
                     ret = json.loads(ret)
-                except Exception as e:
+                except json.JSONDecodeError as e:
                     logger.warning(f'failed to parse response: {e}')
-            else:
-                logger.debug('parsing string into dictionary')
-                # For panda server interactions, the response should be in dictionary format
+            else:  # response="StatusCode=_some number_"
                 # Parse the query string into a dictionary
                 query_dict = parse_qs(ret)
 
@@ -756,6 +941,37 @@ def request2(url: str = "", data: dict = None, secure: bool = True, compressed: 
                 ret = {k: v[0] if len(v) == 1 else v for k, v in query_dict.items()}
 
     return ret
+
+
+def install_ipv4_opener():
+    """Install the IPv4 opener."""
+    http_proxy = os.environ.get("http_proxy")
+    all_proxy = os.environ.get("all_proxy")
+    if http_proxy and all_proxy:
+        logger.info(f"using http_proxy={http_proxy}, all_proxy={all_proxy}")
+        proxy_handler = urllib.request.ProxyHandler({
+            'http': http_proxy,
+            'https': http_proxy,
+            'all': all_proxy
+        })
+        opener = urllib.request.build_opener(proxy_handler, IPv4HTTPHandler())
+    else:
+        logger.info("no http_proxy found, will use IPv4 without proxy")
+        opener = urllib.request.build_opener(IPv4HTTPHandler())
+    urllib.request.install_opener(opener)
+
+
+def hide_token(headers: dict) -> dict:
+    """
+    Hide the token in the headers.
+
+    :param headers: Copy of headers (dict)
+    :return: headers with token hidden (dict).
+    """
+    if 'Authorization' in headers:
+        headers['Authorization'] = 'Bearer ********'
+
+    return headers
 
 
 def request3(url: str, data: dict = None) -> str:
@@ -799,7 +1015,7 @@ def request3(url: str, data: dict = None) -> str:
 
         # Handle the response as needed
         ret = response.text
-    except (requests.exceptions.RequestException, requests.exceptions.Timeout) as exc:
+    except requests.exceptions.RequestException as exc:
         logger.warning(f'failed to send request: {exc}')
         ret = ""
 
@@ -825,23 +1041,23 @@ def upload_file(url: str, path: str) -> bool:
         file_content = file.read()
 
     # Define request object
-    request = urllib.request.Request(url, data=file_content, headers=headers, method='POST')
+    req = urllib.request.Request(url, data=file_content, headers=headers, method='POST')
 
     # Set timeouts
-    request.timeout = 20
-    request.socket_timeout = 120
+    req.timeout = 20
+    req.socket_timeout = 120
 
     # Perform the request
     ret = 'notok'
     try:
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(req) as response:
             response_data = response.read()
             # Handle response
             ret = response_data.decode('utf-8')
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as e:
         # Handle URL errors
-        logger.warning("URL Error:", e)
-        ret = e
+        logger.warning(f"exception caught in urlopen: {e}")
+        ret = str(e)
 
     if ret == 'ok':
         status = True
@@ -851,21 +1067,231 @@ def upload_file(url: str, path: str) -> bool:
     return status
 
 
-def download_file(url: str, _timeout: int = 20) -> str:
+def download_file(url: str, timeout: int = 20, headers: dict = None) -> str:
     """
     Download url content.
 
+    The optional headers should in fact be used for downloading OIDC tokens.
+
     :param url: url (str)
+    :param timeout: optional timeout (int)
+    :param headers: optional headers (dict)
     :return: url content (str).
     """
-    req = urllib.request.Request(url)
-    req.add_header('User-Agent', ctx.user_agent)
+    # define the request headers
+    if headers is None:
+        headers = {"User-Agent": _ctx.user_agent}
+    logger.debug(f"headers = {hide_token(headers.copy())}")
+
+    req = urllib.request.Request(url, headers=headers)
+
+    # download the file
     try:
-        with urllib.request.urlopen(req, context=ctx.ssl_context, timeout=_timeout) as response:
+        with urllib.request.urlopen(req, context=ctx.ssl_context, timeout=timeout) as response:
             content = response.read()
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as exc:
         logger.warning(f"error occurred with urlopen: {exc.reason}")
         # Handle the error, set content to None or handle as needed
         content = ""
 
     return content
+
+
+def refresh_oidc_token(auth_token: str, auth_origin: str, url: str, port: int) -> bool:
+    """
+    Refresh the OIDC token.
+
+    :param auth_token: token name (str)
+    :param auth_origin: token origin (str)
+    :param url: server URL (str)
+    :param port: server port (int)
+    :return: True if success, False otherwise (bool).
+    """
+    status = False
+
+    # first get the token key
+    token_key = os.environ.get("PANDA_AUTH_TOKEN_KEY")
+    if not token_key:
+        logger.warning('PANDA_AUTH_TOKEN_KEY is not set - will not be able to download a new token')
+        return False
+
+    panda_token_key = get_auth_token_content(token_key, key=True)
+    if panda_token_key:
+        logger.info(f'read token key: {token_key}')
+    else:
+        logger.warning('failed to get panda_token_key - will not be able to download a new token')
+        return status
+
+    # now get the actual token
+    auth_token_content = get_auth_token_content(auth_token)
+    if not auth_token_content:
+        logger.warning(f'failed to get auth token content for {auth_token}')
+        return status
+
+    headers = get_headers(True, auth_token_content, auth_origin, content_type=None)
+    server_command = get_server_command(url, port, cmd='get_access_token')
+
+    # the client name and token key should be added to the URL as parameters
+    server_command += f'?client_name=pilot_server&token_key={panda_token_key}'
+
+    content = download_file(server_command, headers=headers)
+    if content:
+        status = handle_file_content(content, auth_token)
+    else:
+        logger.warning(f'failed to download data from \"{url}\" resource')
+
+    return status
+
+
+def handle_file_content(content: bytes or str, auth_token: str) -> bool:
+    """
+    Handle the content of the downloaded file.
+
+    The original token is overwritten with the new token.
+
+    :param content: file content (bytes or str)
+    :param auth_token: token name (str)
+    :return: True if success, False otherwise (bool).
+    """
+    status = False
+
+    # define the path if it does not exist already
+    path = os.environ.get('OIDC_REFRESHED_AUTH_TOKEN')
+    if path is None:
+        path = os.path.join(os.environ.get('PILOT_HOME'), 'tmp_refreshed_token')
+
+    if isinstance(content, bytes):
+        content = content.decode('utf-8')
+
+    # convert the string to a dictionary
+    _content = ast.literal_eval(content)
+
+    # check for errors
+    statuscode = _content.get('StatusCode', 0)
+    diagnostics = _content.get('ErrorDialog', '')
+    if statuscode != 0:
+        logger.warning(f"failed to get new token: StatusCode={statuscode}, ErrorDialog={diagnostics}")
+    else:
+        token = _content.get('userProxy')
+        if not token:
+            logger.warning(f'failed to find userProxy in content: {content}')
+        else:
+            # write the content to the file
+            try:
+                with open(path, "w", encoding='utf-8') as _file:
+                    _file.write(token)
+            except IOError as exc:
+                logger.warning(f'failed to write data to file {path}: {exc}')
+            else:
+                # proceed with renaming the refreshed token to that of the original one (i.e. overwrite)
+                status = rename(path, auth_token)
+                if status:
+                    logger.info(f'saved token data in file {path}, length={len(content) / 1024.:.1f} kB')
+                    os.environ['OIDC_REFRESHED_AUTH_TOKEN'] = auth_token
+                else:
+                    logger.warning(f'failed to rename {path} to {auth_token}')
+
+    return status
+
+
+def update_local_oidc_token_info(url: str, port: int):
+    """
+    Update the local OIDC token info.
+
+    :param url: URL (str)
+    :param port: port number (int).
+    """
+    auth_token, auth_origin = get_local_oidc_token_info()
+    if auth_token and auth_origin:
+        logger.debug('updating OIDC token info')
+        status = refresh_oidc_token(auth_token, auth_origin, url, port)
+        if not status:
+            logger.warning('failed to refresh OIDC token')
+        else:
+            logger.info('OIDC token has been refreshed')
+    else:
+        logger.debug('no OIDC token info to update')
+
+
+def get_base_urls(args_base_urls: str) -> list:
+    """
+    Get base URLs for transform download.
+
+    :param args_base_urls: base URLs (str)
+    :return: list of base URLs (list).
+    """
+    base_urls = args_base_urls.split(",") if args_base_urls else []
+    if not base_urls:
+        # try to get the list from an environmental variable instead
+        urls = os.getenv("PANDA_BASE_URLS", None)
+        if urls:
+            base_urls = urls.split(",") if urls else []
+
+    return base_urls
+
+
+def get_memory_limits(url: str, port: int) -> dict:
+    """
+    Get the resource types from the server.
+
+    Args:
+        url (str): The URL of the server.
+        port (int): The port number of the server.
+
+    Returns:
+        dict: A dictionary of resource types.
+    """
+    cmd = get_server_command(url, port, cmd="getResourceTypes")
+    try:
+        response = request2(cmd, panda=True)  # will be a dictionary
+    except Exception as exc:
+        logger.warning(f'exception caught in request2() while getting resource types: {exc}')
+        return {}
+    logger.debug(f"response from {cmd} = {response}")
+
+    if not response:
+        logger.warning(f'failed to get memory limits from {cmd}')
+        return {}
+
+    # convert the response to a dictionary in case it is a string
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except json.JSONDecodeError as exc:
+            logger.warning(f'failed to parse response as JSON: {exc}')
+            return {}
+
+    resource_types_pre = response.get('ResourceTypes', {})
+    # Handle if resource_types_pre is a string (legacy server response)
+    if isinstance(resource_types_pre, str):
+        resource_types_str = resource_types_pre.replace("None", "null").replace("'", '"')
+        try:
+            resource_types_list = json.loads(resource_types_str)
+        except json.JSONDecodeError as exc:
+            logger.warning(f'failed to parse ResourceTypes as JSON: {exc}')
+            resource_types_list = []
+    elif isinstance(resource_types_pre, dict):
+        resource_types_list = resource_types_pre.get('ResourceTypes', [])
+    else:
+        resource_types_list = []
+
+    # create the final dictionary
+    resource_types = {}
+    try:
+        for entry in resource_types_list:
+            resource_name = entry.get('resource_name', '')
+            mincore = entry.get('mincore', 0)
+            maxcore = entry.get('maxcore', 0)
+            minrampercore = entry.get('minrampercore', 0)
+            maxrampercore = entry.get('maxrampercore', 0)
+            resource_types[resource_name] = {
+                'mincore': mincore,
+                'maxcore': maxcore,
+                'minrampercore': minrampercore,
+                'maxrampercore': maxrampercore
+            }
+    except Exception as exc:
+        logger.warning(f'failed to parse resource types: {exc}')
+        resource_types = {}
+
+    return resource_types

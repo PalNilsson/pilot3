@@ -17,19 +17,48 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2018-2024
+# - Paul Nilsson, paul.nilsson@cern.ch, 2018-25
 
 """Functions for building job metrics."""
 
-# from pilot.util.jobmetrics import get_job_metrics_entry
-
 import logging
-from typing import Any
+
+from pilot.info import JobData
+from pilot.util.jobmetrics import get_job_metrics_entry
+from pilot.util.math import mean
 
 logger = logging.getLogger(__name__)
 
 
-def get_job_metrics(job: Any, extra: dict = None) -> str:
+def get_job_metrics_string(job: JobData, extra: dict = None) -> str:
+    """
+    Get the job metrics string.
+
+    :param job: job object (JobData)
+    :param extra: any extra information to be added (dict)
+    :return: job metrics (str).
+    """
+    if extra is None:
+        extra = {}
+    job_metrics = ""
+
+    if job.cpufrequencies:
+        try:
+            _mean = int(mean(job.cpufrequencies))
+        except ValueError:
+            pass
+        else:
+            job_metrics += get_job_metrics_entry("cpuFrequency", _mean)
+
+    # add any additional info
+    if extra:
+        for entry in extra:
+            job_metrics += get_job_metrics_entry(entry, extra.get(entry))
+
+    return job_metrics
+
+
+def get_job_metrics(job: JobData, extra: dict = None) -> str:
     """
     Return a properly formatted job metrics string.
 
@@ -40,10 +69,13 @@ def get_job_metrics(job: Any, extra: dict = None) -> str:
     Format: nEvents=<int> nEventsW=<int> vmPeakMax=<int> vmPeakMean=<int> RSSMean=<int> hs06=<float> shutdownTime=<int>
             cpuFactor=<float> cpuLimit=<float> diskLimit=<float> jobStart=<int> memLimit=<int> runLimit=<float>
 
-    :param job: job object (Any)
+    :param job: job object (JobData)
     :param extra: any extra information to be added (dict)
     :return: job metrics (str).
     """
-    #if extra is None:
-    #    extra = {}
-    return ""
+    if extra is None:
+        extra = {}
+    # get job metrics string
+    job_metrics = get_job_metrics_string(job, extra=extra)
+
+    return job_metrics

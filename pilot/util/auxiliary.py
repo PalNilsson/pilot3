@@ -17,13 +17,14 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-23
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-24
 
 """Auxiliary functions."""
 
 import logging
 import os
 import re
+import shlex
 import socket
 import sys
 
@@ -32,6 +33,7 @@ from collections import deque, OrderedDict
 from numbers import Number
 from time import sleep
 from typing import Any
+from uuid import uuid4
 
 from pilot.util.constants import (
     SUCCESS,
@@ -43,7 +45,10 @@ from pilot.util.constants import (
 )
 from pilot.common.errorcodes import ErrorCodes
 from pilot.util.container import execute
-from pilot.util.filehandling import dump
+from pilot.util.filehandling import (
+    dump,
+    grep
+)
 
 zero_depth_bases = (str, bytes, Number, range, bytearray)
 iteritems = 'items'
@@ -174,6 +179,7 @@ def get_error_code_translation_dictionary() -> dict:
     """
     error_code_translation_dictionary = {
         -1: [64, "Site offline"],
+        errors.CVMFSISNOTALIVE: [64, "CVMFS is not responding"],  # same exit code as site offline
         errors.GENERALERROR: [65, "General pilot error, consult batch log"],  # added to traces object
         errors.MKDIR: [66, "Could not create directory"],  # added to traces object
         errors.NOSUCHFILE: [67, "No such file or directory"],  # added to traces object
@@ -191,7 +197,9 @@ def get_error_code_translation_dictionary() -> dict:
         errors.MISSINGINPUTFILE: [77, "Missing input file in SE"],  # should pilot report this type of error to wrapper?
         errors.PANDAQUEUENOTACTIVE: [78, "PanDA queue is not active"],
         errors.COMMUNICATIONFAILURE: [79, "PanDA server communication failure"],
-        errors.CVMFSISNOTALIVE: [64, "CVMFS is not responding"],  # same exit code as site offline
+        errors.PROXYTOOSHORT: [80, "Proxy too short"],  # added to traces object
+        errors.REACHEDMAXTIME: [81, "Reached maximum time limit"],  # added to traces object
+        errors.NOJOBSINPANDA: [82, "No jobs in PanDA"],  # added to traces object
         errors.KILLSIGNAL: [137, "General kill signal"],  # Job terminated by unknown kill signal
         errors.SIGTERM: [143, "Job killed by signal: SIGTERM"],  # 128+15
         errors.SIGQUIT: [131, "Job killed by signal: SIGQUIT"],  # 128+3
@@ -361,9 +369,9 @@ def check_for_final_server_update(update_server: bool) -> None:
     """
     Check for the final server update.
 
-    Do not set graceful stop if pilot has not finished sending the final job update
-    i.e. wait until SERVER_UPDATE is DONE_FINAL. This function sleeps for a maximum
-    of 20*30 s until SERVER_UPDATE env variable has been set to SERVER_UPDATE_FINAL.
+    Do not set graceful stop if pilot has not finished sending the final job update.
+    This function sleeps for a maximum of 20*30 s until SERVER_UPDATE env variable has been set
+    to SERVER_UPDATE_FINAL.
 
     :param update_server: args.update_server (bool).
     """
@@ -372,6 +380,8 @@ def check_for_final_server_update(update_server: bool) -> None:
 
     # abort if in startup stage or if in final update stage
     server_update = os.environ.get('SERVER_UPDATE', '')
+    logger.info(f'current server update state: {server_update}')
+    logger.info(f'update_server={update_server}')
     if server_update == SERVER_UPDATE_NOT_DONE:
         return
 
@@ -443,7 +453,7 @@ def get_memory_usage(pid: int) -> (int, str, str):
     return execute(f'ps aux -q {pid}', timeout=60)
 
 
-def extract_memory_usage_value(output: str) -> int:
+def extract_memory_usage_value(output: str) -> str:
     """
     Extract the memory usage value from the ps output (in kB).
 
@@ -481,34 +491,38 @@ def cut_output(txt: str, cutat: int = 1024, separator: str = '\n[...]\n') -> str
     return txt
 
 
-def has_instruction_set(instruction_set: str) -> bool:
+def has_instruction_sets(instruction_sets: list) -> str:
     """
     Determine whether a given CPU instruction set is available.
 
     The function will use grep to search in /proc/cpuinfo (both in upper and lower case).
+    Example: instruction_sets = ['AVX', 'AVX2', 'SSE4_2', 'XXX'] -> "AVX|AVX2|SSE4_2"
 
-    :param instruction_set: instruction set (e.g. AVX2) (str)
-    :return: True if given instruction set is available, False otherwise (bool).
+    :param instruction_sets: instruction set (e.g. AVX2) (list)
+    :return: string of pipe-separated instruction sets (str).
     """
-    status = False
-    cmd = fr"grep -o \'{instruction_set.lower()}[^ ]*\|{instruction_set.upper()}[^ ]*\' /proc/cpuinfo"
-    exit_code, stdout, stderr = execute(cmd)
-    if not exit_code and not stderr:
-        if instruction_set.lower() in stdout.split() or instruction_set.upper() in stdout.split():
-            status = True
+    ret = ""
 
-    return status
+    for instr in instruction_sets:
+        pattern = re.compile(fr'{instr.lower()}[^ ]*', re.IGNORECASE)
+        out = grep(patterns=[pattern], file_name="/proc/cpuinfo")
+
+        for stdout in out:
+            if instr.upper() not in ret and (instr.lower() in stdout.split() or instr.upper() in stdout.split()):
+                ret += f'|{instr.upper()}' if ret else instr.upper()
+
+    return ret
 
 
-def has_instruction_sets(instruction_sets: str) -> bool:
+def has_instruction_sets_old(instruction_sets: list) -> str:
     """
     Determine whether a given list of CPU instruction sets is available.
 
     The function will use grep to search in /proc/cpuinfo (both in upper and lower case).
     Example: instruction_sets = ['AVX', 'AVX2', 'SSE4_2', 'XXX'] -> "AVX|AVX2|SSE4_2"
 
-    :param instruction_sets: instruction set (e.g. AVX2) (str)
-    :return: True if given instruction set is available, False otherwise (bool).
+    :param instruction_sets: instruction set (e.g. AVX2) (list)
+    :return: string of pipe-separated instruction sets (str).
     """
     ret = ""
     pattern = ""
@@ -708,8 +722,8 @@ def encode_globaljobid(jobid: str, maxsize: int = 31) -> str:
         else:
             try:
                 host = socket.gethostname()
-            except socket.herror as exc:
-                logger.warning(f'failed to get host name: {exc}')
+            except socket.herror as e:
+                logger.warning(f'failed to get host name: {e}')
                 host = 'localhost'
         return host.split('.')[0]
 
@@ -796,3 +810,46 @@ def correct_none_types(data_dict: dict) -> dict:
         if value == 'None' or value == 'null':
             data_dict[key] = None
     return data_dict
+
+
+def is_command_available(command: str):
+    """
+    Check if the given command is available on the system.
+
+    :param command: command to check (str)
+    :return: True if command is available, False otherwise (bool)
+    """
+    args = shlex.split(command)
+
+    return os.access(args[0], os.X_OK)
+
+
+def is_kubernetes_resource() -> bool:
+    """
+    Determine if the pilot is running on a Kubernetes resource.
+
+    :return: True if running on Kubernetes, False otherwise (bool)
+    """
+    if os.environ.get('K8S_JOB_ID'):
+        return True
+    else:
+        return False
+
+
+def uuidgen_t() -> str:
+    """
+    Generate a UUID string in the same format as "uuidgen -t".
+
+    :return: A UUID in the format "00000000-0000-0000-0000-000000000000" (str).
+    """
+    return str(uuid4())
+
+
+def list_items(items: list):
+    """
+    List the items in the given list as a numbered list.
+
+    :param items: list of items (list)
+    """
+    for i, item in enumerate(items):
+        logger.info(f'{i + 1}: {item}')

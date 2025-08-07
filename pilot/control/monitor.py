@@ -18,61 +18,122 @@
 #
 # Authors:
 # - Daniel Drizhuk, d.drizhuk@gmail.com, 2017
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-2024
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
 
 # NOTE: this module should deal with non-job related monitoring, such as thread monitoring. Job monitoring is
 #       a task for the job_monitor thread in the Job component.
 
-"""Functions for monitoring of threads."""
+"""Functions for monitoring of pilot and threads."""
 
 import logging
+import os
 import threading
 import time
 import re
-from os import environ, getuid
-from subprocess import Popen, PIPE
+
+from collections import namedtuple
+from os import environ, getuid, getpid
+from subprocess import (
+    Popen,
+    PIPE
+)
 from typing import Any
 
 from pilot.common.exception import PilotException, ExceededMaxWaitTime
-from pilot.util.auxiliary import check_for_final_server_update, set_pilot_state
+from pilot.common.pilotcache import get_pilot_cache
+from pilot.util.auxiliary import (
+    check_for_final_server_update,
+    set_pilot_state
+)
+from pilot.util.cgroups import monitor_cgroup
 from pilot.util.common import is_pilot_check
 from pilot.util.config import config
 from pilot.util.constants import MAX_KILL_WAIT_TIME
 # from pilot.util.container import execute
 from pilot.util.features import MachineFeatures
 from pilot.util.heartbeat import update_pilot_heartbeat
-from pilot.util.queuehandling import get_queuedata_from_job, get_maxwalltime_from_job, abort_jobs_in_queues
+from pilot.util.https import (
+    get_local_oidc_token_info,
+    update_local_oidc_token_info
+)
+from pilot.util.psutils import get_process_info
+from pilot.util.queuehandling import (
+    abort_jobs_in_queues,
+    get_timeinfo_from_job,
+    get_queuedata_from_job,
+)
 from pilot.util.timing import get_time_since_start
 
+pilot_cache = get_pilot_cache()
 logger = logging.getLogger(__name__)
 
 
-def control(queues: Any, traces: Any, args: Any):  # noqa: C901
+def cgroup_control(queues: namedtuple, traces: Any, args: object):  # noqa: C901
+    """
+    Control function for the cgroup monitor.
+
+    This function is called from the main control thread to set up the cgroup monitor task.
+
+    Args:
+        queues: internal queues for job handling (namedtuple)
+        traces: tuple containing internal pilot states (Any)
+        args: Pilot arguments (e.g. containing queue name, queuedata dictionary, etc) (object)
+    """
+    if queues or traces:  # to bypass pylint warning
+        pass
+
+    # set up the periodic cgroup monitor task
+    while not args.graceful_stop.is_set():
+        pilot_cgroup_path = pilot_cache.get_cgroup(os.getpid())
+        logger.debug(f"monitoring pilot cgroup at path: {pilot_cgroup_path}")
+        if pilot_cgroup_path:
+            monitor_cgroup(pilot_cgroup_path)
+
+        subprocesses_cgroup_path = pilot_cache.get_cgroup('subprocesses')
+        logger.debug(f"monitoring subprocesses cgroup at path: {subprocesses_cgroup_path}")
+        if subprocesses_cgroup_path:
+            monitor_cgroup(subprocesses_cgroup_path)
+
+        time.sleep(60)
+
+    logger.info("[monitor] cgroup control has ended")
+
+
+def control(queues: namedtuple, traces: Any, args: object):  # noqa: C901
     """
     Monitor threads.
 
     Main control function, run from the relevant workflow module.
 
-    :param queues: internal queues for job handling (Any)
+    :param queues: internal queues for job handling (namedtuple)
     :param traces: tuple containing internal pilot states (Any)
-    :param args: Pilot arguments (e.g. containing queue name, queuedata dictionary, etc) (Any)
+    :param args: Pilot arguments (e.g. containing queue name, queuedata dictionary, etc) (object)
     """
     t_0 = time.time()
     traces.pilot['lifetime_start'] = t_0  # ie referring to when pilot monitoring began
     traces.pilot['lifetime_max'] = t_0
 
     threadchecktime = int(config.Pilot.thread_check)
+    # if OIDC tokens are used, define the time interval for checking the token
+    # otherwise the following variable is None
+    tokendownloadchecktime = get_oidc_check_time()
+    last_token_check = t_0
 
     # for CPU usage debugging
-    # cpuchecktime = int(config.Pilot.cpu_check)
-    # tcpu = t_0
+    cpuchecktime = int(config.Pilot.cpu_check)
+    tcpu = t_0
     last_minute_check = t_0
 
-    queuedata = get_queuedata_from_job(queues)
-    push = args.harvester and args.harvester_submitmode.lower() == 'push'
+    queuedata = pilot_cache.queuedata
+    if not queuedata:
+        logger.warning("no queuedata in pilot cache, will try to extract it from queues")
+        queuedata = get_queuedata_from_job(queues)
+    if not queuedata:
+        logger.warning('queuedata could not be extracted from queues either')
+
     try:
         # overall loop counter (ignoring the fact that more than one job may be running)
-        niter = 0
+        n_iterations = 0
 
         max_running_time_old = 0
         while not args.graceful_stop.is_set():
@@ -81,6 +142,15 @@ def control(queues: Any, traces: Any, args: Any):  # noqa: C901
                 logger.warning('aborting monitor loop since graceful_stop has been set (timing out remaining threads)')
                 run_checks(queues, args)
                 break
+
+            # check if the OIDC token needs to be refreshed
+            if tokendownloadchecktime and queuedata:
+                if int(time.time() - last_token_check) > tokendownloadchecktime:
+                    last_token_check = time.time()
+                    if 'no_token_renewal' in queuedata.catchall or args.token_renewal is False:
+                        logger.info("OIDC token will not be renewed by the pilot")
+                    else:
+                        update_local_oidc_token_info(args.url, args.port)
 
             # abort if kill signal arrived too long time ago, ie loop is stuck
             if args.kill_time and int(time.time()) - args.kill_time > MAX_KILL_WAIT_TIME:
@@ -95,7 +165,7 @@ def control(queues: Any, traces: Any, args: Any):  # noqa: C901
                 grace_time = 0
             # get the current max_running_time (can change with job)
             try:
-                max_running_time = get_max_running_time(args.lifetime, queuedata, queues, push, args.pod)
+                max_running_time, start_time = get_timeinfo(args.lifetime, queuedata, queues, args.pod)
             except Exception as exc:
                 logger.warning(f'caught exception: {exc}')
                 max_running_time = args.lifetime
@@ -104,14 +174,32 @@ def control(queues: Any, traces: Any, args: Any):  # noqa: C901
                     max_running_time_old = max_running_time
                     logger.info(f'using max running time = {max_running_time}s')
 
-            # for testing: max_running_time = 4 * 60
-            if time_since_start > max_running_time - grace_time:
+            # if start_time for the current job is known (push queues), a more detailed check can be performed
+            start_time_ok = False
+            if start_time and queuedata:  # in epoch seconds
+                time_since_job_start = int(time.time()) - start_time
+                # in this case, max_running_time is the max job walltime
+                limit = max_running_time * queuedata.pilot_walltime_grace  # queuedata.pilot_walltime_grace = 1 + PQ.pilot_walltime_grace/100
+                if time_since_job_start > limit:
+                    logger.fatal(f"time since job start ({time_since_job_start}s) has exceeded the limit ({limit}s) - time to abort pilot")
+                    logger.fatal(f'limit = max running time ({max_running_time}s) * pilot walltime grace ({queuedata.pilot_walltime_grace})')
+                    reached_maxtime_abort(args)
+                    break
+                else:
+                    logger.info(f'time since job start ({time_since_job_start}s) is within the limit ({limit}s)')
+                    logger.debug(f'max running time = {max_running_time}s, queuedata.pilot_walltime_grace = {queuedata.pilot_walltime_grace}')
+                    start_time_ok = True
+
+            # fallback to max_running_time if start_time is not known
+            if (time_since_start > max_running_time - grace_time) and not start_time_ok:
                 logger.fatal(f'max running time ({max_running_time}s) minus grace time ({grace_time}s) has been '
                              f'exceeded - time to abort pilot')
                 reached_maxtime_abort(args)
                 break
-            if niter % 60 == 0:
-                logger.info(f'{time_since_start}s have passed since pilot start')
+
+            if n_iterations % 60 == 0:
+                logger.info(f"{time_since_start}s have passed since pilot start - server update state is \'{environ['SERVER_UPDATE']}\'")
+                logger.debug(f"args.update_server={args.update_server}")
 
             # every minute run the following check
             if is_pilot_check(check='machinefeatures'):
@@ -122,19 +210,22 @@ def control(queues: Any, traces: Any, args: Any):  # noqa: C901
                         break
                     last_minute_check = time.time()
 
+            # test max
+            #time.sleep(120)
+            #reached_maxtime_abort(args)
             # take a nap
             time.sleep(1)
 
             # time to check the CPU usage?
-            # if is_pilot_check(check='cpu_usage'):
-            #     if int(time.time() - tcpu) > cpuchecktime:
-            #         processes = get_process_info('python3 pilot3/pilot.py', pid=getpid())
-            #         if processes:
-            #             logger.info(f'PID={getpid()} has CPU usage={processes[0]}% CMD={processes[2]}')
-            #             nproc = processes[3]
-            #             if nproc > 1:
-            #                 logger.info(f'.. there are {nproc} such processes running')
-            #         tcpu = time.time()
+            if is_pilot_check(check='cpu_usage'):
+                if int(time.time() - tcpu) > cpuchecktime:
+                    processes = get_process_info('python3 pilot3/pilot.py', pid=getpid())
+                    if processes:
+                        logger.info(f'PID={getpid()} has CPU usage={processes[0]}% CMD={processes[2]}')
+                        nproc = processes[3]
+                        if nproc > 1:
+                            logger.info(f'.. there are {nproc} such processes running')
+                    tcpu = time.time()
 
             # proceed with running the other checks
             run_checks(queues, args)
@@ -149,24 +240,53 @@ def control(queues: Any, traces: Any, args: Any):  # noqa: C901
                             logger.fatal(f'thread \'{thread.name}\' is not alive')
                             # args.graceful_stop.set()
 
-            niter += 1
+            n_iterations += 1
 
     except Exception as error:
         print((f"monitor: exception caught: {error}"))
         raise PilotException(error) from error
 
+    # shut down the cgroups monitoring task
+    # logger.info("[monitor] waiting for cgroup monitor task to finish")
+    # await task
+
     logger.info('[monitor] control thread has ended')
+
+
+def get_oidc_check_time() -> int or None:
+    """
+    Return the time interval for checking the OIDC token.
+
+    :return: time interval for checking the OIDC token (int or None).
+    """
+    auth_token, auth_origin = get_local_oidc_token_info()
+    use_oidc_token = True if auth_token and auth_origin else False
+    if use_oidc_token:
+        try:
+            token_check = int(config.Token.download_check)
+        except (AttributeError, ValueError):
+            token_check = None
+    else:
+        token_check = None
+
+    return token_check
 
 
 def run_shutdowntime_minute_check(time_since_start: int) -> bool:
     """
     Run checks on machine features shutdowntime once a minute.
 
-    :param time_since_start: how many seconds have lapsed since the pilot started (int)
-    :return: True if reached max time, False otherwise (also if shutdowntime not known) (bool).
+    Args:
+        time_since_start (int): how many seconds have lapsed since the pilot started
+
+    Returns:
+        True if reached max time, False otherwise (also if shutdowntime not known) (bool).
     """
     # check machine features if present for shutdowntime
     machinefeatures = MachineFeatures().get()
+    logger.debug(f"MachineFeatures().get()={machinefeatures}")
+    logger.debug(f"type(machinefeatures)={type(machinefeatures)}")
+
     if machinefeatures:
         grace_time = 10 * 60
         try:
@@ -181,10 +301,10 @@ def run_shutdowntime_minute_check(time_since_start: int) -> bool:
         if _shutdowntime:
             try:
                 shutdowntime = int(_shutdowntime)
-            except (TypeError, ValueError):  # as exc:
-                #logger.debug(f'failed to convert shutdowntime: {exc}')
+            except (TypeError, ValueError) as exc:
+                logger.warning(f'failed to convert shutdowntime: {exc}')
                 return False  # will be ignored
-            logger.debug(f'machinefeatures shutdowntime={shutdowntime} - now={now}')
+
         if not shutdowntime:
             logger.debug('ignoring shutdowntime since it is not set')
             return False  # will be ignored
@@ -232,11 +352,7 @@ def reached_maxtime_abort(args: Any):
     args.graceful_stop.set()
 
 
-#def log_lifetime(sig, frame, traces):
-#    logger.info('lifetime: %i used, %i maximum', int(time.time() - traces.pilot['lifetime_start']), traces.pilot['lifetime_max'])
-
-
-def get_process_info(cmd: str, user: str = "", args: str = 'aufx', pid: int = 0) -> list:
+def get_process_info_old(cmd: str, user: str = "", args: str = 'aufx', pid: int = 0) -> list:
     """
     Return process info for given command.
 
@@ -299,12 +415,12 @@ def get_proper_pilot_heartbeat() -> int:
         return 60
 
 
-def run_checks(queues: Any, args: Any) -> None:
+def run_checks(queues: namedtuple, args: object) -> None:
     """
     Perform non-job related monitoring checks.
 
-    :param queues: queues object (Any)
-    :param args: Pilot arguments object (Any)
+    :param queues: queues object (namedtuple)
+    :param args: Pilot arguments object (object)
     :raises: ExceedMaxWaitTime.
     """
     # check how long time has passed since last successful heartbeat
@@ -381,40 +497,38 @@ def run_checks(queues: Any, args: Any) -> None:
 #            raise ExceededMaxWaitTime(diagnostics)
 
 
-def get_max_running_time(lifetime: int, queuedata: Any, queues: Any, push: bool, pod: bool) -> int:
+def get_timeinfo(lifetime: int, queuedata: Any, queues: namedtuple, pod: bool) -> tuple[int or None, int or None]:
     """
-    Return the maximum allowed running time for the pilot.
+    Return the maximum allowed running time for the pilot and any start time for the running job.
 
     The max time is set either as a pilot option or via the schedconfig.maxtime for the PQ in question.
     If running in a Kubernetes pod, always use the args.lifetime as maxtime (it will be determined by the harvester submitter).
 
     :param lifetime: optional pilot option time in seconds (int)
     :param queuedata: queuedata object (Any)
-    :param queues: queues object (Any)
-    :param push: push mode (bool)
+    :param queues: queues object (namedtuple)
     :param pod: pod mode (bool)
-    :return: max running time in seconds (int).
+    :return: max running time in seconds (int or None), start time in seconds (int or None) (tuple).
     """
     if pod:
-        return lifetime
+        return lifetime, None
 
     max_running_time = lifetime
+    start_time = None
 
     if not queuedata:
         #logger.warning(f'queuedata could not be extracted from queues, will use default for max running time '
         #               f'({max_running_time}s)')
-        return max_running_time
+        return max_running_time, start_time
 
-    # for push queues: try to get the walltime from the job object first, in case it exists and is set
-    if push:
-        try:
-            _max_running_time = get_maxwalltime_from_job(queues, queuedata.params)
-        except Exception as exc:
-            logger.warning(f'caught exception: {exc}')
-        else:
-            if _max_running_time:
-                #logger.debug(f'using max running time from job: {_max_running_time}s')
-                return _max_running_time
+    try:
+        _max_running_time, start_time = get_timeinfo_from_job(queues, queuedata.params)
+    except Exception as exc:
+        logger.warning(f'caught exception: {exc}')
+    else:
+        if _max_running_time:
+            logger.debug(f'using max running time from job: {_max_running_time}s and start time: {start_time}')
+            return _max_running_time, start_time
 
     # use the schedconfig value if set, otherwise use the pilot option lifetime value
     if queuedata.maxtime:
@@ -430,4 +544,4 @@ def get_max_running_time(lifetime: int, queuedata: Any, queues: Any, push: bool,
             #else:
             #    logger.debug(f'will use queuedata.maxtime value for max running time: {max_running_time}s')
 
-    return max_running_time
+    return max_running_time, start_time

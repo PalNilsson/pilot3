@@ -17,7 +17,7 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-23
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
 
 """A collection of functions related to file handling."""
 
@@ -262,6 +262,32 @@ def grep(patterns: list, file_name: str) -> list:
     :return: list of matched lines in file (list).
     """
     matched_lines = []
+    compiled_patterns = [re.compile(pattern) for pattern in patterns]
+
+    with open(file_name, 'r', encoding='utf-8') as _file:
+        matched_lines = [
+            line for line in _file
+            if any(compiled_pattern.search(line) for compiled_pattern in compiled_patterns)
+        ]
+
+    return matched_lines
+
+
+def grep_old(patterns: list, file_name: str) -> list:
+    """
+    Search for the patterns in the given list in a file.
+
+    Example:
+      grep(["St9bad_alloc", "FATAL"], "athena_stdout.txt")
+      -> [list containing the lines below]
+        CaloTrkMuIdAlg2.sysExecute()             ERROR St9bad_alloc
+        AthAlgSeq.sysExecute()                   FATAL  Standard std::exception is caught
+
+    :param patterns: list of regexp patterns (list)
+    :param file_name: file name (str)
+    :return: list of matched lines in file (list).
+    """
+    matched_lines = []
     _pats = []
     for pattern in patterns:
         _pats.append(re.compile(pattern))
@@ -388,7 +414,7 @@ def read_json(filename: str) -> dict:
 
 
 def write_json(filename: str, data: Union[dict, list], sort_keys: bool = True, indent: int = 4,
-               separators: tuple = (',', ': ')) -> bool:
+               separators: tuple[str, str] = (',', ': ')) -> bool:
     r"""
     Write the dictionary to a JSON file.
 
@@ -477,6 +503,8 @@ def remove_dir_tree(path: str) -> int:
     except OSError as exc:
         logger.warning(f"failed to remove directory: {path} ({exc.errno}, {exc.strerror})")
         return -1
+    logger.debug(f'removed {path}')
+
     return 0
 
 
@@ -1376,3 +1404,23 @@ def rename_xrdlog(name: str):
                 logger.warning(f'did not find the expected {xrd_logfile} in {pilot_home}')
         else:
             logger.warning(f'cannot look for {xrd_logfile} since PILOT_HOME was not set')
+
+
+def rename(from_name: str, to_name: str) -> bool:
+    """
+    Rename a file from one name to another.
+
+    :param from_name: The original name of the file (str)
+    :param to_name: The new name of the file (str)
+    :return: True if the operation was successful, False otherwise (bool).
+    """
+    status = False
+    try:
+        os.rename(from_name, to_name)
+        status = True
+    except FileNotFoundError as exc:
+        logger.warning(f"file not found: {exc}")
+    except IOError as exc:
+        logger.warning(f"an error occurred while processing the file: {exc}")
+
+    return status

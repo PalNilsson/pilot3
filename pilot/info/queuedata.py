@@ -17,7 +17,7 @@
 #
 # Authors:
 # - Alexey Anisenkov, anisyonk@cern.ch, 2018-19
-# - Paul Nilsson, paul.nilsson@cern.ch, 2019-23
+# - Paul Nilsson, paul.nilsson@cern.ch, 2019-25
 
 
 """
@@ -37,17 +37,18 @@ on the configuration settings
 :date: January 2018
 """
 
+import logging
 import re
+from typing import Any
 
 from .basedata import BaseData
 
-import logging
 logger = logging.getLogger(__name__)
 
 
 class QueueData(BaseData):
     """
-        High-level object to host all queuedata settings associated to given PandaQueue
+    High-level object to host all queuedata settings associated to given PandaQueue
     """
 
     # ## put explicit list of all the attributes with comments for better inline-documentation by sphinx
@@ -59,11 +60,10 @@ class QueueData(BaseData):
     appdir = ""     #
     catchall = ""   # General catchall field
     environ = ""    # Special field for key=value pairs to be added as exports to payload command
-
     platform = ""     # cmtconfig value
     container_options = ""  # singularity only options? to be reviewed and forced to be a dict (support options for other containers?)
     container_type = {}  # dict of container names by user as a key
-
+    resource_type = ""  # type of resource, e.g. 'grid', 'hpc'
     copytools = None
     acopytools = None
 
@@ -76,68 +76,62 @@ class QueueData(BaseData):
     astorages = None
     aprotocols = None
     params = {}
-
     state = None  # AGIS PQ state, e.g. ACTIVE
     status = ""   # PQ status, e.g. online
     site = None   # ATLAS Site name
 
     direct_access_lan = False  # Prefer remote io (True) or use only copy2scratch method (False) for stage-in over LAN
     direct_access_wan = False  # Prefer remote io (True) or use only copy2scratch method (False) for stage-in over WAN
-
     allow_lan = True  # Allow LAN access (whatever method) for stage-in
     allow_wan = False  # Allow WAN access (whatever method) for stage-in
 
     use_pcache = False
-
     maxwdir = 0    # in MB
     maxrss = 0
     maxinputsize = 0
-
     timefloor = 0  # The maximum time during which the pilot is allowed to start a new job, in seconds
     corecount = 1  #
-
     maxtime = 0  # maximum allowed lifetime for pilot to run on the resource (0 will be ignored, fallback to default)
-
     pledgedcpu = 0  #
     es_stageout_gap = 0  ## time gap value in seconds for ES stageout
-
     is_cvmfs = True  # has cvmfs installed
+    memkillgrace = 100  # memory kill grace value in percentage
+
+    altstageout = None  # allow altstageout: force (True) or disable (False) or no preferences (None)
+    pilot_walltime_grace = 1.0  # pilot walltime grace factor
+    pilot_rss_grace = 2.0  # pilot rss grace factor
 
     # specify the type of attributes for proper data validation and casting
     _keys = {int: ['timefloor', 'maxwdir', 'pledgedcpu', 'es_stageout_gap',
-                   'corecount', 'maxrss', 'maxtime', 'maxinputsize'],
+                   'corecount', 'maxrss', 'maxtime', 'maxinputsize', 'memkillgrace'],
              str: ['name', 'type', 'appdir', 'catchall', 'platform', 'container_options', 'container_type',
-                   'resource', 'state', 'status', 'site', 'environ'],
+                   'resource', 'state', 'status', 'site', 'environ', 'resource_type'],
              dict: ['copytools', 'acopytools', 'astorages', 'aprotocols', 'acopytools_schemas', 'params'],
              bool: ['allow_lan', 'allow_wan', 'direct_access_lan', 'direct_access_wan', 'is_cvmfs', 'use_pcache']
              }
 
-    def __init__(self, data):
+    def __init__(self, data: dict):
         """
-        Init class instance.
+        Initialize class instance.
 
         :param data: input dictionary of queue data settings (dict).
         """
         self.load(data)
-
-        # DEBUG
-        #import pprint
-        #logger.debug(f'initialize QueueData from raw:\n{pprint.pformat(data)}')
         logger.debug(f'final parsed QueueData content:\n{self}')
 
-    def load(self, data):
+    def load(self, data: dict):
         """
-            Construct and initialize data from ext source
-            :param data: input dictionary of queue data settings
-        """
+        Construct and initialize data from ext source
 
+        :param data: input dictionary of queue data settings (dict).
+        """
         # the translation map of the queue data attributes from external data to internal schema
         # 'internal_name':('ext_name1', 'extname2_if_any')
         # 'internal_name2':'ext_name3'
 
         # first defined ext field will be used
         # if key is not explicitly specified then ext name will be used as is
-        ## fix me later to proper internal names if need
+        ## fix me later to proper internal names if needed
 
         kmap = {
             'name': 'nickname',
@@ -149,22 +143,25 @@ class QueueData(BaseData):
 
         self._load_data(data, kmap)
 
-    def resolve_allowed_schemas(self, activity, copytool=None):
+    def resolve_allowed_schemas(self, activity: str or list, copytool: str = None) -> list:
         """
-            Resolve list of allowed schemas for given activity and requested copytool based on `acopytools_schemas` settings
-            :param activity: str or ordered list of transfer activity names to resolve acopytools related data
-            :return: list of protocol schemes
-        """
+        Resolve list of allowed schemas for given activity and requested copytool based on `acopytools_schemas` settings
 
+        :param activity: str or ordered list of transfer activity names to resolve acopytools related data (str or list)
+        :param copytool: requested copytool name (str)
+        :return: list of protocol schemes (list).
+        """
         if not activity:
             activity = 'default'
         if isinstance(activity, str):
-            activity = [activity]
-        if 'default' not in activity:
-            activity = activity + ['default']
+            activity_list = list(activity)
+        else:
+            activity_list = activity
+        if 'default' not in activity_list:
+            activity_list.append('default')
 
         adat = {}
-        for aname in activity:
+        for aname in activity_list:
             adat = self.acopytools_schemas.get(aname)
             if adat:
                 break
@@ -179,12 +176,36 @@ class QueueData(BaseData):
 
         return adat.get(copytool) or []
 
-    def clean(self):
+    def allow_altstageout(self):
         """
-            Validate and finally clean up required data values (required object properties) if need
-            :return: None
+        Resolve if alternative stageout should be forced (True) or disabled (False); None value means no preferences defined.
+        :return: boolean or None
         """
 
+        val = self.params.get('allow_altstageout', None)
+        if val is not None:  # cast to bool
+            return bool(val)
+
+    def set_pilot_walltime_grace(self):
+        """Set pilot walltime grace factor based on the queuedata settings."""
+        try:
+            _pilot_walltime_grace = float(self.params.get('pilot_walltime_grace', 0))
+            self.pilot_walltime_grace = 1.0 + _pilot_walltime_grace / 100.0
+        except (ValueError, TypeError) as e:
+            logger.warning(f"failed to set pilot_walltime_grace: {e}")
+            self.pilot_walltime_grace = 1.0
+
+    def set_pilot_rss_grace(self):
+        """Set pilot rss grace factor based on the queuedata settings."""
+        try:
+            _pilot_rss_grace = float(self.params.get('pilot_rss_grace', 100))
+            self.pilot_rss_grace = 1.0 + _pilot_rss_grace / 100.0
+        except (ValueError, TypeError) as e:
+            logger.warning(f"failed to set pilot_rss_grace: {e}")
+            self.pilot_rss_grace = 2.0
+
+    def clean(self):
+        """Validate and finally clean up required data values (required object properties) if needed."""
         # validate es_stageout_gap value
         if not self.es_stageout_gap:
             is_opportunistic = self.pledgedcpu and self.pledgedcpu == -1
@@ -209,7 +230,12 @@ class QueueData(BaseData):
                 self.container_options = self.container_options.replace(" --contain", ",${workdir} --contain")
                 logger.info(f"note: added missing $workdir to container_options: {self.container_options}")
 
-        pass
+        # set altstageout settings
+        self.altstageout = self.allow_altstageout()
+
+        # set pilot walltime and rss grace factors
+        self.set_pilot_walltime_grace()
+        self.set_pilot_rss_grace()
 
     ## custom function pattern to apply extra validation to the key values
     ##def clean__keyname(self, raw, value):
@@ -218,22 +244,27 @@ class QueueData(BaseData):
     ##
     ##    return value
 
-    def clean__timefloor(self, raw, value):
+    def clean__timefloor(self, raw: Any, value: int) -> int:
         """
-            Verify and validate value for the timefloor key (convert to seconds)
-        """
+        Verify and validate value for the timefloor key (convert to seconds).
 
+        :param raw: raw value passed from ext source as input - unused (Any)
+        :param value: preliminary cleaned and cast to proper type value (int)
+        :return: timefloor value in seconds (int).
+        """
         return value * 60
 
-    def clean__container_type(self, raw, value):
+    def clean__container_type(self, raw: Any, value: str) -> dict:
         """
-            Parse and prepare value for the container_type key
-            Expected raw data in format 'container_name:user_name;'
-            E.g. container_type = 'singularity:pilot;docker:wrapper', 'apptainer:pilot;docker:wrapper'
+        Parse and prepare value for the container_type key.
 
-            :return: dict of container names by user as a key
+        Expected raw data in format 'container_name:user_name;'
+        E.g. container_type = 'singularity:pilot;docker:wrapper', 'apptainer:pilot;docker:wrapper'
+
+        :param raw: raw value passed from ext source as input - unused (Any)
+        :param value: preliminary cleaned and cast to proper type value (str)
+        :return: dictionary of container names by user as a key (dict).
         """
-
         ret = {}
         val = value or ''
         for e in val.split(';'):
@@ -244,16 +275,22 @@ class QueueData(BaseData):
 
         return ret
 
-    def clean__container_options(self, raw, value):
+    def clean__container_options(self, raw: Any, value: str) -> str:
         """
-            Verify and validate value for the container_options key (remove bad values)
-        """
+        Verify and validate value for the container_options key (remove bad values)
 
+        :param raw: raw value passed from ext source as input - unused (Any)
+        :param value: preliminary cleaned and cast to proper type value (str)
+        :return: cleaned container_options value (str).
+        """
         return value if value.lower() not in ['none'] else ''
 
-    def clean__corecount(self, raw, value):
+    def clean__corecount(self, raw: Any, value: int) -> int:
         """
-            Verify and validate value for the corecount key (set to 1 if not set)
-        """
+        Verify and validate value for the corecount key (set to 1 if not set)
 
+        :param raw: raw value passed from ext source as input - unused (Any)
+        :param value: preliminary cleaned and cast to proper type value (int)
+        :return: corecount value (int).
+        """
         return value if value else 1
