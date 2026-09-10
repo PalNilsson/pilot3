@@ -144,6 +144,7 @@ import os
 import re
 import signal
 import tempfile
+import threading
 import time
 from shutil import (
     disk_usage,
@@ -334,6 +335,17 @@ CVMFS_FAILURE_SIGNATURES = (
     "can't open to read symbols",
     "could not open as an executable file",
 )
+
+# Matches a path gdb reached for through the inferior's mount namespace. Such a
+# failure is about gdb's access to the container, not about the filesystem the
+# path names, so it must not be read as evidence about CVMFS.
+TARGET_PATH_PATTERN = re.compile(r"target:\S*")
+
+# Matches a CVMFS path in a gdb warning, so that the pilot can check it itself.
+CVMFS_PATH_PATTERN = re.compile(r"/cvmfs/\S+")
+
+# Time allowed for the pilot's own read of a path gdb failed on, in seconds.
+PATH_CHECK_TIMEOUT = 20
 
 # Maximum number of gdb frames requested per thread in phase B.
 MAX_BACKTRACE_FRAMES = 100
@@ -1375,7 +1387,7 @@ def get_container_analysis_info(job: Any, setup: str) -> list:
             f"  {container_command}",
         ]
 
-    if setup:
+    if setup.strip(" ;\t\n"):
         lines += [
             "",
             "release setup (as used by the pilot):",
@@ -1531,7 +1543,17 @@ def get_gdb_setup(job: Any) -> str:
         logger.warning(f"{LOG_PREFIX}: failed to build the gdb setup: {exc}")
         return ""
 
-    return scratch.debug_command
+    setup = scratch.debug_command
+
+    # a job without a software release (a user analysis job, say) gets a setup that is
+    # empty apart from its separator. Treating that as a real setup puts a bare leading
+    # ';' into the gdb command and an empty "release setup:" section into the analysis
+    # file, both of which read as though something went missing
+    if not setup.strip(" ;\t\n"):
+        logger.debug(f"{LOG_PREFIX}: the {pilot_user} plugin returned no usable setup")
+        return ""
+
+    return setup
 
 
 def has_room_for_core(workdir: str, rss: int) -> bool:
@@ -1603,6 +1625,35 @@ def has_python_startup_failure(output: str) -> bool:
     return any(signature in (output or "") for signature in PYTHON_FAILURE_SIGNATURES)
 
 
+def get_executable_argument(pid: int) -> str:
+    """Return the gdb option naming the executable of a process.
+
+    gdb defaults to ``sysroot = target:``, which makes it fetch the executable
+    through the inferior's mount namespace. For a containerised payload that
+    means reaching into an Apptainer image from the host, which fails with
+
+        warning: "target:/usr/bin/python3.9": could not open as an executable
+        file: Input/output error.
+
+    and leaves gdb with no symbols, no vsyscall page and ``?? ()`` in place of
+    the stop location. ``/proc/<pid>/exe`` is a magic symlink to the inode
+    itself, so opening it bypasses the mount namespace entirely and works from
+    the host regardless of what the path looks like inside the container.
+
+    Args:
+        pid: Process id to attach to.
+
+    Returns:
+        The ``-se <path>`` option, or an empty string if the link is not there.
+    """
+    path = f"/proc/{pid}/exe"
+    if not os.path.exists(path):
+        logger.warning(f"{LOG_PREFIX}: {path} does not exist - gdb will have to find the executable itself")
+        return ""
+
+    return f"-se {path}"
+
+
 def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbols: bool = True) -> str:
     """Return the gdb invocation attaching to a process and running commands.
 
@@ -1638,6 +1689,9 @@ def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbol
         "-iex 'set debuginfod enabled off'",
         "-iex 'set index-cache enabled off'",
     ]
+    executable = get_executable_argument(pid)
+    if executable:
+        options.insert(1, executable)
     if not symbols:
         options += [
             "-iex 'set auto-solib-add off'",
@@ -1780,24 +1834,150 @@ def log_gdb_output(output: str, label: str, output_path: str) -> None:
     logger.info(f"{LOG_PREFIX}: {label}: gdb output:\n{text}")
 
 
-def has_cvmfs_io_failure(output: str) -> bool:
-    """Return True if the gdb output shows a CVMFS path could not be read.
+def call_with_timeout(func: Any, timeout: float, default: Any = None) -> Any:
+    """Call a function in a daemon thread and give up after *timeout* seconds.
 
-    Both a CVMFS path and a read failure have to appear on the same line. gdb
-    emits plenty of warnings that mention neither, and plenty that mention a
-    path without failing on it, so requiring the pair keeps this from firing on
-    ordinary noise.
+    Used for filesystem checks that can block indefinitely. ``signal.alarm``,
+    which :mod:`pilot.util.cvmfs` uses at start-up, is not an option here: the
+    looping check runs in a monitoring thread and ``signal.alarm`` only works
+    in the main thread.
+
+    Args:
+        func: Callable taking no arguments.
+        timeout: Seconds to wait.
+        default: Value returned if the call does not finish in time.
+
+    Returns:
+        The call's return value, or *default* if it did not finish in time.
+    """
+    result = []
+
+    def _run():
+        try:
+            result.append(func())
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(f"{LOG_PREFIX}: {getattr(func, '__name__', 'call')} raised: {exc}")
+            result.append(default)
+
+    thread = threading.Thread(target=_run, daemon=True, name="looping-dump-check")
+    thread.start()
+    thread.join(timeout=timeout)
+
+    return result[0] if result else default
+
+
+def strip_target_paths(line: str) -> str:
+    """Remove paths gdb reached for through the inferior's mount namespace.
+
+    A ``target:`` prefix means gdb was reading through the container rather
+    than from the worker node's own filesystem, and for an unprivileged
+    Apptainer image that fails with an I/O error even when the file is
+    perfectly readable on the host. Such a failure says nothing about the
+    health of the filesystem the path names.
+
+    Args:
+        line: One line of gdb output.
+
+    Returns:
+        The line with any ``target:`` paths removed.
+    """
+    return TARGET_PATH_PATTERN.sub("", line or "")
+
+
+def get_cvmfs_failure_paths(output: str) -> list:
+    """Return the CVMFS paths gdb failed to read from the worker node itself.
+
+    Both a CVMFS path and a read failure have to appear on the same line, and
+    paths reached through the container are excluded (see
+    :func:`strip_target_paths`).
 
     Args:
         output: Captured gdb output.
 
     Returns:
-        True if a CVMFS read failure is present.
+        List of CVMFS paths, without duplicates, in the order seen.
     """
-    return any(
-        CVMFS_PATH_MARKER in line and any(signature in line for signature in CVMFS_FAILURE_SIGNATURES)
-        for line in (output or "").split("\n")
-    )
+    paths = []
+    for line in (output or "").split("\n"):
+        if not any(signature in line for signature in CVMFS_FAILURE_SIGNATURES):
+            continue
+        for path in CVMFS_PATH_PATTERN.findall(strip_target_paths(line)):
+            path = path.rstrip("\"'`:.,")
+            if path not in paths:
+                paths.append(path)
+
+    return paths
+
+
+def is_path_unreadable(path: str) -> bool:
+    """Return True if the pilot cannot read the given path from this node.
+
+    A read that blocks counts as unreadable, on the same reasoning as the CVMFS
+    availability check: ``open`` blocks indefinitely on a hung mount, so a check
+    that never returns has established what it set out to.
+
+    Args:
+        path: Absolute path to test.
+
+    Returns:
+        True if the path could not be read.
+    """
+    def _read() -> bool:
+        try:
+            with open(path, "rb") as _file:
+                _file.read(1)
+        except OSError as exc:
+            logger.warning(f"{LOG_PREFIX}: the pilot cannot read {path}: {exc}")
+            return True
+
+        return False
+
+    unreadable = call_with_timeout(_read, PATH_CHECK_TIMEOUT, default=None)
+    if unreadable is None:
+        logger.warning(
+            f"{LOG_PREFIX}: reading {path} did not return within {PATH_CHECK_TIMEOUT} s - "
+            f"treating it as unreadable, since a hung mount is what makes it block"
+        )
+        return True
+
+    return unreadable
+
+
+def has_cvmfs_io_failure(output: str) -> bool:
+    """Return True if CVMFS is genuinely unreadable on this worker node.
+
+    gdb failing to read a CVMFS path is not sufficient on its own. Its default
+    sysroot makes it fetch files through the inferior's mount namespace, and
+    reaching into an unprivileged Apptainer image from the host fails with an
+    I/O error whatever the file is - observed at ANALY_CERN-PTEST on
+    ``target:/usr/bin/python3.9`` while CVMFS was demonstrably healthy. Since
+    most payload executables live under ``/cvmfs``, taking gdb's word for it
+    would have mislabelled almost every containerised looping job.
+
+    So a path only counts if gdb named it without the ``target:`` prefix, and
+    the pilot - which runs outside the container - then confirms that it cannot
+    read the file either.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if a CVMFS path was confirmed unreadable from this node.
+    """
+    for path in get_cvmfs_failure_paths(output):
+        if is_path_unreadable(path):
+            logger.warning(
+                f"{LOG_PREFIX}: {path} is unreadable for the pilot as well - CVMFS is broken on "
+                f"this node, which is enough on its own to make a payload appear to loop"
+            )
+            return True
+
+        logger.info(
+            f"{LOG_PREFIX}: gdb could not read {path} but the pilot can, so this is gdb reaching "
+            f"through the container's mount namespace rather than a CVMFS failure"
+        )
+
+    return False
 
 
 def has_attach_failure(output: str) -> bool:

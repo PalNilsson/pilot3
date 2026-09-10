@@ -1220,55 +1220,119 @@ class TestPerPhaseLogging(unittest.TestCase):
 
 
 class TestCvmfsFailureDetection(unittest.TestCase):
-    """A CVMFS read failure while dumping reframes the whole job."""
+    """gdb failing on a CVMFS path is not by itself a CVMFS failure.
 
-    # verbatim from the production log that prompted this: gdb could not read the
-    # payload's own executable while taking the diagnostic core dump
-    PRODUCTION_LINE = (
+    gdb defaults to fetching files through the inferior's mount namespace, and
+    reaching into an unprivileged Apptainer image from the host fails with an
+    I/O error whatever the file is. Since most payload executables live under
+    /cvmfs, taking gdb's word for it would mislabel almost every containerised
+    looping job. A path only counts if gdb named it without the target: prefix
+    and the pilot, which runs outside the container, cannot read it either.
+    """
+
+    # verbatim from the wuppertal log. Note the target: prefix - this is gdb
+    # reaching through the container, not a statement about CVMFS
+    WUPPERTAL_LINE = (
         'warning: "target:/cvmfs/atlas.cern.ch/repo/sw/software/25.2/AnalysisBase/25.2.97/'
         'InstallArea/x86_64-el9-gcc14-opt/bin/eventloop_run_grid_job": could not open as an '
         'executable file: Input/output error.'
     )
 
-    def test_the_production_signature_is_recognised(self):
-        """The line that started this."""
-        self.assertTrue(loopingdumps.has_cvmfs_io_failure(self.PRODUCTION_LINE))
+    # verbatim from ANALY_CERN-PTEST, where CVMFS was demonstrably healthy: the
+    # same error, on a path that has nothing to do with CVMFS
+    PTEST_LINE = (
+        'warning: "target:/usr/bin/python3.9": could not open as an executable file: '
+        'Input/output error.'
+    )
 
-    def test_the_symbol_read_variant_is_recognised(self):
-        """gdb reports the same failure a second way, for symbols."""
-        line = ("warning: `target:/cvmfs/atlas.cern.ch/repo/sw/x.so': can't open to read "
-                "symbols: Input/output error.")
+    # what a real CVMFS failure looks like: no target: prefix, so gdb read it
+    # from the worker node's own filesystem
+    HOST_LINE = (
+        'warning: "/cvmfs/atlas.cern.ch/repo/sw/software/25.2/bin/athena": could not open as '
+        'an executable file: Input/output error.'
+    )
 
-        self.assertTrue(loopingdumps.has_cvmfs_io_failure(line))
+    def test_a_target_prefixed_failure_is_not_evidence_about_cvmfs(self):
+        """The wuppertal line, which this code was originally built around."""
+        self.assertEqual(loopingdumps.get_cvmfs_failure_paths(self.WUPPERTAL_LINE), [])
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(self.WUPPERTAL_LINE))
 
-    def test_an_io_error_on_a_local_path_is_not_a_cvmfs_failure(self):
-        """Both halves have to be on the same line, or this fires on anything."""
-        self.assertFalse(loopingdumps.has_cvmfs_io_failure(
-            "warning: \"/tmp/scratch/payload\": could not open as an executable file: Input/output error."))
+    def test_the_same_error_occurs_with_cvmfs_healthy(self):
+        """ANALY_CERN-PTEST produced it on a non-CVMFS path with CVMFS working."""
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(self.PTEST_LINE))
 
-    def test_a_cvmfs_path_without_a_failure_is_not_one_either(self):
+    def test_a_host_path_is_extracted_for_checking(self):
+        """Without the prefix, the path is gdb's own view of the node."""
+        paths = loopingdumps.get_cvmfs_failure_paths(self.HOST_LINE)
+
+        self.assertEqual(paths, ["/cvmfs/atlas.cern.ch/repo/sw/software/25.2/bin/athena"])
+
+    def test_the_pilot_confirming_the_failure_is_evidence(self):
+        """Two independent readers failing on the same path is a broken node."""
+        with patch.object(loopingdumps, "is_path_unreadable", return_value=True), \
+             self.assertLogs("pilot.util.loopingdumps", level="WARNING") as captured:
+            observed = loopingdumps.has_cvmfs_io_failure(self.HOST_LINE)
+
+        self.assertTrue(observed)
+        self.assertIn("CVMFS is broken on this node", "\n".join(captured.output))
+
+    def test_the_pilot_reading_it_fine_settles_the_matter(self):
+        """gdb could not, the pilot could, so it was the mount namespace."""
+        with patch.object(loopingdumps, "is_path_unreadable", return_value=False), \
+             self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            observed = loopingdumps.has_cvmfs_io_failure(self.HOST_LINE)
+
+        self.assertFalse(observed)
+        self.assertIn("mount namespace", "\n".join(captured.output))
+
+    def test_a_cvmfs_path_without_a_failure_is_not_one(self):
         """gdb mentions CVMFS paths constantly when things are working."""
-        self.assertFalse(loopingdumps.has_cvmfs_io_failure(
-            "0x00001 in main () from /cvmfs/atlas.cern.ch/repo/sw/lib/libAthenaKernel.so"))
+        self.assertEqual(loopingdumps.get_cvmfs_failure_paths(
+            "0x1 in main () from /cvmfs/atlas.cern.ch/repo/sw/lib/libAthenaKernel.so"), [])
+
+    def test_an_io_error_on_a_local_path_is_not_one_either(self):
+        """Both halves have to be on the same line, and the path must be CVMFS."""
+        self.assertEqual(loopingdumps.get_cvmfs_failure_paths(
+            'warning: "/tmp/scratch/payload": Input/output error.'), [])
 
     def test_the_two_halves_on_separate_lines_do_not_combine(self):
         """An unrelated CVMFS line next to an unrelated error must not pair up."""
         output = ("Reading symbols from /cvmfs/atlas.cern.ch/repo/sw/bin/athena\n"
                   "warning: /tmp/x: Input/output error.")
 
-        self.assertFalse(loopingdumps.has_cvmfs_io_failure(output))
+        self.assertEqual(loopingdumps.get_cvmfs_failure_paths(output), [])
 
     def test_ordinary_backtraces_are_clean(self):
         """No false positive on the common case."""
         self.assertFalse(loopingdumps.has_cvmfs_io_failure(PARTIAL_BACKTRACE))
         self.assertFalse(loopingdumps.has_cvmfs_io_failure(""))
 
-    def test_the_dump_reports_the_failure_to_its_caller(self):
+    def test_a_blocked_read_counts_as_unreadable(self):
+        """open() blocks indefinitely on a hung mount."""
+        with patch.object(loopingdumps, "PATH_CHECK_TIMEOUT", 0.2), \
+             patch.object(loopingdumps, "call_with_timeout", return_value=None), \
+             self.assertLogs("pilot.util.loopingdumps", level="WARNING"):
+            self.assertTrue(loopingdumps.is_path_unreadable("/cvmfs/atlas.cern.ch/x"))
+
+    def test_a_readable_path_is_reported_as_readable(self):
+        """The check has to be able to clear a path, or it proves nothing."""
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"x")
+            handle.flush()
+            self.assertFalse(loopingdumps.is_path_unreadable(handle.name))
+
+    def test_a_missing_path_is_reported_as_unreadable(self):
+        """A path gdb saw that the pilot cannot open at all."""
+        with self.assertLogs("pilot.util.loopingdumps", level="WARNING"):
+            self.assertTrue(loopingdumps.is_path_unreadable("/cvmfs/does/not/exist/anywhere"))
+
+    def test_the_dump_reports_a_confirmed_failure_to_its_caller(self):
         """The caller uses this to pick the error code, so it must propagate."""
         with tempfile.TemporaryDirectory() as workdir:
             job = FakeJob(pid=1000, workdir=workdir)
-            stub = GdbStub([(1, self.PRODUCTION_LINE, None), (0, PARTIAL_BACKTRACE, None)])
+            stub = GdbStub([(1, self.HOST_LINE, None), (0, PARTIAL_BACKTRACE, None)])
             with patch.object(loopingdumps, "execute", stub), \
+                 patch.object(loopingdumps, "is_path_unreadable", return_value=True), \
                  patch.object(loopingdumps, "select_dump_candidates", return_value=[(1003, "athena")]), \
                  patch.object(loopingdumps, "get_rss", return_value=1024), \
                  patch.object(loopingdumps, "has_room_for_core", return_value=True), \
@@ -1277,17 +1341,16 @@ class TestCvmfsFailureDetection(unittest.TestCase):
                  patch.object(loopingdumps, "read_proc_link", return_value="/cvmfs/sw/bin/athena"), \
                  patch.object(loopingdumps, "get_cmdline", return_value="bash -c payload"), \
                  patch.object(loopingdumps, "resume_process"), \
-                 self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+                 self.assertLogs("pilot.util.loopingdumps", level="INFO"):
                 observed = create_core_dump(job)
 
         self.assertTrue(observed)
-        self.assertIn("could not read a CVMFS path", "\n".join(captured.output))
 
-    def test_a_clean_dump_reports_nothing(self):
-        """No signal means no claim about CVMFS."""
+    def test_the_dump_reports_nothing_for_a_namespace_artifact(self):
+        """The wuppertal case must not reach the caller as a CVMFS failure."""
         with tempfile.TemporaryDirectory() as workdir:
             job = FakeJob(pid=1000, workdir=workdir)
-            stub = GdbStub([(0, "Saved corefile", os.path.join(workdir, "core.1003")),
+            stub = GdbStub([(0, self.WUPPERTAL_LINE, os.path.join(workdir, "core.1003")),
                             (0, PARTIAL_BACKTRACE, None)])
             with patch.object(loopingdumps, "execute", stub), \
                  patch.object(loopingdumps, "select_dump_candidates", return_value=[(1003, "athena")]), \
@@ -1302,6 +1365,83 @@ class TestCvmfsFailureDetection(unittest.TestCase):
                 observed = create_core_dump(job)
 
         self.assertFalse(observed)
+
+
+class TestExecutableArgument(unittest.TestCase):
+    """gdb must be told which binary it is looking at, without going through the container."""
+
+    def test_the_proc_exe_link_is_used(self):
+        """A magic symlink to the inode, so the mount namespace is irrelevant."""
+        argument = loopingdumps.get_executable_argument(os.getpid())
+
+        self.assertEqual(argument, f"-se /proc/{os.getpid()}/exe")
+
+    def test_a_dead_process_yields_no_argument(self):
+        """The link disappears with the process; gdb has to cope on its own."""
+        with self.assertLogs("pilot.util.loopingdumps", level="WARNING"):
+            self.assertEqual(loopingdumps.get_executable_argument(999999999), "")
+
+    def test_the_invocation_carries_the_executable(self):
+        """Otherwise gdb resolves the path inside the container and fails."""
+        invocation = build_gdb_invocation(os.getpid(), ["-ex bt"])
+
+        self.assertIn(f"-se /proc/{os.getpid()}/exe", invocation)
+
+
+class TestEmptySetupHandling(unittest.TestCase):
+    """A job without a software release gets a setup that is only a separator."""
+
+    def test_a_separator_only_setup_is_normalised_away(self):
+        """The plugin returns '; ' for a job with no software release.
+
+        Observed at ANALY_CERN-PTEST, where swRelease was NULL. Passing that on
+        as a real setup is what produced the bare leading ';' in the gdb
+        command and the empty section in the analysis file.
+        """
+        class _Plugin:  # pylint: disable=too-few-public-methods
+            """Stand-in for a plugin whose setup comes back empty."""
+
+            @staticmethod
+            def preprocess_debug_command(scratch):
+                """Leave the command as the separator alone."""
+                scratch.debug_command = "; "
+
+        with patch.object(loopingdumps, "__import__", create=True, return_value=_Plugin):
+            setup = loopingdumps.get_gdb_setup(FakeJob())
+
+        self.assertEqual(setup, "")
+
+    def test_a_real_setup_is_passed_through(self):
+        """The normalisation must not swallow a setup that has content."""
+        class _Plugin:  # pylint: disable=too-few-public-methods
+            """Stand-in for a plugin returning a real setup."""
+
+            @staticmethod
+            def preprocess_debug_command(scratch):
+                """Set a setup with actual content."""
+                scratch.debug_command = "asetup Athena,24.0.41; "
+
+        with patch.object(loopingdumps, "__import__", create=True, return_value=_Plugin):
+            setup = loopingdumps.get_gdb_setup(FakeJob())
+
+        self.assertEqual(setup, "asetup Athena,24.0.41; ")
+
+    def test_an_empty_setup_leaves_no_stray_separator(self):
+        """The phase B command used to start with a bare ';'."""
+        cmd = build_phase_command(build_gdb_invocation(7, ["-ex bt"]),
+                                  "/srv/core.7.gdb.txt", "=== phase B ===", setup="")
+
+        self.assertFalse(cmd.startswith(";"))
+
+    def test_an_empty_setup_leaves_no_empty_analysis_section(self):
+        """An empty 'release setup:' heading reads as though something went missing."""
+        with patch.object(loopingdumps, "read_proc_link", return_value="/usr/bin/python3"), \
+             patch.object(loopingdumps, "get_rss", return_value=0), \
+             patch.object(loopingdumps, "get_cmdline", return_value="bash -c payload"), \
+             patch.object(loopingdumps, "get_shared_libraries", return_value=[]):
+            info = get_core_analysis_info(FakeJob(), 1003, "python x.py", "/srv/core.1003", setup="")
+
+        self.assertNotIn("release setup (as used by the pilot)", info)
 
 
 if __name__ == "__main__":

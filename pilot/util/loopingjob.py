@@ -24,7 +24,6 @@
 from __future__ import annotations
 import logging
 import os
-import threading
 import time
 from typing import Any
 
@@ -48,6 +47,7 @@ from pilot.util.cvmfs import (
 from pilot.util.heartbeat import time_since_suspension
 from pilot.util.loopingdumps import (
     MAX_STACK_TRACE_CANDIDATES,
+    call_with_timeout,
     create_core_dump,
     remove_diagnostic_files,
     select_dump_candidates,
@@ -169,27 +169,17 @@ def _check_cvmfs_health() -> bool:
         logger.info('skipping the CVMFS check since NO_CVMFS_OK is set for this queue')
         return None
 
-    result = []
+    sentinel = object()
+    available = call_with_timeout(is_cvmfs_available, CVMFS_CHECK_TIMEOUT, default=sentinel)
 
-    def _run():
-        try:
-            result.append(is_cvmfs_available())
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.warning(f'CVMFS availability check raised: {exc}')
-            result.append(False)
-
-    thread = threading.Thread(target=_run, daemon=True, name='cvmfs-health')
-    thread.start()
-    thread.join(timeout=CVMFS_CHECK_TIMEOUT)
-
-    if thread.is_alive():
+    if available is sentinel:
         logger.warning(
             f'CVMFS availability check did not return within {CVMFS_CHECK_TIMEOUT} s - '
             f'treating CVMFS as unreadable, since a hung mount is what makes it block'
         )
         return False
 
-    return result[0] if result else None
+    return available
 
 
 def _diagnose_cvmfs(job: Any, cvmfs_failure_in_dump: bool) -> bool:
