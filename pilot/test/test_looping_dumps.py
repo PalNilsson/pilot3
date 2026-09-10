@@ -51,6 +51,7 @@ Covers:
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -1589,6 +1590,48 @@ class TestInContainerBacktraces(unittest.TestCase):
         # once outside the container and once inside it: the release setup runs in
         # there, so that is where it exports the PYTHONHOME that breaks gdb
         self.assertEqual(stub.calls[0][0].count("unset PYTHONHOME"), 2)
+
+
+class TestHeaderQuoting(unittest.TestCase):
+    """The phase header is shell input, so it has to be quoted as such."""
+
+    def test_an_apostrophe_in_the_header_does_not_break_the_command(self):
+        """The header "in the payload's container" killed phase B in production.
+
+        The apostrophe closed the single-quoted echo early and the following
+        parenthesis became a syntax error, so bash rejected the whole command
+        and gdb never ran. Constraining the header by convention was not
+        enough; it has to be quoted.
+        """
+        cmd = build_phase_command("gdb -p 7", "/tmp/out.txt",
+                                  "=== phase B: backtraces (in the payload's container) ===")
+
+        self.assertEqual(subprocess.run(["bash", "-n", "-c", cmd], check=False).returncode, 0)
+
+    def test_the_headers_actually_used_all_parse(self):
+        """Every header this module emits, checked against a real shell."""
+        headers = [
+            "=== phase A: core file (bare gdb, no release setup, no symbols) ===",
+            "=== phase A (retry): core file (clean environment) ===",
+            "=== phase B: backtraces (release setup) ===",
+            "=== phase B: backtraces (in the payload's container) ===",
+            "=== phase B (retry): backtraces (no release setup) ===",
+        ]
+        for header in headers:
+            cmd = build_phase_command("gdb -p 7", "/tmp/out.txt", header)
+            self.assertEqual(
+                subprocess.run(["bash", "-n", "-c", cmd], check=False).returncode, 0, msg=header
+            )
+
+    def test_the_header_still_reaches_the_output_file(self):
+        """Quoting must not mangle what the reader sees."""
+        with tempfile.TemporaryDirectory() as workdir:
+            path = os.path.join(workdir, "out.txt")
+            header = "=== phase B: backtraces (in the payload's container) ==="
+            cmd = build_phase_command("true", path, header)
+            subprocess.run(["bash", "-c", cmd], check=False)
+            with open(path, encoding="utf-8") as _file:
+                self.assertIn(header, _file.read())
 
 
 if __name__ == "__main__":

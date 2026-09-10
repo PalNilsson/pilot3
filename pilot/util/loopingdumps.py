@@ -1874,15 +1874,18 @@ def build_phase_command(invocation: str, output_path: str, header: str, setup: s
     Args:
         invocation: gdb command as returned by :func:`build_gdb_invocation`.
         output_path: File the phase appends its output to.
-        header: Single line marking the phase in the output file; must not
-            contain a single quote.
+        header: Single line marking the phase in the output file. Quoted here
+            rather than constrained by convention: a header reading "in the
+            payload's container" once closed the quoting early and turned the
+            rest of the line into a syntax error, killing the phase before gdb
+            ran.
         setup: Experiment setup prepended to the command.
 
     Returns:
         Full shell command string.
     """
     identity = "echo \"gdb: $(command -v gdb)\"; gdb --version 2>&1 | head -1"
-    inner = f"echo '{header}'; date -u '+%Y-%m-%dT%H:%M:%SZ'; {identity}; {invocation}"
+    inner = f"echo {shlex.quote(header)}; date -u '+%Y-%m-%dT%H:%M:%SZ'; {identity}; {invocation}"
 
     return f'{setup}{get_environment_prefix()}{{ {inner}; }} >> "{output_path}" 2>&1'
 
