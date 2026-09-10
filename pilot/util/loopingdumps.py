@@ -295,6 +295,46 @@ DEFAULT_DIAGNOSTICS_BUDGET = 900
 # size of every looping job's log file, not just on the dump.
 DEFAULT_CORE_DUMP_MAX_SIZE = "2 GB"
 
+# Stage markers written by gdb itself into the output file. A phase that is
+# killed by its timeout leaves no exit status to reason from, so these are what
+# say how far gdb got.
+#
+# STARTUP_MARKER means "gdb finished starting up and began executing the
+# requested commands". It deliberately does not claim the attach succeeded: gdb
+# in batch mode carries on after an error, so an 'echo' runs even when the
+# attach failed (verified: a failed attach prints "ptrace: No such process."
+# and then the marker anyway). What its *absence* proves is the useful part -
+# gdb was still in start-up, which for an attach means reading symbols.
+STARTUP_MARKER = "=== gdb ready ==="
+CORE_WRITTEN_MARKER = "=== core file written ==="
+
+# Fragments identifying a failed attach. Needed because the marker above cannot
+# carry that meaning, and because a failed attach and a slow one call for
+# completely different responses.
+ATTACH_FAILURE_SIGNATURES = (
+    "ptrace:",
+    "You can't do that without a process to debug",
+)
+
+# Fragments identifying a CVMFS read failure in the gdb output, and the path
+# prefix that ties one to CVMFS rather than to a local file. Both are required
+# on the same line, since gdb reports plenty of unrelated warnings.
+#
+# This matters beyond the dump. The payload executes from CVMFS, so a node that
+# cannot serve the payload's own binary is a node on which the payload will
+# appear to loop. Seen in production as
+#
+#   warning: "target:/cvmfs/.../eventloop_run_grid_job": could not open as an
+#   executable file: Input/output error.
+#
+# on a job that was then reported as a looping payload.
+CVMFS_PATH_MARKER = "/cvmfs/"
+CVMFS_FAILURE_SIGNATURES = (
+    "Input/output error",
+    "can't open to read symbols",
+    "could not open as an executable file",
+)
+
 # Maximum number of gdb frames requested per thread in phase B.
 MAX_BACKTRACE_FRAMES = 100
 
@@ -1563,7 +1603,7 @@ def has_python_startup_failure(output: str) -> bool:
     return any(signature in (output or "") for signature in PYTHON_FAILURE_SIGNATURES)
 
 
-def build_gdb_invocation(pid: int, commands: list, environment: str = "") -> str:
+def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbols: bool = True) -> str:
     """Return the gdb invocation attaching to a process and running commands.
 
     ``--nx`` keeps a stray ``.gdbinit`` out of the way, and debuginfod and the
@@ -1571,10 +1611,22 @@ def build_gdb_invocation(pid: int, commands: list, environment: str = "") -> str
     route to a debuginfod server, so leaving it enabled risks a stall inside a
     step that is already the slowest one here.
 
+    ``symbols=False`` is what makes the core file affordable. gdb reads the
+    symbol table of every mapped shared object *during the attach*, before it
+    executes a single ``-ex`` command, so a phase that needs no symbols at all
+    still pays for all of them. For an AnalysisBase or athena process that is
+    several hundred objects read over CVMFS, and in production it exhausted a
+    300 s timeout on a 989 MB payload before ``generate-core-file`` was ever
+    reached. ``set auto-solib-add off`` has to be an ``-iex``, since by the time
+    an ``-ex`` runs the reading has already happened. It costs nothing here: the
+    core file records memory and mappings, and symbols are resolved when the
+    core file is opened, not when it is written.
+
     Args:
         pid: Process id to attach to.
         commands: gdb ``-ex`` options to run, in order.
         environment: Optional command prefix, e.g. :data:`CLEAN_ENVIRONMENT`.
+        symbols: Whether shared library symbols should be read on attach.
 
     Returns:
         gdb command string.
@@ -1585,8 +1637,16 @@ def build_gdb_invocation(pid: int, commands: list, environment: str = "") -> str
         "-batch",
         "-iex 'set debuginfod enabled off'",
         "-iex 'set index-cache enabled off'",
+    ]
+    if not symbols:
+        options += [
+            "-iex 'set auto-solib-add off'",
+            "-iex 'set auto-load no'",
+        ]
+    options += [
         "-ex 'set confirm off'",
         "-ex 'set pagination off'",
+        f"-ex 'echo {STARTUP_MARKER}\\n'",
     ]
     options += commands
     options += ["-ex detach", "-ex quit"]
@@ -1693,19 +1753,21 @@ def remove_scratch_directory(path: str) -> None:
         rmtree(path, ignore_errors=True)
 
 
-def log_gdb_output(output_path: str, label: str) -> None:
-    """Echo a bounded amount of gdb output into the pilot log.
+def log_gdb_output(output: str, label: str, output_path: str) -> None:
+    """Echo a bounded amount of one phase's gdb output into the pilot log.
 
-    The full output travels in the log tarball next to the core file; this only
-    makes the common case greppable without unpacking it.
+    Called per phase rather than once at the end: a phase whose output is only
+    logged after the following phase has finished is invisible for minutes, and
+    invisible altogether if the pilot does not get that far.
 
     Args:
-        output_path: Output file path.
+        output: Output produced by this phase.
         label: Phase label used in the log message.
+        output_path: Output file path, named in the log for the truncated case.
     """
-    output = read_gdb_output(output_path).strip()
+    output = (output or "").strip()
     if not output:
-        logger.warning(f"{LOG_PREFIX}: {label}: gdb produced no output")
+        logger.warning(f"{LOG_PREFIX}: {label}: gdb produced no output at all")
         return
 
     lines = output.split("\n")
@@ -1716,6 +1778,64 @@ def log_gdb_output(output_path: str, label: str) -> None:
 
     text = "\n".join(lines)
     logger.info(f"{LOG_PREFIX}: {label}: gdb output:\n{text}")
+
+
+def has_cvmfs_io_failure(output: str) -> bool:
+    """Return True if the gdb output shows a CVMFS path could not be read.
+
+    Both a CVMFS path and a read failure have to appear on the same line. gdb
+    emits plenty of warnings that mention neither, and plenty that mention a
+    path without failing on it, so requiring the pair keeps this from firing on
+    ordinary noise.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if a CVMFS read failure is present.
+    """
+    return any(
+        CVMFS_PATH_MARKER in line and any(signature in line for signature in CVMFS_FAILURE_SIGNATURES)
+        for line in (output or "").split("\n")
+    )
+
+
+def has_attach_failure(output: str) -> bool:
+    """Return True if the gdb output shows the attach itself failed.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if the failure signature is present.
+    """
+    return any(signature in (output or "") for signature in ATTACH_FAILURE_SIGNATURES)
+
+
+def log_stall_diagnosis(output: str, label: str) -> None:
+    """Say how far gdb got before it was stopped, using the stage markers.
+
+    A timeout leaves no exit status to reason from, and "gdb was still reading
+    symbols" and "gdb attached and then stalled writing the core file" point at
+    completely different causes.
+
+    Args:
+        output: Output produced by this phase.
+        label: Phase label used in the log message.
+    """
+    if CORE_WRITTEN_MARKER in output:
+        logger.info(f"{LOG_PREFIX}: {label}: the core file was complete before gdb was stopped")
+    elif STARTUP_MARKER in output:
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb reached the requested commands and was stopped while "
+            f"running them"
+        )
+    else:
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb never reached the requested commands - it was still "
+            f"starting up, which on an attach means reading the symbol table of every mapped "
+            f"shared object"
+        )
 
 
 def run_gdb_phase(cmd: str, output_path: str, timeout: int, scratch: str, label: str) -> tuple:
@@ -1748,6 +1868,7 @@ def run_gdb_phase(cmd: str, output_path: str, timeout: int, scratch: str, label:
             f"{LOG_PREFIX}: {label}: gdb timed out after {elapsed} s - whatever it had produced "
             f"by then was kept in {os.path.basename(output_path)}"
         )
+        log_stall_diagnosis(output, label)
     elif exit_code != 0:
         logger.warning(f"{LOG_PREFIX}: {label}: gdb failed with exit code {exit_code} after {elapsed} s")
         if stderr:
@@ -1755,12 +1876,27 @@ def run_gdb_phase(cmd: str, output_path: str, timeout: int, scratch: str, label:
     else:
         logger.info(f"{LOG_PREFIX}: {label}: gdb finished in {elapsed} s")
 
+    log_gdb_output(output, label, output_path)
+
     if has_python_startup_failure(output):
         logger.warning(
             f"{LOG_PREFIX}: {label}: gdb's own embedded interpreter failed to start "
             f"(the 'encodings' error refers to gdb's Python, not to the payload's) - "
             f"a PYTHONHOME/PYTHONPATH in the environment does not match the Python gdb is "
             f"linked against, and gdb aborted before running any command"
+        )
+
+    if has_attach_failure(output):
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb could not attach to the process - it may have exited "
+            f"already, or ptrace may be restricted on this node"
+        )
+
+    if has_cvmfs_io_failure(output):
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb could not read a CVMFS path on this node. The payload "
+            f"executes from CVMFS, so this is likely to be why it appeared to loop, and is "
+            f"likely to affect other jobs on the same node"
         )
 
     return exit_code, output
@@ -1782,18 +1918,21 @@ def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str
         deadline: Diagnostics deadline as a :func:`time.monotonic` value.
 
     Returns:
-        True if gdb reported success.
+        True if gdb reported a CVMFS path it could not read.
     """
     timeout = min(get_core_dump_timeout(), get_remaining_budget(deadline))
     if timeout <= 0:
         logger.warning(f"{LOG_PREFIX}: phase A (core file): skipped - the diagnostics budget is spent")
         return False
 
-    commands = [f"-ex 'generate-core-file {core_path}'"]
+    commands = [
+        f"-ex 'generate-core-file {core_path}'",
+        f"-ex 'echo {CORE_WRITTEN_MARKER}\\n'",
+    ]
     cmd = build_phase_command(
-        build_gdb_invocation(pid, commands),
+        build_gdb_invocation(pid, commands, symbols=False),
         output_path,
-        "=== phase A: core file (bare gdb, no release setup) ===",
+        "=== phase A: core file (bare gdb, no release setup, no symbols) ===",
     )
     exit_code, output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase A (core file)")
 
@@ -1802,7 +1941,7 @@ def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str
         if timeout > 0:
             logger.info(f"{LOG_PREFIX}: phase A (core file): retrying with a clean environment")
             cmd = build_phase_command(
-                build_gdb_invocation(pid, commands, environment=CLEAN_ENVIRONMENT),
+                build_gdb_invocation(pid, commands, environment=CLEAN_ENVIRONMENT, symbols=False),
                 output_path,
                 "=== phase A (retry): core file (clean environment) ===",
             )
@@ -1811,10 +1950,10 @@ def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str
     if exit_code != 0:
         resume_process(pid)
 
-    return exit_code == 0
+    return has_cvmfs_io_failure(output)
 
 
-def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, deadline: float) -> None:
+def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, deadline: float) -> bool:
     """Run phase B: collect the backtraces with the experiment setup.
 
     This is the expensive phase, since every mapped object's symbol table has to
@@ -1832,6 +1971,9 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, de
         scratch: Working directory for the command.
         setup: Experiment setup prepended to the command.
         deadline: Diagnostics deadline as a :func:`time.monotonic` value.
+
+    Returns:
+        True if gdb reported a CVMFS path it could not read.
     """
     timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
     if timeout <= 0:
@@ -1839,7 +1981,7 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, de
             f"{LOG_PREFIX}: phase B (backtraces): skipped - the diagnostics budget is spent "
             f"(the stacks are in the core file)"
         )
-        return
+        return False
 
     commands = [
         f"-ex 'set backtrace limit {MAX_BACKTRACE_FRAMES}'",
@@ -1864,10 +2006,13 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, de
             cmd = build_phase_command(
                 invocation, output_path, "=== phase B (retry): backtraces (no release setup) ==="
             )
-            exit_code, _ = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B retry (backtraces)")
+            exit_code, retry_output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B retry (backtraces)")
+            output += retry_output
 
     if exit_code != 0:
         resume_process(pid)
+
+    return has_cvmfs_io_failure(output)
 
 
 def is_core_file_wanted_for(job: Any, pid: int) -> bool:
@@ -1911,7 +2056,7 @@ def report_core_file(core_path: str) -> None:
         logger.warning(f"{LOG_PREFIX}: no core file was produced at {core_path}")
 
 
-def create_core_dump(job: Any) -> None:
+def create_core_dump(job: Any) -> bool:
     """Create a core dump of the looping payload and record how to analyse it.
 
     Targets the best candidate from :func:`select_dump_candidates` rather than
@@ -1926,17 +2071,22 @@ def create_core_dump(job: Any) -> None:
 
     Args:
         job: Job object. Must have ``pid`` and ``workdir`` set.
+
+    Returns:
+        True if either phase found a CVMFS path it could not read. The caller
+        uses this to distinguish a payload that was looping from a payload on a
+        node that could not serve it.
     """
     if not job.pid or not job.workdir:
         logger.warning(f"{LOG_PREFIX}: cannot create a core file since pid or workdir is unknown")
-        return
+        return False
 
     logger.info(summarise_snapshots())
 
     candidates = select_dump_candidates(job, label="before diagnostics")
     if not candidates:
         logger.warning(f"{LOG_PREFIX}: no dump candidate could be identified")
-        return
+        return False
 
     pid, cmdline = candidates[0]
     logger.info(f"{LOG_PREFIX}: selected pid={pid} for the core dump: {cmdline}")
@@ -1955,12 +2105,13 @@ def create_core_dump(job: Any) -> None:
     logger.info(f"{LOG_PREFIX}: diagnostics budget for pid={pid}: {budget} s (core file={with_core})")
 
     scratch = create_scratch_directory(job)
+    cvmfs_failure = False
     try:
         if with_core:
-            run_core_dump_phase(pid, core_path, output_path, scratch, deadline)
+            cvmfs_failure = run_core_dump_phase(pid, core_path, output_path, scratch, deadline)
             report_core_file(core_path)
-        run_backtrace_phase(pid, output_path, scratch, setup, deadline)
+        cvmfs_failure = run_backtrace_phase(pid, output_path, scratch, setup, deadline) or cvmfs_failure
     finally:
         remove_scratch_directory(scratch)
 
-    log_gdb_output(output_path, f"pid={pid}")
+    return cvmfs_failure

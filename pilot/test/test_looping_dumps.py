@@ -60,6 +60,7 @@ from pilot.common.errorcodes import ErrorCodes
 from pilot.util import loopingdumps
 from pilot.util.loopingdumps import (
     CLEAN_ENVIRONMENT,
+    CORE_WRITTEN_MARKER,
     CORE_INFO_MARKER,
     CORE_INFO_SUFFIX,
     GDB_OUTPUT_SUFFIX,
@@ -79,6 +80,7 @@ from pilot.util.loopingdumps import (
     rank_candidate,
     reset_looping_dump_state,
     select_dump_candidates,
+    STARTUP_MARKER,
     store_core_analysis_info,
     summarise_snapshots,
     take_looping_snapshot,
@@ -775,6 +777,26 @@ class TestDumpPhases(unittest.TestCase):
 
         return stub, "\n".join(captured.output), core_path
 
+    def test_a_timeout_says_how_far_gdb_got(self):
+        """The diagnosis has to be wired into the timeout path, not just exist.
+
+        Output with no startup marker means gdb never reached the commands,
+        which is the signature of it still reading symbols.
+        """
+        _, log, _ = self._run([
+            (errors.COMMANDTIMEDOUT, "Attaching to process 1003", False),
+            (0, PARTIAL_BACKTRACE, False),
+        ])
+
+        self.assertIn("never reached the requested commands", log)
+
+    def test_the_core_phase_asks_gdb_to_mark_completion(self):
+        """Otherwise a truncated core file is indistinguishable from a complete one."""
+        stub, _, _ = self._run([(0, "Saved corefile", True), (0, PARTIAL_BACKTRACE, False)])
+
+        self.assertIn(CORE_WRITTEN_MARKER, stub.calls[0][0])
+        self.assertIn(STARTUP_MARKER, stub.calls[0][0])
+
     def test_core_file_is_written_before_the_backtraces(self):
         """The cheap artifact must not be lost to the expensive one.
 
@@ -1059,6 +1081,227 @@ class TestPhaseCommandConstruction(unittest.TestCase):
                                   "/srv/workdir/core.7.gdb.txt", "=== phase B ===",
                                   setup="asetup Athena; ")
         self.assertLess(cmd.index("asetup Athena"), cmd.index("unset PYTHONHOME"))
+
+
+class TestSymbolLoading(unittest.TestCase):
+    """gdb reads symbols during the attach, before any -ex command runs.
+
+    This is what defeated the first two attempts at the core dump. The phase
+    that needs no symbols still paid for all of them: measured against gdb 15.1
+    on a process mapping 176 shared objects, the attach reads 176 symbol tables
+    with the default setting and 2 with auto-solib-add off, and the core file
+    is byte-identical either way. On CVMFS, with several hundred objects and a
+    cold cache, those reads exhausted a 300 s timeout on a 989 MB payload
+    before generate-core-file was ever reached.
+    """
+
+    def test_the_core_phase_disables_symbol_loading(self):
+        """The setting must be an -iex: by the time an -ex runs, the reading is done."""
+        invocation = build_gdb_invocation(1003, ["-ex bt"], symbols=False)
+
+        self.assertIn("-iex 'set auto-solib-add off'", invocation)
+        self.assertIn("-iex 'set auto-load no'", invocation)
+        self.assertLess(invocation.index("auto-solib-add"), invocation.index("-ex bt"))
+
+    def test_the_backtrace_phase_keeps_symbol_loading(self):
+        """Phase B is the one that actually needs the symbols."""
+        invocation = build_gdb_invocation(1003, ["-ex bt"])
+
+        self.assertNotIn("auto-solib-add", invocation)
+
+    def test_the_dump_uses_each_setting_in_the_right_phase(self):
+        """Phase A without symbols, phase B with them."""
+        job = FakeJob(pid=1000, workdir=self.workdir)
+        stub = GdbStub([(0, "Saved corefile", os.path.join(self.workdir, "core.1003")),
+                        (0, PARTIAL_BACKTRACE, None)])
+        with patch.object(loopingdumps, "execute", stub), \
+             patch.object(loopingdumps, "select_dump_candidates", return_value=[(1003, "athena.py")]), \
+             patch.object(loopingdumps, "get_rss", return_value=1024), \
+             patch.object(loopingdumps, "has_room_for_core", return_value=True), \
+             patch.object(loopingdumps, "get_gdb_setup", return_value="asetup Athena; "), \
+             patch.object(loopingdumps, "get_shared_libraries", return_value=[]), \
+             patch.object(loopingdumps, "read_proc_link", return_value="/cvmfs/sw/bin/python"), \
+             patch.object(loopingdumps, "get_cmdline", return_value="bash -c payload"), \
+             patch.object(loopingdumps, "resume_process"), \
+             self.assertLogs("pilot.util.loopingdumps", level="INFO"):
+            create_core_dump(job)
+
+        self.assertIn("auto-solib-add off", stub.calls[0][0])
+        self.assertNotIn("auto-solib-add", stub.calls[1][0])
+
+    def setUp(self):
+        """Create a work directory."""
+        reset_looping_dump_state()
+        self._tmp = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.workdir = self._tmp.name
+
+    def tearDown(self):
+        """Remove the work directory."""
+        self._tmp.cleanup()
+        reset_looping_dump_state()
+
+
+class TestStageMarkers(unittest.TestCase):
+    """A timeout leaves no exit status, so the markers are the only evidence."""
+
+    def test_a_stall_during_startup_is_named(self):
+        """No marker at all means gdb never reached the commands."""
+        with self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            loopingdumps.log_stall_diagnosis("Attaching to process 1003", "phase A")
+
+        text = "\n".join(captured.output)
+        self.assertIn("never reached the requested commands", text)
+        self.assertIn("symbol table of every mapped shared object", text)
+
+    def test_a_stall_during_the_commands_is_named(self):
+        """The startup marker means gdb got as far as running them."""
+        with self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            loopingdumps.log_stall_diagnosis(f"blah\n{STARTUP_MARKER}\n", "phase A")
+
+        self.assertIn("stopped while running them", "\n".join(captured.output))
+
+    def test_a_complete_core_file_is_recognised(self):
+        """gdb can be killed after the core file is already on disk."""
+        with self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            loopingdumps.log_stall_diagnosis(
+                f"{STARTUP_MARKER}\nSaved corefile\n{CORE_WRITTEN_MARKER}\n", "phase A")
+
+        self.assertIn("core file was complete", "\n".join(captured.output))
+
+    def test_the_startup_marker_does_not_claim_the_attach_succeeded(self):
+        """gdb in batch mode carries on after an error, so the echo runs anyway.
+
+        Verified against gdb 15.1: a failed attach prints 'ptrace: No such
+        process.' and then the marker. The attach failure has to be detected
+        from gdb's own error text instead.
+        """
+        failed = "ptrace: No such process.\n=== gdb ready ===\nYou can't do that without a process to debug."
+
+        self.assertIn(STARTUP_MARKER, failed)  # the marker is present ...
+        self.assertTrue(loopingdumps.has_attach_failure(failed))  # ... and means nothing here
+
+    def test_a_successful_attach_is_not_flagged(self):
+        """The real gdb output of a working attach must stay clean."""
+        succeeded = (f"[Thread debugging using libthread_db enabled]\n{STARTUP_MARKER}\n"
+                     f"Saved corefile /tmp/core.944\n{CORE_WRITTEN_MARKER}\n"
+                     f"[Inferior 1 (process 944) detached]")
+
+        self.assertFalse(loopingdumps.has_attach_failure(succeeded))
+
+
+class TestPerPhaseLogging(unittest.TestCase):
+    """A phase logged only after the next one has finished is invisible for minutes."""
+
+    def test_output_is_logged_with_its_phase_label(self):
+        """And truncated to a bounded number of lines."""
+        with self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            loopingdumps.log_gdb_output(PARTIAL_BACKTRACE, "phase B (backtraces)", "/srv/core.7.gdb.txt")
+
+        text = "\n".join(captured.output)
+        self.assertIn("phase B (backtraces)", text)
+        self.assertIn("__read_nocancel", text)
+
+    def test_a_long_output_is_truncated_and_says_so(self):
+        """The full text is in the log tarball either way."""
+        with self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+            loopingdumps.log_gdb_output("\n".join(f"#{i} frame" for i in range(500)),
+                                        "phase B", "/srv/core.7.gdb.txt")
+
+        text = "\n".join(captured.output)
+        self.assertIn("earlier lines in core.7.gdb.txt", text)
+        self.assertNotIn("#0 frame", text)
+
+    def test_empty_output_is_reported(self):
+        """gdb producing nothing at all is itself a finding."""
+        with self.assertLogs("pilot.util.loopingdumps", level="WARNING") as captured:
+            loopingdumps.log_gdb_output("", "phase A", "/srv/core.7.gdb.txt")
+
+        self.assertIn("no output at all", "\n".join(captured.output))
+
+
+class TestCvmfsFailureDetection(unittest.TestCase):
+    """A CVMFS read failure while dumping reframes the whole job."""
+
+    # verbatim from the production log that prompted this: gdb could not read the
+    # payload's own executable while taking the diagnostic core dump
+    PRODUCTION_LINE = (
+        'warning: "target:/cvmfs/atlas.cern.ch/repo/sw/software/25.2/AnalysisBase/25.2.97/'
+        'InstallArea/x86_64-el9-gcc14-opt/bin/eventloop_run_grid_job": could not open as an '
+        'executable file: Input/output error.'
+    )
+
+    def test_the_production_signature_is_recognised(self):
+        """The line that started this."""
+        self.assertTrue(loopingdumps.has_cvmfs_io_failure(self.PRODUCTION_LINE))
+
+    def test_the_symbol_read_variant_is_recognised(self):
+        """gdb reports the same failure a second way, for symbols."""
+        line = ("warning: `target:/cvmfs/atlas.cern.ch/repo/sw/x.so': can't open to read "
+                "symbols: Input/output error.")
+
+        self.assertTrue(loopingdumps.has_cvmfs_io_failure(line))
+
+    def test_an_io_error_on_a_local_path_is_not_a_cvmfs_failure(self):
+        """Both halves have to be on the same line, or this fires on anything."""
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(
+            "warning: \"/tmp/scratch/payload\": could not open as an executable file: Input/output error."))
+
+    def test_a_cvmfs_path_without_a_failure_is_not_one_either(self):
+        """gdb mentions CVMFS paths constantly when things are working."""
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(
+            "0x00001 in main () from /cvmfs/atlas.cern.ch/repo/sw/lib/libAthenaKernel.so"))
+
+    def test_the_two_halves_on_separate_lines_do_not_combine(self):
+        """An unrelated CVMFS line next to an unrelated error must not pair up."""
+        output = ("Reading symbols from /cvmfs/atlas.cern.ch/repo/sw/bin/athena\n"
+                  "warning: /tmp/x: Input/output error.")
+
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(output))
+
+    def test_ordinary_backtraces_are_clean(self):
+        """No false positive on the common case."""
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(PARTIAL_BACKTRACE))
+        self.assertFalse(loopingdumps.has_cvmfs_io_failure(""))
+
+    def test_the_dump_reports_the_failure_to_its_caller(self):
+        """The caller uses this to pick the error code, so it must propagate."""
+        with tempfile.TemporaryDirectory() as workdir:
+            job = FakeJob(pid=1000, workdir=workdir)
+            stub = GdbStub([(1, self.PRODUCTION_LINE, None), (0, PARTIAL_BACKTRACE, None)])
+            with patch.object(loopingdumps, "execute", stub), \
+                 patch.object(loopingdumps, "select_dump_candidates", return_value=[(1003, "athena")]), \
+                 patch.object(loopingdumps, "get_rss", return_value=1024), \
+                 patch.object(loopingdumps, "has_room_for_core", return_value=True), \
+                 patch.object(loopingdumps, "get_gdb_setup", return_value=""), \
+                 patch.object(loopingdumps, "get_shared_libraries", return_value=[]), \
+                 patch.object(loopingdumps, "read_proc_link", return_value="/cvmfs/sw/bin/athena"), \
+                 patch.object(loopingdumps, "get_cmdline", return_value="bash -c payload"), \
+                 patch.object(loopingdumps, "resume_process"), \
+                 self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
+                observed = create_core_dump(job)
+
+        self.assertTrue(observed)
+        self.assertIn("could not read a CVMFS path", "\n".join(captured.output))
+
+    def test_a_clean_dump_reports_nothing(self):
+        """No signal means no claim about CVMFS."""
+        with tempfile.TemporaryDirectory() as workdir:
+            job = FakeJob(pid=1000, workdir=workdir)
+            stub = GdbStub([(0, "Saved corefile", os.path.join(workdir, "core.1003")),
+                            (0, PARTIAL_BACKTRACE, None)])
+            with patch.object(loopingdumps, "execute", stub), \
+                 patch.object(loopingdumps, "select_dump_candidates", return_value=[(1003, "athena")]), \
+                 patch.object(loopingdumps, "get_rss", return_value=1024), \
+                 patch.object(loopingdumps, "has_room_for_core", return_value=True), \
+                 patch.object(loopingdumps, "get_gdb_setup", return_value=""), \
+                 patch.object(loopingdumps, "get_shared_libraries", return_value=[]), \
+                 patch.object(loopingdumps, "read_proc_link", return_value="/cvmfs/sw/bin/athena"), \
+                 patch.object(loopingdumps, "get_cmdline", return_value="bash -c payload"), \
+                 patch.object(loopingdumps, "resume_process"), \
+                 self.assertLogs("pilot.util.loopingdumps", level="INFO"):
+                observed = create_core_dump(job)
+
+        self.assertFalse(observed)
 
 
 if __name__ == "__main__":

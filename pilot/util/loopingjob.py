@@ -24,6 +24,7 @@
 from __future__ import annotations
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -39,6 +40,10 @@ from pilot.util.filehandling import (
     find_latest_modified_file,
     verify_file_list,
     list_mod_files
+)
+from pilot.util.cvmfs import (
+    cvmfs_diagnostics,
+    is_cvmfs_available,
 )
 from pilot.util.heartbeat import time_since_suspension
 from pilot.util.loopingdumps import (
@@ -66,6 +71,12 @@ from pilot.util.timing import time_stamp
 
 logger = logging.getLogger(__name__)
 errors = ErrorCodes()
+
+# Time allowed for the CVMFS availability check at kill time, in seconds. Kept
+# short because it runs between the decision to kill and the kill itself, and
+# because the interesting answer - a mount that blocks - arrives by not
+# arriving.
+CVMFS_CHECK_TIMEOUT = 30
 
 
 def looping_job(job: Any, montime: Any) -> tuple[int, str]:
@@ -133,6 +144,93 @@ def looping_job(job: Any, montime: Any) -> tuple[int, str]:
     return exit_code, diagnostics
 
 
+def _check_cvmfs_health() -> bool:
+    """Return False if CVMFS is unreadable on this node, True if it is fine.
+
+    Run in a daemon thread with a join timeout rather than with ``signal.alarm``
+    as :mod:`pilot.util.cvmfs` does at start-up: the looping check runs in a
+    monitoring thread, and ``signal.alarm`` only works in the main thread.
+
+    A check that does not return in time counts as unhealthy. That is not a
+    workaround but the correct reading: ``stat`` and ``open`` on a hung CVMFS
+    mount block indefinitely, so a check that never returns has established
+    exactly what it set out to establish.
+
+    Returns:
+        True if CVMFS looks readable, False if it does not or the check hung.
+        None if CVMFS is not in use here, or the plugin does not implement it.
+    """
+    # the pilot aborts at start-up with CVMFSISNOTALIVE when CVMFS is unavailable, unless
+    # NO_CVMFS_OK is set. So if a job is running at all, either CVMFS was verified at
+    # start-up - which makes a failure now a genuine transition - or the site does not use
+    # CVMFS, in which case the check says nothing about this job and must be ignored. Without
+    # this gate every looping job at a CVMFS-less site would be reported as a CVMFS problem
+    if os.environ.get("NO_CVMFS_OK", False):
+        logger.info('skipping the CVMFS check since NO_CVMFS_OK is set for this queue')
+        return None
+
+    result = []
+
+    def _run():
+        try:
+            result.append(is_cvmfs_available())
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(f'CVMFS availability check raised: {exc}')
+            result.append(False)
+
+    thread = threading.Thread(target=_run, daemon=True, name='cvmfs-health')
+    thread.start()
+    thread.join(timeout=CVMFS_CHECK_TIMEOUT)
+
+    if thread.is_alive():
+        logger.warning(
+            f'CVMFS availability check did not return within {CVMFS_CHECK_TIMEOUT} s - '
+            f'treating CVMFS as unreadable, since a hung mount is what makes it block'
+        )
+        return False
+
+    return result[0] if result else None
+
+
+def _diagnose_cvmfs(job: Any, cvmfs_failure_in_dump: bool) -> bool:
+    """Decide whether this looping payload sits on a node with a CVMFS problem.
+
+    Two independent signals, either of which is enough. The first is gdb
+    failing to read a CVMFS path while dumping, which is the stronger one
+    because it is tied to the payload's own executable. The second is the
+    pilot's own availability check, which still works when no gdb ran at all,
+    for instance when the payload was too large for a core file.
+
+    Neither signal proves that CVMFS caused the loop - it may have broken after
+    the loop began - so the error message reports what was observed rather than
+    asserting causation.
+
+    Args:
+        job: Job object.
+        cvmfs_failure_in_dump: Whether the dump phases hit a CVMFS read error.
+
+    Returns:
+        True if CVMFS should be reported as the likely explanation.
+    """
+    available = _check_cvmfs_health()
+    if not cvmfs_failure_in_dump and available is not False:
+        return False
+
+    if cvmfs_failure_in_dump:
+        logger.warning(f'job {job.jobid}: gdb could not read a CVMFS path while dumping the payload')
+    if available is False:
+        logger.warning(f'job {job.jobid}: the pilot could not read CVMFS on this node')
+
+    # the pilot only runs these at start-up, so without this there is no record of
+    # the CVMFS state at the time the payload was killed
+    try:
+        cvmfs_diagnostics()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f'cvmfs diagnostics failed: {exc}')
+
+    return True
+
+
 def _handle_looping_payload(job: Any, recent_files: list) -> tuple[int, str]:
     """Report the looping payload, collect the diagnostics and kill it.
 
@@ -172,13 +270,28 @@ def _handle_looping_payload(job: Any, recent_files: list) -> tuple[int, str]:
 
     # produce the core dump (and the analysis information needed to read it)
     # while the payload processes are still alive
+    cvmfs_failure_in_dump = False
     try:
-        create_core_dump(job)
+        cvmfs_failure_in_dump = create_core_dump(job)
     except Exception as error:  # pylint: disable=broad-exception-caught
         logger.warning(f'failed to create the core dump: {error}')
 
     try:
-        kill_looping_job(job)
+        cvmfs_problem = _diagnose_cvmfs(job, cvmfs_failure_in_dump)
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logger.warning(f'failed to establish the CVMFS state: {error}')
+        cvmfs_problem = False
+
+    if cvmfs_problem:
+        exit_code = errors.LOOPINGJOBCVMFS
+        diagnostics = (
+            'the payload was found to be looping on a node where CVMFS could not be read - '
+            'job will be failed in the next update'
+        )
+        logger.warning(f'job {job.jobid}: reporting the loop as a CVMFS problem on this node')
+
+    try:
+        kill_looping_job(job, cvmfs_problem=cvmfs_problem)
     except Exception as error:  # pylint: disable=broad-exception-caught
         logger.warning(f'exception caught while killing the looping job: {error}')
 
@@ -268,7 +381,7 @@ def _log_workdir_listing(workdir: str):
     logger.info('\n'.join(lines))
 
 
-def kill_looping_job(job: Any):
+def kill_looping_job(job: Any, cvmfs_problem: bool = False):
     """Kill the looping payload process and clean up.
 
     Sets the appropriate error code and transitions the job to the ``failed``
@@ -282,6 +395,9 @@ def kill_looping_job(job: Any):
 
     Args:
         job: Job object.
+        cvmfs_problem: Whether CVMFS was found to be unreadable on this node,
+            in which case the looping error code reported to the server names
+            CVMFS as the likely explanation.
     """
     # the child process is looping, kill it
     diagnostics = f"pilot has decided to kill looping job {job.jobid} at {time_stamp()}"
@@ -290,7 +406,7 @@ def kill_looping_job(job: Any):
 
     # fail the job before anything else is done: the diagnostics below take time and can
     # fail, and neither must be able to leave the job unmarked
-    _set_looping_error_code(job)
+    _set_looping_error_code(job, cvmfs_problem=cvmfs_problem)
 
     # dump stack traces while the payload processes are still alive (the generic kill
     # path does this, but this path kills the children itself)
@@ -307,11 +423,17 @@ def kill_looping_job(job: Any):
     _kill_child_processes(os.getpid())
 
 
-def _set_looping_error_code(job: Any):
+def _set_looping_error_code(job: Any, cvmfs_problem: bool = False):
     """Add the error code matching the job state and fail the job.
+
+    The CVMFS variant only replaces the plain looping code in the running
+    state. A stage-in or stage-out timeout is reported as such regardless: the
+    payload was not the thing that stalled, so attributing it to CVMFS would be
+    a guess rather than an observation.
 
     Args:
         job: Job object.
+        cvmfs_problem: Whether CVMFS was found to be unreadable on this node.
     """
     if job.state == 'stagein':
         job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.STAGEINTIMEOUT, priority=True)
@@ -319,7 +441,8 @@ def _set_looping_error_code(job: Any):
         job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.STAGEOUTTIMEOUT, priority=True)
     else:
         # most likely in the 'running' state, but use the catch-all 'else'
-        job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.LOOPINGJOB, priority=True)
+        code = errors.LOOPINGJOBCVMFS if cvmfs_problem else errors.LOOPINGJOB
+        job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(code, priority=True)
     set_pilot_state(job=job, state="failed")
 
 

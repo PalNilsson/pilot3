@@ -17,3160 +17,2101 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-26
-# - Wen Guan, wen.guan@cern.ch, 2018
+# - Paul Nilsson, paul.nilsson@cern.ch, 2026
 
-"""Common functions for ATLAS."""
+"""Process diagnostics for looping payloads.
+
+Background: when the looping job algorithm decides that a payload has stopped
+touching its files, the pilot produced a single core dump before killing the
+job. The dump target was ``get_subprocesses(job.pid)[-1]``, i.e. the last entry
+of a depth-first walk of the payload's descendants in ascending PID order. That
+is not "the youngest child" and has no relation to which process is actually
+stuck: for an ATLAS job the descendant tree also holds the transform's own
+prmon instance, asetup/apptainer/bash wrappers, and xrootd helpers, any of
+which can end up last.
+
+The 10 s timeout used for the dump made the selection actively harmful rather
+than merely arbitrary. ``generate-core-file`` writes the whole address space,
+so a multi-GB payload cannot finish inside the window while a few-MB helper
+always can - the one candidate guaranteed to produce a usable core file was
+the uninteresting one.
+
+This module replaces that with three things.
+
+**An unfiltered inventory** (:func:`log_process_inventory`). What an ATLAS payload
+tree actually contains during a loop has not been established, so the complete
+tree is logged - depth, pid, ppid, process name, state, CPU time, resident set,
+drop status and full command line for every descendant, including the ones that
+were dropped - bracketed by :data:`INVENTORY_MARKER` so the inventories of
+several looping jobs can be grepped out and compared. Any refinement of the
+selection should come from those, not from assumptions made here.
+
+**A minimal denylist and a ranked candidate list**
+(:func:`select_dump_candidates`). Only processes the pilot demonstrably puts into
+the payload tree are rejected: prmon, shells, the container runtimes and the ALRB
+setup calls. What survives is ranked by accumulated CPU time - a *looping*
+payload normally spins, which is exactly what separates a loop from a hang - then
+by resident set. A per-experiment hook for payload process names exists and is
+consulted first, but is empty for every experiment: a name that matched the wrong
+process would promote it above the real payload, which is worse than declaring
+nothing, so the hook is left for the inventories to fill in.
+
+**A series of cheap snapshots** (:func:`take_looping_snapshot`). A core file is
+one instant, whereas a loop is characterised by what changes and what does not
+between samples, so once the job is a configurable fraction of the way to the
+looping limit the pilot starts recording, at every looping verification, the
+accumulated CPU time, process state, ``wchan``, current syscall, resident set
+and a truncated backtrace of every candidate. That is kilobytes per snapshot
+against gigabytes for a core file, and the deltas between consecutive snapshots
+are summarised at kill time (:func:`summarise_snapshots`). Because the snapshots
+cover the top :data:`MAX_CANDIDATES` processes rather than only the winner, a
+mis-ranked first choice still leaves the real payload sampled.
+
+At kill time at most one core file is still produced
+(:func:`create_core_dump`), in two independent phases with independent
+timeouts. The first ordering tried - all of it in one gdb invocation, with the
+backtraces requested before the core write "so that a timeout still leaves
+something behind" - was wrong in production, and wrong in three separate ways:
+
+* it assumed the core write was the expensive step. It is not. ``generate-core-file``
+  only walks the inferior's mappings and needs no symbols at all, whereas
+  ``thread apply all bt`` needs the symbol table of every mapped object, which
+  for an athena process means several hundred shared libraries read over CVMFS.
+  On a real looping job the backtraces had not finished after four minutes and
+  the core write was never reached, so the cheap artifact was lost to the
+  expensive one;
+* it prepended the experiment setup to the invocation that writes the core
+  file, which cost about a minute of asetup before gdb even started, wrote
+  ``.asetup.save`` into the job work directory, and exported ``PYTHONHOME`` and
+  ``PYTHONPATH`` pointing at the release's Python. A gdb linked against a
+  different libpython honours those, cannot find the ``encodings`` module and
+  aborts inside ``Py_Initialize()`` before executing a single ``-ex`` command
+  (see :data:`PYTHON_ENVIRONMENT_VARIABLES`), losing both artifacts at once;
+* it relied on the return value of :func:`pilot.util.container.execute` to
+  carry the output, and that function discards stdout when a command times out.
+  Everything gdb had printed before the timeout was thrown away, and the log
+  claimed the backtraces had been captured when nothing had been.
+
+So: phase A writes the core file with a bare gdb, no experiment setup, and a
+sanitised environment. Phase B collects the backtraces with the experiment
+setup, on its own timeout, and is allowed to fail - the stacks are in the core
+file too. Both phases redirect to a file in the job work directory
+(:data:`GDB_OUTPUT_SUFFIX`) rather than relying on the return value, so a
+timeout keeps whatever was produced up to that point, and both run with a
+working directory *outside* the job work directory so that the setup cannot
+write there. The total is bounded by a single diagnostics budget
+(:func:`get_diagnostics_budget`), because everything here happens between the
+decision to kill and the kill itself.
+
+The release gdb is only needed to *read* a core file, and that happens offline,
+long after the worker node is gone. What it needs in order to be possible at
+all is recorded next to the core file by :func:`get_core_analysis_info`,
+including the container the payload ran in: the payload's system libraries come
+from the container image, not from the worker node, so a gdb running on the
+host resolves the system frames against the wrong binaries.
+
+Because a core file is useless without knowing which binary produced it, the
+executable identity is recorded twice: as a greppable block in the pilot log
+marked with :data:`CORE_INFO_MARKER`, and as a companion file next to the core
+file in the job work directory, so that whoever picks up the log tarball later
+can run gdb against the right binary and the right software release.
+
+**These files must never look like payload activity.** The looping algorithm
+decides that a payload is alive by taking the modification time of the most
+recently modified file in the job work directory, and everything this module
+writes lands in that same directory. A diagnostic write therefore looks exactly
+like the payload doing work, which resets the very clock that triggered the
+diagnostic: the snapshot series starts at a fraction of the looping limit, so
+the time since the last touch was pinned just below that fraction and could
+never reach the limit. No looping job could be detected at all. Two independent
+guards prevent that, and both are needed - the first covers all artifacts, the
+second holds even if a caller forgets to apply the first:
+
+* :func:`is_looping_diagnostic_file` names every artifact written here, and the
+  looping algorithm drops those paths from the file list it measures
+  (:func:`pilot.util.loopingjob.get_time_for_last_touch`), centrally rather
+  than in each experiment plugin - the file names belong to this module, and
+  seven separate plugin filters are what failed to catch this;
+* :func:`store_snapshot` pins the modification time of the snapshot file to the
+  payload's own last touch, so that the file cannot be the newest file in the
+  work directory no matter who looks at it.
+"""
 
 from __future__ import annotations
-import fnmatch
+
 import logging
 import os
 import re
+import signal
+import tempfile
 import time
-
-from collections import defaultdict
-from functools import reduce
-from glob import glob
-from json import dumps
-from random import randint
-from signal import SIGTERM, SIGUSR1
-from typing import Any, Optional
-
-# from tarfile import ExFileObject
-
-from pilot.util.auxiliary import (
-    get_resource_name,
-    get_key_value,
+from shutil import (
+    disk_usage,
+    rmtree,
+    which
 )
+from typing import Any
+
 from pilot.common.errorcodes import ErrorCodes
-from pilot.common.exception import (
-    TrfDownloadFailure,
-    PilotException,
-    FileHandlingFailure
-)
-from pilot.info.filespec import FileSpec
-from pilot.info.jobdata import JobData
 from pilot.util.config import config
-from pilot.util.constants import (
-    UTILITY_BEFORE_PAYLOAD,
-    UTILITY_WITH_PAYLOAD,
-    UTILITY_AFTER_PAYLOAD_STARTED,
-    UTILITY_AFTER_PAYLOAD_FINISHED,
-    UTILITY_AFTER_PAYLOAD_STARTED2,
-    UTILITY_BEFORE_STAGEIN,
-    UTILITY_AFTER_PAYLOAD_FINISHED2,
-    PILOT_PRE_REMOTEIO,
-    PILOT_POST_REMOTEIO
-)
 from pilot.util.container import execute
 from pilot.util.filehandling import (
-    copy,
-    copy_pilot_source,
-    calculate_checksum,
-    get_disk_usage,
-    get_guid,
-    get_local_file_size,
-    looks_like_root_file,
-    remove,
-    remove_dir_tree,
-    remove_core_dumps,
-    read_file,
-    read_json,
-    update_extension,
-    write_file,
+    get_modification_time,
+    write_file
 )
-from pilot.util.https import (
-    upload_file,
-    get_base_urls
-)
-from pilot.util.processes import (
-    convert_ps_to_dict,
-    find_pid, find_cmd_pids,
-    get_trimmed_dictionary,
-    is_child
-)
-from pilot.util.timing import add_to_pilot_timing
-from pilot.util.tracereport import TraceReport
-from .container import (
-    create_root_container_command,
-    execute_remote_file_open
-)
-from .dbrelease import get_dbrelease_version, create_dbrelease
-from .setup import (
-    should_pilot_prepare_setup,
-    is_standard_atlas_job,
-    get_asetup,
-    set_inds,
-    get_analysis_trf,
-    get_payload_environment_variables,
-    replace_lfns_with_turls,
-)
-from .utilities import (
-    get_memory_monitor_setup,
-    get_network_monitor_setup,
-    post_memory_monitor_action,
-    get_memory_monitor_summary_filename,
-    get_memory_monitor_output_filename,
-    get_metadata_dict_from_txt,
-)
-
-# Maximum number of TURLs to pass on the command line.  Above this the list is
-# written to a file and --turl-file is used instead, avoiding ARG_MAX failures.
-_TURL_CMDLINE_LIMIT = 500
+from pilot.util.math import human2bytes
+from pilot.util.parameters import convert_to_int
+from pilot.util.psutils import get_child_processes
 
 logger = logging.getLogger(__name__)
 errors = ErrorCodes()
 
+# Prefix on every log line from this module so the diagnostics can be grepped
+# out of a pilot log.
+LOG_PREFIX = "looping-dump"
 
-def sanity_check() -> int:
-    """Perform an initial sanity check before doing anything else in a given workflow.
+# Marker on the log block that records which binary a core file belongs to.
+# Deliberately verbose and unique: it is what someone analysing the log tarball
+# weeks later will grep for in order to find out how to open the core file.
+CORE_INFO_MARKER = "CORE FILE ANALYSIS INFO"
 
-    This function can be used to verify importing of modules that are otherwise used much later, but it is better to
-    abort the pilot if a problem is discovered early.
+# Name of the companion file written next to the core file, holding the same
+# information as the CORE_INFO_MARKER log block. The core file and this file
+# travel together in the log tarball.
+CORE_INFO_SUFFIX = ".analysis.txt"
 
-    Note: currently this function does not do anything.
+# Name of the file the gdb phases redirect their output to, written next to the
+# core file. The output cannot be taken from the return value of execute():
+# that function discards stdout when a command times out, which is precisely
+# the case in which the partial output matters most.
+GDB_OUTPUT_SUFFIX = ".gdb.txt"
+
+# Marker bracketing the unfiltered inventory of the payload process tree. The
+# selection heuristics rest on assumptions about what that tree contains during a
+# loop, so the inventory is logged in full - including the processes that were
+# dropped - to let a payload name list be derived from real jobs rather than
+# guessed at. Grep this out of the logs of several looping jobs to build it.
+INVENTORY_MARKER = "PAYLOAD PROCESS INVENTORY"
+
+# Name of the file in the job work directory holding the snapshot series.
+SNAPSHOT_FILENAME = "looping_snapshots.log"
+
+# Core files written by create_core_dump() are named 'core.<pid>'. Matched
+# against the basename so that the looping algorithm can recognise them as its
+# own output rather than as payload progress.
+CORE_FILE_PATTERN = re.compile(r"^core\.\d+$")
+
+# Command line fragments identifying processes that are known not to be the
+# looping payload. Matched case-insensitively against the basename of argv[0]
+# and, for DENYLISTED_ARGS, against the full command line.
+#
+# Deliberately minimal. Every entry here is one the pilot itself demonstrably
+# puts inside the payload tree:
+#
+# * prmon - the memory monitor, and the process the core dump was in fact being
+#   taken from; 'memorymonitor' is the pilot's own internal name for it
+#   (config.Pilot.utility_after_payload_started);
+# * sh/bash - execute() runs every command as '/bin/bash -c <...>', so job.pid
+#   is itself a shell and the transform's own wrappers are shells too;
+# * apptainer/singularity - the container runtimes used by the container plugin;
+# * asetup/lsetup/atlasLocalSetup.sh/setupATLAS - the ALRB setup calls embedded
+#   in the payload command string.
+#
+# Nothing is added on suspicion. An over-broad denylist fails the same way a
+# guessed payload name list does, only more quietly: dropping the real payload
+# leaves the ranking to pick something worse, and the log would show the entry
+# as filtered rather than as chosen wrongly. Anything else that turns out to
+# live in the tree should be added on the evidence of the logged inventories
+# (see INVENTORY_MARKER), not in advance.
+DENYLISTED_NAMES = (
+    "prmon",
+    "memorymonitor",
+    "sh",
+    "bash",
+    "apptainer",
+    "singularity",
+    "asetup",
+    "lsetup",
+    "atlaslocalsetup.sh",
+    "setupatlas",
+)
+
+# Full-command-line fragments that disqualify a process regardless of argv[0],
+# for a helper invoked through an interpreter (e.g. a prmon wrapper script).
+# Kept to prmon alone: a fragment that can occur inside a legitimate payload
+# command line would silently drop the very process being looked for.
+DENYLISTED_ARGS = (
+    "prmon",
+)
+
+# Maximum number of candidates carried through to snapshotting. Bounds both the
+# snapshot size and the number of stack tool invocations per snapshot.
+MAX_CANDIDATES = 5
+
+# Maximum number of candidates stack traced at kill time. pstack is a gdb
+# wrapper and costs up to its full timeout per process on a large payload, so
+# this bounds the time between the decision to kill and the log upload. The
+# candidates are ranked, so the ones dropped are the least likely to explain the
+# loop, and the best candidate has already been dumped in more detail.
+MAX_STACK_TRACE_CANDIDATES = 2
+
+# Maximum number of backtrace lines kept per process per snapshot.
+MAX_BACKTRACE_LINES = 40
+
+# Timeout for a single stack trace invocation, in seconds.
+STACK_TOOL_TIMEOUT = 60
+
+# Stack tools in order of preference. eu-stack is the cheapest and does not need
+# a full gdb; pstack is the traditional fallback; gdb is used last because it is
+# the slowest to start.
+STACK_TOOLS = ("eu-stack", "pstack")
+
+# Fraction of the looping limit after which the snapshot series starts. With the
+# default 7200 s limit and a 900 s verification time this yields roughly four
+# samples before the payload is killed.
+DEFAULT_SNAPSHOT_FRACTION = 0.5
+
+# Default timeout for phase A, the core file, in seconds. 'generate-core-file'
+# writes the whole address space but needs no symbols, so the cost is bounded by
+# the resident set and the disk: at DEFAULT_CORE_DUMP_MAX_SIZE this is ample.
+DEFAULT_CORE_DUMP_TIMEOUT = 300
+
+# Default timeout for phase B, the backtraces, in seconds. This is the phase
+# that needs the symbol table of every mapped object, several hundred of them
+# over CVMFS for an athena process, and is the one that timed out in production.
+# It is allowed to: the stacks are in the core file from phase A as well.
+DEFAULT_BACKTRACE_TIMEOUT = 300
+
+# Default upper bound on the total time the diagnostics may take, in seconds.
+# Everything in this module runs between the decision to kill a looping payload
+# and the kill itself, so an unbounded sum of per-step timeouts delays the log
+# upload on a worker node that may be close to its wall clock limit.
+DEFAULT_DIAGNOSTICS_BUDGET = 900
+
+# Default upper bound on the resident set of a process for which a core file is
+# still attempted. Above this the backtraces are kept and the core file skipped.
+# The core file is deliberately kept in the log tarball so that it can be
+# analysed afterwards, which is what bounds this: the value is a limit on the
+# size of every looping job's log file, not just on the dump.
+DEFAULT_CORE_DUMP_MAX_SIZE = "2 GB"
+
+# Stage markers written by gdb itself into the output file. A phase that is
+# killed by its timeout leaves no exit status to reason from, so these are what
+# say how far gdb got.
+#
+# STARTUP_MARKER means "gdb finished starting up and began executing the
+# requested commands". It deliberately does not claim the attach succeeded: gdb
+# in batch mode carries on after an error, so an 'echo' runs even when the
+# attach failed (verified: a failed attach prints "ptrace: No such process."
+# and then the marker anyway). What its *absence* proves is the useful part -
+# gdb was still in start-up, which for an attach means reading symbols.
+STARTUP_MARKER = "=== gdb ready ==="
+CORE_WRITTEN_MARKER = "=== core file written ==="
+
+# Fragments identifying a failed attach. Needed because the marker above cannot
+# carry that meaning, and because a failed attach and a slow one call for
+# completely different responses.
+ATTACH_FAILURE_SIGNATURES = (
+    "ptrace:",
+    "You can't do that without a process to debug",
+)
+
+# Fragments identifying a CVMFS read failure in the gdb output, and the path
+# prefix that ties one to CVMFS rather than to a local file. Both are required
+# on the same line, since gdb reports plenty of unrelated warnings.
+#
+# This matters beyond the dump. The payload executes from CVMFS, so a node that
+# cannot serve the payload's own binary is a node on which the payload will
+# appear to loop. Seen in production as
+#
+#   warning: "target:/cvmfs/.../eventloop_run_grid_job": could not open as an
+#   executable file: Input/output error.
+#
+# on a job that was then reported as a looping payload.
+CVMFS_PATH_MARKER = "/cvmfs/"
+CVMFS_FAILURE_SIGNATURES = (
+    "Input/output error",
+    "can't open to read symbols",
+    "could not open as an executable file",
+)
+
+# Maximum number of gdb frames requested per thread in phase B.
+MAX_BACKTRACE_FRAMES = 100
+
+# Maximum number of lines of gdb output echoed into the pilot log. The full
+# output is in the file next to the core file either way; this only makes the
+# common case greppable without unpacking the log tarball.
+MAX_GDB_LOG_LINES = 200
+
+# Environment variables that must not reach gdb. The experiment setup exports
+# PYTHONHOME and PYTHONPATH pointing at the release's Python. A gdb linked
+# against a different libpython honours them, fails to find the 'encodings'
+# module and aborts during Py_Initialize() with
+#
+#   Fatal Python error: init_fs_encoding: failed to get the Python codec of the
+#   filesystem encoding
+#   ModuleNotFoundError: No module named 'encodings'
+#
+# before executing a single -ex command, so neither the core file nor the
+# backtraces are produced and gdb exits 1. Observed in production. Note that the
+# pilot's own environment can carry these too, since the pilot itself normally
+# runs under an ALRB Python, so they are stripped in every phase and not only
+# after the release setup.
+PYTHON_ENVIRONMENT_VARIABLES = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONNOUSERSITE",
+)
+
+# Fragments identifying the failure above in the gdb output. Used to decide
+# whether a retry is worth attempting and, more importantly, to say so in the
+# log: the message names the payload's Python, not gdb's, and is easy to
+# misread as a payload failure.
+PYTHON_FAILURE_SIGNATURES = (
+    "init_fs_encoding",
+    "No module named 'encodings'",
+)
+
+# Environment used for the last-resort retry, when even the sanitised
+# environment leaves gdb unable to start its interpreter.
+CLEAN_ENVIRONMENT = "env -i PATH=/usr/bin:/bin:/usr/local/bin TERM=dumb HOME=/tmp "
+
+# Multiplier applied to the resident set when checking free disk space, to cover
+# the difference between RSS and the size of the written core file.
+CORE_SIZE_SAFETY_FACTOR = 1.5
+
+# Ticks per second used to convert utime/stime from /proc/<pid>/stat. Kept as a
+# constant rather than read via os.sysconf() on every snapshot; it is 100 on
+# every platform the pilot runs on.
+CLOCK_TICKS = 100.0
+
+# Snapshot bookkeeping, keyed on job id so that every job of a multijob pilot
+# gets its own series.
+_snapshot_state: dict[str, Any] = {"jobid": None, "snapshots": []}
+
+
+def reset_looping_dump_state() -> None:
+    """Reset the snapshot bookkeeping.
+
+    Exposed for tests and for the multijob case; the state is otherwise reset
+    automatically when a new job id is seen.
+    """
+    _snapshot_state["jobid"] = None
+    _snapshot_state["snapshots"] = []
+
+
+def is_looping_diagnostic_file(path: str) -> bool:
+    """Return True if the given path is a file the looping diagnostics wrote.
+
+    The looping algorithm must not measure the pilot's own diagnostic output as
+    if it were payload activity; see the module docstring. Everything this
+    module writes into the job work directory is listed here:
+
+    * the snapshot series (:data:`SNAPSHOT_FILENAME`);
+    * the core files (``core.<pid>``, :data:`CORE_FILE_PATTERN`);
+    * the core file analysis companions (``*.analysis.txt``,
+      :data:`CORE_INFO_SUFFIX`);
+    * the gdb output of the two dump phases (``*.gdb.txt``,
+      :data:`GDB_OUTPUT_SUFFIX`).
+
+    Note what is deliberately *not* listed: ``.asetup.save``. The experiment
+    setup writes it into its working directory, which is why the gdb phases run
+    outside the job work directory (:func:`create_scratch_directory`) rather
+    than being filtered by name here. A multi-step transform legitimately
+    rewrites ``.asetup.save`` between steps, so filtering it would hide real
+    payload activity and could turn a healthy job into a looping one.
+
+    Args:
+        path: File path, absolute or relative.
 
     Returns:
-        int: exit code (0 if all is ok, otherwise non-zero exit code).
+        True if the path is a looping diagnostic artifact.
     """
-    #try:
-    #    from rucio.client.downloadclient import DownloadClient
-    #    from rucio.client.uploadclient import UploadClient
-    #    # note: must do something with Download/UploadClients or flake8
-    # will complain - but do not instantiate
-    #except Exception as exc:
-    #    logger.warning(f'sanity check failed: {exc}')
-    #    exit_code = errors.MIDDLEWAREIMPORTFAILURE
-
-    return 0
-
-
-def validate(job: JobData) -> bool:
-    """Perform user specific payload/job validation.
-
-    This function will produce a local DBRelease file if necessary (old releases).
-
-    Args:
-        job: job object.
-
-    Returns:
-        bool: True if validation is successful, False otherwise.
-    """
-    status = True
-
-    if 'DBRelease' in job.jobparams:
-        logger.debug((
-            'encountered DBRelease info in job parameters - '
-            'will attempt to create a local DBRelease file'))
-        version = get_dbrelease_version(job.jobparams)
-        if version:
-            status = create_dbrelease(version, job.workdir)
-
-    # assign error in case of DBRelease handling failure
-    if not status:
-        job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.DBRELEASEFAILURE)
-
-    # make sure that any given images actually exist
-    if status:
-        if job.imagename and job.imagename.startswith('/'):
-            if os.path.exists(job.imagename):
-                logger.info(f'verified that image exists: {job.imagename}')
-            else:
-                status = False
-                logger.warning(f'image does not exist: {job.imagename}')
-                job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.IMAGENOTFOUND)
-
-    # cleanup job parameters if only copy-to-scratch
-    #if job.only_copy_to_scratch():
-    #    logger.debug(f'job.params={job.jobparams}')
-    #    if ' --usePFCTurl' in job.jobparams:
-    #        logger.debug('cleaning up --usePFCTurl from job parameters
-    #         since all input is copy-to-scratch')
-    #        job.jobparams = job.jobparams.replace(' --usePFCTurl', '')
-    #    if ' --directIn' in job.jobparams:
-    #        logger.debug('cleaning up --directIn from job parameters
-    #           since all input is copy-to-scratch')
-    #        job.jobparams = job.jobparams.replace(' --directIn', '')
-
-    return status
-
-
-def open_remote_files(indata: list, workdir: str, nthreads: int) -> tuple[int, str, list, int]:  # noqa: C901
-    """Verify that direct i/o files can be opened.
-
-    Args:
-        indata: list of FileSpec objects.
-        workdir: working directory.
-        nthreads: number of concurrent file open threads.
-
-    Returns:
-        tuple[int, str, list, int]: exit code, diagnostics, not opened files, lsetup time.
-
-    Raises:
-        PilotException: in case of pilot error.
-    """
-    exitcode = 0
-    diagnostics = ""
-    not_opened = []
-    lsetup_time = 0
-
-    # extract direct i/o files from indata (string of comma-separated turls)
-    turls = extract_turls(indata)
-    if turls:
-        # execute file open script which will attempt to open each file
-
-        # copy pilot source into container directory, unless it is already there
-        diagnostics = copy_pilot_source(workdir)
-        if diagnostics:
-            raise PilotException(diagnostics)
-
-        os.environ['PYTHONPATH'] = os.environ.get('PYTHONPATH') + ':' + workdir
-
-        # first copy all scripts that are needed
-        scripts = ['open_remote_file.py', 'open_file.sh']
-        final_paths = {}
-        for script in scripts:
-
-            final_script_path = os.path.join(workdir, script)
-            script_path = os.path.join('pilot/scripts', script)
-            dir1 = os.path.join(os.path.join(os.environ['PILOT_HOME'], 'pilot3'), script_path)
-            dir2 = os.path.join(workdir, script_path)
-            full_script_path = dir1 if os.path.exists(dir1) else dir2
-            if not os.path.exists(full_script_path):
-                # do not set ec since this will be a pilot issue rather than site issue
-                diagnostics = (
-                    f'cannot perform file open test - script path does not exist: {full_script_path}'
-                )
-                logger.warning(diagnostics)
-                logger.warning(f'tested both path={dir1} and path={dir2} (none exists)')
-                return exitcode, diagnostics, not_opened, lsetup_time
-
-            try:
-                copy(full_script_path, final_script_path)
-            except PilotException as exc:
-                # do not set ec since this will be a pilot issue rather than site issue
-                diagnostics = f'cannot perform file open test - pilot source copy failed: {exc}'
-                logger.warning(diagnostics)
-                return exitcode, diagnostics, not_opened, lsetup_time
-
-            # correct the path when containers have been used
-            if "open_remote_file.py" in script:
-                final_script_path = os.path.join('.', script)
-
-            final_paths[script] = final_script_path
-            logger.debug(f'final path={final_script_path}')
-
-        logger.debug(f'reading file: {final_paths["open_file.sh"]}')
-        script_content = read_file(final_paths['open_file.sh'])
-        if not script_content:
-            diagnostics = (f'cannot perform file open test - failed to read script content from path '
-                           f'{final_paths["open_file.sh"]}')
-            logger.warning(diagnostics)
-            return exitcode, diagnostics, not_opened, lsetup_time
-
-        logger.debug(f'creating file open command from path: {final_paths["open_remote_file.py"]}')
-        _cmd = get_file_open_command(final_paths['open_remote_file.py'], turls, nthreads, workdir=workdir,
-                                     rawfirst_turls=extract_rawfirst_turls(indata))
-        if not _cmd:
-            diagnostics = (f'cannot perform file open test - failed to create file open command from path '
-                           f'{final_paths["open_remote_file.py"]}')
-            logger.warning(diagnostics)
-            return exitcode, diagnostics, not_opened, lsetup_time
-
-        timeout = get_timeout_for_remoteio(indata)
-        cmd = create_root_container_command(workdir, _cmd, script_content)
-        path = os.path.join(workdir, 'open_remote_file_cmd.sh')
-        logger.info(f'executing file open verification script (path={path}, timeout={timeout}):\n\n\'{cmd}\'\n\n')
-        try:
-            write_file(path, cmd)
-        except FileHandlingFailure as exc:
-            diagnostics = f'failed to write file: {exc}'
-            logger.warning(diagnostics)
-            return 11, diagnostics, not_opened, lsetup_time
-
-        # if execute_remote_file_open() returns exit code 1, it means general error.
-        # exit code 2 means that lsetup timed out, while 3 means that the python script (actual file open) timed out
-        try:
-            exitcode, stdout, lsetup_time = execute_remote_file_open(path, timeout)
-        except PilotException as exc:
-            logger.warning(f'caught pilot exception: {exc}')
-            exitcode = 11
-            stdout = str(exc)
-
-        # Log all captured container output so that apptainer startup lines, lsetup
-        # trace (ALRB_CONT_VERBOSE=3), and any error messages are visible in the
-        # pilot log and not only in open_remote_file_cmd.stdout on disk.
-        # Log at WARNING level on failure so the output is visible without raising
-        # the log level at the site; log at DEBUG on success to keep normal logs quiet.
-        if stdout:
-            if exitcode:
-                logger.warning(f'container output from open_remote_file_cmd (ec={exitcode}):\n{stdout}')
-            else:
-                logger.debug(f'container output from open_remote_file_cmd:\n{stdout}')
-
-        logger.info(f'remote file open finished with ec={exitcode}')
-        if lsetup_time > 0:
-            logger.info(f"lsetup completed after {lsetup_time} seconds")
-        else:
-            logger.info("lsetup did not finish correctly")
-
-        # error handling
-        if exitcode:
-            # first check for apptainer errors
-            _exitcode, error_message = errors.resolve_transform_error(exitcode, stdout)
-            if _exitcode != exitcode:  # a better error code was found (COMMANDTIMEDOUT error will be passed through)
-                if error_message:
-                    logger.warning(f"found apptainer error in stderr: {error_message}")
-                    logger.warning(f"will overwrite trf exit code {exitcode} due to previous error")
-                return _exitcode, stdout, not_opened, lsetup_time
-
-            # note: if the remote files could still be opened the reported error should not be REMOTEFILEOPENTIMEDOUT
-            _exitcode, diagnostics, not_opened = parse_remotefileverification_dictionary(workdir)
-            if not _exitcode:
-                logger.info('remote file could still be opened in spite of previous error')
-            elif _exitcode:
-                if exitcode == errors.COMMANDTIMEDOUT and _exitcode == errors.REMOTEFILECOULDNOTBEOPENED:
-                    exitcode = errors.REMOTEFILEOPENTIMEDOUT
-                elif exitcode == errors.COMMANDTIMEDOUT and _exitcode == errors.REMOTEFILEDICTDOESNOTEXIST:
-                    exitcode = errors.REMOTEFILEOPENTIMEDOUT
-                    diagnostics = f'remote file open command was timed-out and: {diagnostics}'  # cannot give further info
-                else:  # REMOTEFILECOULDNOTBEOPENED
-                    exitcode = _exitcode
-        else:
-            exitcode, diagnostics, not_opened = parse_remotefileverification_dictionary(workdir)
-    else:
-        logger.info('nothing to verify (for remote files)')
-
-    if exitcode:
-        logger.warning(f'remote file open exit code: {exitcode}')
-
-    return exitcode, diagnostics, not_opened, lsetup_time
-
-
-def get_timeout_for_remoteio(indata: list) -> int:
-    """Calculate a proper timeout to be used for remote i/o files.
-
-    Note: open_remote_file.py attempts up to two open modes per file (ROOT format and raw),
-    each with an internal 30 s time-out, hence 60 s is budgeted per remote i/o file.
-
-    Args:
-        indata: list of FileSpec objects.
-
-    Returns:
-        int: timeout in seconds.
-    """
-    remote_io = [fspec for fspec in indata if fspec.status == 'remote_io']
-
-    return len(remote_io) * 60 + 900
-
-
-def parse_remotefileverification_dictionary(workdir: str) -> tuple[int, str, list]:
-    """Verify that all files could be remotely opened.
-
-    Note: currently ignoring if remote file dictionary doesn't exist.
-
-    Args:
-        workdir: work directory needed for opening remote file dictionary.
-
-    Returns:
-        tuple[int, str, list]: exit code, diagnostics, not opened files.
-    """
-    exitcode = 0
-    diagnostics = ""
-    not_opened = []
-
-    dictionary_path = os.path.join(
-        workdir,
-        config.Pilot.remotefileverification_dictionary
-    )
-
-    if not os.path.exists(dictionary_path):
-        diagnostics = f'file {dictionary_path} does not exist'
-        logger.warning(diagnostics)
-        return errors.REMOTEFILEDICTDOESNOTEXIST, diagnostics, not_opened
-
-    file_dictionary = read_json(dictionary_path)
-    if not file_dictionary:
-        diagnostics = f'could not read dictionary from {dictionary_path}'
-        logger.warning(diagnostics)
-    else:
-        for turl in file_dictionary:
-            opened = file_dictionary[turl]
-            if not opened:
-                logger.info(f'turl could not be opened: {turl}')
-                not_opened.append(turl)
-            else:
-                logger.info(f'turl could be opened: {turl}')
-
-    if not_opened:
-        exitcode = errors.REMOTEFILECOULDNOTBEOPENED
-        diagnostics = f"Remote file(s) could not be opened: {not_opened}"
-
-        # Attempt to distinguish a genuinely absent file from other open failures
-        # (network issues, auth problems, etc.) by scanning the remote file open log
-        # for XRootD / ROOT "No such file" error text.  The log is written by
-        # open_remote_file.py into the same workdir.  If the log is absent or
-        # contains no matching pattern we leave the code as REMOTEFILECOULDNOTBEOPENED,
-        # so there is no regression for non-missing-file failures.
-        _no_such_file_patterns = ("No such file or directory", "No such file (source)")
-        log_path = os.path.join(workdir, config.Pilot.remotefileverification_log)
-        if os.path.exists(log_path):
-            try:
-                with open(log_path, encoding='utf-8', errors='replace') as _fh:
-                    log_text = _fh.read()
-                if any(pat in log_text for pat in _no_such_file_patterns):
-                    logger.info('remote file open log indicates file(s) absent from storage; '
-                                'promoting error code to MISSINGINPUTFILE (1331)')
-                    exitcode = errors.MISSINGINPUTFILE
-            except OSError as _exc:
-                logger.warning(f'could not read remote file open log {log_path}: {_exc}')
-        else:
-            logger.debug(f'remote file open log not found at {log_path}; '
-                         f'keeping REMOTEFILECOULDNOTBEOPENED (1361)')
-
-    return exitcode, diagnostics, not_opened
-
-
-def get_file_open_command(script_path: str, turls: str, nthreads: int,
-                          stdout: str = 'remote_open.stdout', stderr: str = 'remote_open.stderr',
-                          workdir: str = '', rawfirst_turls: str = '') -> str:
-    """Return the command for opening remote files.
-
-    When the number of TURLs exceeds _TURL_CMDLINE_LIMIT the list is written to
-    a plain-text file (one TURL per line) inside ``workdir``, and --turl-file is
-    passed instead of --turls, preventing 'Argument list too long' errors. The
-    raw-first TURL list is handled the same way, via --rawfirst / --rawfirst-file.
-
-    ``script_path`` may be a container-relative path such as ``./open_remote_file.py``
-    whose ``dirname`` is ``'.'``.  The ``workdir`` parameter provides the real on-disk
-    destination so that ``turls.txt`` is written into the directory that is
-    bind-mounted as the working directory inside the container (typically ``/srv``).
-    When ``workdir`` is empty the directory part of ``script_path`` is used as a
-    fallback, which is correct when the path is absolute (e.g. in unit tests).
-
-    Args:
-        script_path: path to script (may be container-relative, e.g. ``./open_remote_file.py``).
-        turls: comma-separated turls.
-        nthreads: number of concurrent file open threads.
-        stdout: stdout file name.
-        stderr: stderr file name.
-        workdir: real on-disk working directory used as the write destination for
-            ``turls.txt``; falls back to ``os.path.dirname(script_path)`` when empty.
-        rawfirst_turls: comma-separated turls of input known not to be in ROOT format,
-            to be opened in raw mode first (empty when there are none).
-
-    Returns:
-        str: command string.
-    """
-    # Determine the directory that is reachable from the pilot process for writing
-    # turls.txt.  script_path may have been adjusted to a container-relative form
-    # (e.g. './open_remote_file.py') whose dirname resolves to '.' in the pilot's
-    # CWD, which differs from workdir.  Using workdir explicitly ensures the file
-    # lands in the bind-mounted directory that the container script can read.
-    write_dir = workdir if workdir else os.path.dirname(script_path)
-
-    turls_arg = get_turl_list_argument(turls, write_dir, 'turls.txt', '--turls', '--turl-file')
-
-    cmd = f"{script_path} {turls_arg} -w {os.path.dirname(script_path)} -t {nthreads}"
-    if rawfirst_turls:
-        cmd += ' ' + get_turl_list_argument(rawfirst_turls, write_dir, 'rawfirst.txt',
-                                            '--rawfirst', '--rawfirst-file')
-    if stdout and stderr:
-        cmd += f' 1>{stdout} 2>{stderr}'
-
-    return cmd
-
-
-def get_turl_list_argument(turls: str, write_dir: str, filename: str,
-                           inline_option: str, file_option: str) -> str:
-    """Return the command-line argument carrying a turl list.
-
-    Lists longer than _TURL_CMDLINE_LIMIT entries are written to ``filename`` in
-    ``write_dir`` and passed by reference, to keep the command line well below ARG_MAX.
-    On write failure the inline form is used as a fallback.
-
-    Args:
-        turls: comma-separated turls.
-        write_dir: directory to write the turl file to.
-        filename: name of the turl file (e.g. ``turls.txt``).
-        inline_option: option name for the inline form (e.g. ``--turls``).
-        file_option: option name for the by-reference form (e.g. ``--turl-file``).
-
-    Returns:
-        str: the command-line argument, including the option name.
-    """
-    turl_list = turls.split(',')
-
-    if len(turl_list) > _TURL_CMDLINE_LIMIT:
-        turl_file = os.path.join(write_dir, filename)
-        try:
-            write_file(turl_file, '\n'.join(turl_list))
-        except FileHandlingFailure as exc:
-            logger.warning(f'failed to write turl file {turl_file!r}: {exc} - falling back to {inline_option}')
-        else:
-            logger.debug(f'wrote {len(turl_list)} TURLs to {turl_file!r}, using {file_option}')
-            # Use a relative path in the command so it resolves correctly inside
-            # the container regardless of how the bind-mount is labelled.
-            return f"{file_option}='./{filename}'"
-
-    return f"{inline_option}='{turls}'"
-
-
-def extract_turls(indata: list) -> str:
-    """Extract TURLs from indata for direct i/o files.
-
-    Args:
-        indata: list of FileSpec objects.
-
-    Returns:
-        str: comma-separated list of turls.
-    """
-    # turls = ""
-    # for filespc in indata:
-    # if filespc.status == 'remote_io':
-    # turls += filespc.turl if not turls else f",{filespc.turl}"
-    # return turls
-
-    return ",".join(
-        fspec.turl for fspec in indata if fspec.status == 'remote_io'
-    )
-
-
-def extract_rawfirst_turls(indata: list) -> str:
-    """Extract TURLs of direct i/o input that is known not to be in ROOT format.
-
-    The decision is taken on ``fspec.lfn``, which is the authoritative file name known to
-    the pilot. It is deliberately not taken on the turl: the trailing path component of a
-    replica PFN is the LFN only for deterministically named replicas, so a turl is not a
-    reliable source for this. The resulting turls are passed to the file open verification
-    script, which opens them in raw mode first (see ``try_open_file()`` there).
-
-    Args:
-        indata: list of FileSpec objects.
-
-    Returns:
-        str: comma-separated list of turls, empty if all input may be in ROOT format.
-    """
-    return ",".join(
-        fspec.turl for fspec in indata
-        if fspec.status == 'remote_io' and not looks_like_root_file(fspec.lfn)
-    )
-
-
-def update_turls_with_filetype_raw(job: JobData) -> None:
-    """Update fspec.turl for input files that required the ``?filetype=raw`` fallback during the remoteIO check.
-
-    ``open_remote_file.py`` retries a failed file open by appending ``?filetype=raw`` to the TURL.
-    When that retry succeeds the modified TURL is written to the remotefileverification dictionary
-    (value ``True``), while the original bare TURL is absent from it.  This function reads that
-    dictionary and, for every ``remote_io`` input file whose bare TURL is not present but whose
-    ``?filetype=raw`` variant is present and marked as opened, updates ``fspec.turl`` in place so
-    that the PFC (``PoolFileCatalog.xml``) handed to the payload contains the correct TURL.
-
-    Must be called after ``open_remote_files()`` has completed and the dictionary has been written,
-    and before ``get_input_file_dictionary()`` / ``create_input_file_metadata()`` builds the PFC.
-
-    Args:
-        job: Job object with workdir and indata populated.
-    """
-    dictionary_path = os.path.join(job.workdir, config.Pilot.remotefileverification_dictionary)
-    if not os.path.exists(dictionary_path):
-        logger.debug(f'remotefileverification dictionary not found at {dictionary_path} - skipping ?filetype=raw turl update')
-        return
-
-    try:
-        file_dictionary = read_json(dictionary_path)
-    except PilotException as exc:
-        logger.warning(f'failed to read remotefileverification dictionary: {exc} - skipping ?filetype=raw turl update')
-        return
-
-    if not file_dictionary:
-        return
-
-    for fspec in job.indata:
-        if fspec.status != 'remote_io':
-            continue
-        raw_turl = fspec.turl + '?filetype=raw'
-        if file_dictionary.get(raw_turl) is True and not file_dictionary.get(fspec.turl):
-            logger.info(f'updating turl for lfn={fspec.lfn}: appending ?filetype=raw (required by remoteIO file-open check)')
-            fspec.turl = raw_turl
-
-
-def process_remote_file_traces(path: str, job: JobData, not_opened_turls: list) -> None:
-    """Report traces for remote files.
-
-    The function reads back the base trace report (common part of all traces)
-    and updates it per file before reporting it to the Rucio server.
-
-    Args:
-        path: path to base trace report.
-        job: job object.
-        not_opened_turls: list of turls that could not be opened.
-    """
-    try:
-        base_trace_report = read_json(path)
-    except PilotException as exc:
-        logger.warning(f'failed to open base trace report (cannot send trace reports): {exc}')
-    else:
-        if not base_trace_report:
-            logger.warning('failed to read back base trace report (cannot send trace reports)')
-        else:
-            # update and send the trace info
-            if 'workdir' not in base_trace_report:
-                base_trace_report['workdir'] = job.workdir
-            for fspec in job.indata:
-                if fspec.status == 'remote_io':
-                    base_trace_report.update(url=fspec.turl)
-                    base_trace_report.update(remoteSite=fspec.ddmendpoint, filesize=fspec.filesize)
-                    base_trace_report.update(filename=fspec.lfn, guid=fspec.guid.replace('-', ''))
-                    base_trace_report.update(scope=fspec.scope, dataset=fspec.dataset)
-                    if fspec.turl in not_opened_turls:
-                        base_trace_report.update(clientState='FAILED_REMOTE_OPEN')
-                    else:
-                        protocol = get_protocol(fspec.surl, base_trace_report.get('eventType', ''))
-                        logger.debug(f'protocol={protocol}')
-                        if protocol:
-                            base_trace_report.update(protocol=protocol)
-                            logger.debug(f'added protocol={protocol} to trace report')
-                        base_trace_report.update(clientState='FOUND_ROOT')
-
-                    # copy the base trace report (only a dictionary) into a real trace report object
-                    trace_report = TraceReport(**base_trace_report)
-                    if trace_report:
-                        trace_report.send()
-                    else:
-                        logger.warning(f'failed to create trace report for turl={fspec.turl}')
-
-
-def get_protocol(surl: str, event_type: str) -> str:
-    """Extract the protocol from the surl for event type get_sm_a.
-
-    Args:
-        surl: SURL.
-        event_type: event type.
-
-    Returns:
-        str: protocol.
-    """
-    protocol = ''
-    if event_type != 'get_sm_a':
-        return ''
-    if surl:
-        protocols = re.findall(r'(\w+)://', surl)  # use raw string to avoid flake8 warning W605 invalid escape sequence '\w'
-        if protocols:
-            protocol = protocols[0]
-
-    return protocol
-
-
-def get_nthreads(catchall: str) -> int:
-    """Extract number of concurrent file open threads from catchall.
-
-    Return nthreads=1 if nopenfiles=.. is not present in catchall.
-
-    Args:
-        catchall: queuedata catchall.
-
-    Returns:
-        int: number of threads.
-    """
-    _nthreads = get_key_value(catchall, key='nopenfiles')
-    return _nthreads if _nthreads else 1
-
-
-def get_payload_command(job: JobData, args: object = None) -> str:
-    """Return the full command for executing the payload, including the sourcing of all setup files and setting of environment variables.
-
-    Args:
-        job: job object.
-        args: pilot arguments.
-
-    Returns:
-        str: command.
-
-    Raises:
-        TrfDownloadFailure: in case of download failure.
-    """
-    # Should the pilot do the setup or does jobPars already contain the information?
-    preparesetup = should_pilot_prepare_setup(job.noexecstrcnv, job.jobparams)
-
-    # convert the base URLs for trf downloads to a list (most likely from an empty string)
-    base_urls = get_base_urls(args.baseurls)
-
-    # Get the platform value
-    # platform = job.infosys.queuedata.platform
-
-    # Is it a user job or not?
-    userjob = job.is_analysis()
-    tmp = 'user analysis' if userjob else 'production'
-    logger.info(f'pilot is running a {tmp} job')
-
-    resource_name = get_resource_name()  # 'grid' if no hpc_resource is set
-    resource = __import__(f'pilot.user.atlas.resource.{resource_name}', globals(), locals(), [resource_name], 0)
-
-    # make sure that remote file can be opened before executing payload
-    catchall = job.infosys.queuedata.catchall.lower() if job.infosys.queuedata.catchall else ''
-    if config.Pilot.remotefileverification_log and 'remoteio_test=false' not in catchall:
-        exitcode = 0
-        diagnostics = ""
-
-        t0 = int(time.time())
-        add_to_pilot_timing(job.jobid, PILOT_PRE_REMOTEIO, t0, args)
-        try:
-            exitcode, diagnostics, not_opened_turls, lsetup_time = open_remote_files(job.indata, job.workdir, get_nthreads(catchall))
-        except Exception as exc:
-            logger.warning(f'caught std exception: {exc}')
-        else:
-            # store the lsetup time for later reporting with job metrics
-            if lsetup_time:
-                job.lsetuptime = lsetup_time
-
-            # read back the base trace report
-            path = os.path.join(job.workdir, config.Pilot.base_trace_report)
-            if not os.path.exists(path):
-                logger.warning(f'base trace report does not exist ({path}) - '
-                               f'input file traces should already have been sent')
-            else:
-                process_remote_file_traces(path, job, not_opened_turls)  # ignore PyCharm warning, path is str
-
-            # if the remoteIO file-open check fell back to ?filetype=raw for any input file,
-            # propagate that modified TURL to fspec so the PFC handed to the payload is correct.
-            # pending confirmation from Rod that ?filetype=raw should be passed to the application:
-            # update_turls_with_filetype_raw(job)
-            # later it was requested not to append ?filetype=raw to the TURL in the PFC (https://its.cern.ch/jira/browse/ATLASPANDA-1096)
-
-            t1 = int(time.time())
-            add_to_pilot_timing(job.jobid, PILOT_POST_REMOTEIO, t1, args)
-            dt = t1 - t0
-            logger.info(f'remote file verification finished in {dt} s')
-
-            # fail the job if the remote files could not be verified
-            if exitcode != 0:
-                # improve the error diagnostics
-                diagnostics = errors.format_diagnostics(exitcode, diagnostics)
-                job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(exitcode, msg=diagnostics)
-                raise PilotException(diagnostics, code=exitcode)
-    else:
-        logger.debug('no remote file open verification')
-
-    os.environ['INDS'] = 'unknown'  # reset in case set by earlier job
-
-    # get the general setup command
-    cmd = resource.get_setup_command(job, preparesetup)
-    logger.debug(f'get_setup_command: cmd={cmd}')
-
-    # do not verify the command at this point, since it is best to run in a container (ie do it further down)
-
-    # move this until the final command is ready to prevent double work and complications
-    #if cmd:
-    #    # containerise command for payload setup verification
-    #    _cmd = create_middleware_container_command(job, cmd, label='setup', proxy=False)
-    #    exitcode, diagnostics = resource.verify_setup_command(_cmd)
-    #    if exitcode != 0:
-    #        job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(exitcode, msg=diagnostics)
-    #        raise PilotException(diagnostics, code=exitcode)
-    #    else:
-    #        logger.info('payload setup verified (in a container)')
-    #########################
-
-    if is_standard_atlas_job(job.swrelease):
-        # Normal setup (production and user jobs)
-        logger.info("preparing normal production/analysis job setup command")
-        cmd = get_normal_payload_command(cmd, job, preparesetup, userjob, base_urls)
-    else:
-        # Generic, non-ATLAS specific jobs, or at least a job with undefined swRelease
-        logger.info("generic job (non-ATLAS specific or with undefined swRelease)")
-        cmd = get_generic_payload_command(cmd, job, preparesetup, userjob, base_urls)
-
-    # add any missing trailing ;
-    if not cmd.endswith(';'):
-        cmd += '; '
-
-    site = os.environ.get('PILOT_SITENAME', '')
-    variables = get_payload_environment_variables(cmd, job.jobid, job.taskid, job.attemptnr, job.processingtype, site, userjob)
-    cmd = ''.join(variables) + cmd
-
-    # prepend payload command with environment variables from PQ.environ if set
-    cmd = prepend_env_vars(job.infosys.queuedata.environ, cmd)
-
-    # prepend PanDA job id in case it is not there already (e.g. runcontainer jobs)
-    if 'export PandaID' not in cmd:
-        cmd = f"export PandaID={job.jobid};" + cmd
-
-    cmd = cmd.replace(';;', ';')
-
-    ## ported from old logic
-    if not userjob and not job.is_build_job() and job.has_remoteio():
-        ## ported from old logic but still it looks strange (anisyonk)
-        ## the "PoolFileCatalog.xml" should already contains proper TURLs
-        ## values as it created by create_input_file_metadata() if the case
-        ## is just to patch `writetofile` file, than logic should be cleaned
-        ## and decoupled anyway, instead of parsing the file, it's much easier
-        ## to generate properly `writetofile` content from the beginning
-        ##  with TURL data
-        lfns = job.get_lfns_and_guids()[0]
-        cmd = replace_lfns_with_turls(
-            cmd,
-            job.workdir,
-            "PoolFileCatalog.xml",
-            lfns,
-            writetofile=job.writetofile
-        )
-
-    # Explicitly add the ATHENA_PROC_NUMBER (or JOB value)
-    cmd = add_athena_proc_number(cmd)
-    if job.dask_scheduler_ip:
-        cmd += f'export DASK_SCHEDULER_IP={job.dask_scheduler_ip}; ' + cmd
-
-    logger.info(f'payload run command: {cmd}')
-
-    return cmd
-
-
-def prepend_env_vars(environ: str, cmd: str) -> str:
-    """Prepend the payload command with environmental variables from PQ.environ if set.
-
-    Args:
-        environ: PQ.environ.
-        cmd: payload command.
-
-    Returns:
-        str: updated payload command.
-    """
-    exports = get_exports(environ)
-    exports_to_add = ''.join(exports)
-
-    # add the UTC time zone
-    exports_to_add += "export TZ=\'UTC\'; "
-    cmd = exports_to_add + cmd
-    logger.debug(f'prepended exports to payload command: {exports_to_add}')
-
-    return cmd
-
-
-def get_key_values(from_string: str) -> list:
-    """Return a list of key value tuples from given string.
-
-    Example: from_string = 'KEY1=VALUE1 KEY2=VALUE2' -> [('KEY1','VALUEE1'), ('KEY2', 'VALUE2')]
-
-    Args:
-        from_string: string containing key-value pairs.
-
-    Returns:
-        list: list of key-pair tuples.
-    """
-    return re.findall(re.compile(r"\b(\w+)=(.*?)(?=\s\w+=\s*|$)"), from_string)
-
-
-def get_exports(from_string: str) -> list:
-    """Return list of exports from given string.
-
-    Args:
-        from_string: string containing key-value pairs.
-
-    Returns:
-        list: list of export commands.
-    """
-    exports = []
-    key_values = get_key_values(from_string)
-    logger.debug(f'extracted key-values: {key_values}')
-    if key_values:
-        for _, raw_val in enumerate(key_values):
-            _key = raw_val[0]
-            _value = raw_val[1]
-            key_value = ''
-            if not _key.startswith('export '):
-                key_value = 'export ' + _key + '=' + _value
-            if not _value.endswith(';'):
-                key_value += ';'
-            exports.append(key_value)
-
-    return exports
-
-
-def get_normal_payload_command(cmd: str, job: JobData, preparesetup: bool, userjob: bool, base_urls: list) -> str:
-    """Return the payload command for a normal production/analysis job.
-
-    Args:
-        cmd: any preliminary command setup.
-        job: job object.
-        preparesetup: True if the pilot should prepare the setup, False if already in the job parameters.
-        userjob: True for user analysis jobs, False otherwise.
-        base_urls: list of base URLs for trf downloads.
-
-    Returns:
-        str: normal payload command.
-    """
-    # set the INDS env variable
-    # (used by runAthena but also for EventIndex production jobs)
-    set_inds(job.datasetin)  # realDatasetsIn
-
-    if userjob:
-        # Try to download the trf (skip when user container is to be used)
-        exitcode, diagnostics, trf_name = get_analysis_trf(job.transformation, job.workdir, base_urls)
-        if exitcode != 0:
-            raise TrfDownloadFailure(diagnostics)
-
-        logger.debug(f'user analysis trf: {trf_name}')
-
-        if preparesetup:
-            _cmd = get_analysis_run_command(job, trf_name)
-        else:
-            _cmd = job.jobparams
-
-        # Correct for multi-core if necessary (especially important in
-        # case coreCount=1 to limit parallel make)
-        cmd += "; " + add_makeflags(job.corecount, "") + _cmd
-    else:
-        # Add Database commands if they are set by the local site
-        cmd += os.environ.get('PILOT_DB_LOCAL_SETUP_CMD', '')
-
-        if job.is_eventservice:
-            if job.corecount:
-                cmd += f'; export ATHENA_PROC_NUMBER={job.corecount}'
-                cmd += f'; export ATHENA_CORE_NUMBER={job.corecount}'
-            else:
-                cmd += '; export ATHENA_PROC_NUMBER=1'
-                cmd += '; export ATHENA_CORE_NUMBER=1'
-
-        # Add the transform and the job parameters (production jobs)
-        if preparesetup:
-            cmd += f"; {job.transformation} {job.jobparams}"
-        else:
-            cmd += "; " + job.jobparams
-
-    return cmd
-
-
-def get_generic_payload_command(cmd: str, job: JobData, preparesetup: bool, userjob: bool, base_urls: list) -> str:
-    """Return the payload command for a generic job.
-
-    Args:
-        cmd: any preliminary command setup.
-        job: job object.
-        preparesetup: True if the pilot should prepare the setup, False if already in the job parameters.
-        userjob: True for user analysis jobs, False otherwise.
-        base_urls: list of base URLs for trf downloads.
-
-    Returns:
-        str: generic job command.
-    """
-    if userjob:
-        # Try to download the trf
-        #if job.imagename != "" or "--containerImage" in job.jobparams:
-        #    job.transformation = os.path.join(os.path.dirname(job.transformation), "runcontainer")
-        #    logger.warning(f'overwrote job.transformation, now set to: {job.transformation}')
-        exitcode, diagnostics, trf_name = get_analysis_trf(job.transformation, job.workdir, base_urls)
-        if exitcode != 0:
-            raise TrfDownloadFailure(diagnostics)
-
-        logger.debug(f'user analysis trf: {trf_name}')
-
-        if preparesetup:
-            _cmd = get_analysis_run_command(job, trf_name)
-        else:
-            _cmd = job.jobparams
-
-        # correct for multi-core if necessary (especially important in case
-        # coreCount=1 to limit parallel make), only if not using a user container
-        if not job.imagename:
-            cmd += "; " + add_makeflags(job.corecount, "") + _cmd
-        else:
-            cmd += _cmd
-
-    elif verify_release_string(job.homepackage) != 'NULL' and job.homepackage != ' ':
-        if preparesetup:
-            cmd = f"python {job.homepackage}/{job.transformation} {job.jobparams}"
-        else:
-            cmd = job.jobparams
-    elif preparesetup:
-        cmd = f"python {job.transformation} {job.jobparams}"
-    else:
-        cmd = job.jobparams
-
-    return cmd
-
-
-def add_athena_proc_number(cmd: str) -> str:
-    """Add the ATHENA_PROC_NUMBER and ATHENA_CORE_NUMBER to the payload command if necessary.
-
-    Args:
-        cmd: payload execution command.
-
-    Returns:
-        str: updated payload execution command.
-    """
-    # get the values if they exist
-    try:
-        value1 = int(os.environ['ATHENA_PROC_NUMBER_JOB'])
-    except (TypeError, KeyError, ValueError) as exc:
-        logger.warning(f'failed to convert ATHENA_PROC_NUMBER_JOB to int: {exc}')
-        value1 = None
-    try:
-        value2 = int(os.environ['ATHENA_CORE_NUMBER'])
-    except (TypeError, KeyError, ValueError) as exc:
-        logger.warning(f'failed to convert ATHENA_CORE_NUMBER to int:{exc}')
-        value2 = None
-
-    if "ATHENA_PROC_NUMBER" not in cmd:
-        if "ATHENA_PROC_NUMBER" in os.environ:
-            cmd = f"export ATHENA_PROC_NUMBER={os.environ['ATHENA_PROC_NUMBER']};" + cmd
-        elif "ATHENA_PROC_NUMBER_JOB" in os.environ and value1:
-            if value1 > 1:
-                cmd = f'export ATHENA_PROC_NUMBER={value1};' + cmd
-            else:
-                logger.info(f"will not add ATHENA_PROC_NUMBER to cmd since the value is {value1}")
-        else:
-            logger.warning((
-                "don't know how to set ATHENA_PROC_NUMBER "
-                "(could not find it in os.environ)"))
-    else:
-        logger.info("ATHENA_PROC_NUMBER already in job command")
-
-    if 'ATHENA_CORE_NUMBER' in os.environ and value2:
-        if value2 > 1:
-            cmd = f'export ATHENA_CORE_NUMBER={value2};' + cmd
-        else:
-            logger.info(f"will not add ATHENA_CORE_NUMBER to cmd since the value is {value2}")
-    else:
-        logger.warning((
-            'there is no ATHENA_CORE_NUMBER in os.environ '
-            '(cannot add it to payload command)'))
-
-    return cmd
-
-
-def verify_release_string(release: Optional[str]) -> str:
-    """Verify that the release (or homepackage) string is set.
-
-    Args:
-        release: release or homepackage string that might or might not be set.
-
-    Returns:
-        str: release string.
-    """
-    if release is None:
-        release = ""
-    release = release.upper()
-    if release == "":
-        release = "NULL"
-    if release == "NULL":
-        logger.info("detected unset (NULL) release/homepackage string")
-
-    return release
-
-
-def add_makeflags(job_core_count: int, cmd: str) -> str:
-    """Correct for multicore if necessary (especially important in case coreCount=1 to limit parallel make).
-
-    Args:
-        job_core_count: core count from the job definition.
-        cmd: payload execution command.
-
-    Returns:
-        str: updated payload execution command.
-    """
-    # ATHENA_PROC_NUMBER is set in Node.py using the schedconfig value
-    try:
-        core_count = int(os.environ.get('ATHENA_PROC_NUMBER'))
-    except (TypeError, KeyError, ValueError):
-        core_count = -1
-
-    if core_count == -1:
-        try:
-            core_count = int(job_core_count)
-        except (TypeError, ValueError):
-            pass
-        else:
-            if core_count >= 1:
-                # Note: the original request (AF) was to use j%d
-                # and not -j%d, now using the latter
-                cmd += f"export MAKEFLAGS=\'-j{core_count} QUICK=1 -l1\';"
-
-    # make sure that MAKEFLAGS is always set
-    if "MAKEFLAGS=" not in cmd:
-        cmd += "export MAKEFLAGS=\'-j1 QUICK=1 -l1\';"
-
-    return cmd
-
-
-def get_analysis_run_command(job: JobData, trf_name: str) -> str:  # noqa: C901
-    """Return the proper run command for the user job.
-
-    Example output:
-    export X509_USER_PROXY=<..>;./runAthena <job parameters> --usePFCTurl --directIn
-
-    Args:
-        job: job object.
-        trf_name: name of the transform that will run the job.
-
-    Returns:
-        str: command.
-    """
-    cmd = ""
-
-    # add the user proxy
-    if 'X509_USER_PROXY' in os.environ and not job.imagename:
-        x509 = os.environ.get('X509_UNIFIED_DISPATCH', os.environ.get('X509_USER_PROXY', ''))
-        cmd += f'export X509_USER_PROXY={x509};'
-
-    env_vars_to_unset = [
-        'OIDC_AUTH_TOKEN',
-        'OIDC_AUTH_ORIGIN',
-        'PANDA_AUTH_TOKEN',
-        'PANDA_AUTH_ORIGIN',
-        'OIDC_REFRESHED_AUTH_TOKEN'
-    ]
-
-    for var in env_vars_to_unset:
-        if var in os.environ:
-            cmd += f'unset {var};'
-
-    # set up trfs
-    if job.imagename == "":  # user jobs with no imagename defined
-        cmd += f'./{trf_name} {job.jobparams}'
-    else:
-        if job.is_analysis() and job.imagename:
-            cmd += f'./{trf_name} {job.jobparams}'
-        else:
-            cmd += f'python {trf_name} {job.jobparams}'
-
-        imagename = job.imagename
-        # check if image is on disk as defined by envar PAYLOAD_CONTAINER_LOCATION
-        payload_container_location = os.environ.get('PAYLOAD_CONTAINER_LOCATION')
-        if payload_container_location is not None:
-            logger.debug(f"$PAYLOAD_CONTAINER_LOCATION = {payload_container_location}")
-            # get container name
-            containername = imagename.rsplit('/')[-1]
-            image_location = os.path.join(payload_container_location, containername)
-            if os.path.exists(image_location):
-                logger.debug(f"image exists at {image_location}")
-                imagename = image_location
-
-        # restore the image name if necessary
-        if 'containerImage' not in cmd and 'runcontainer' in trf_name:
-            cmd += f' --containerImage={imagename}'
-
-    # add control options for PFC turl and direct access
-    #if job.indata:   ## DEPRECATE ME (anisyonk)
-    #    if use_pfc_turl and '--usePFCTurl' not in cmd:
-    #        cmd += ' --usePFCTurl'
-    #    if use_direct_access and '--directIn' not in cmd:
-    #        cmd += ' --directIn'
-
-    if job.has_remoteio():
-        logger.debug((
-            'direct access (remoteio) is used to access some input files: '
-            '--usePFCTurl and --directIn will be added to payload command'))
-        if '--usePFCTurl' not in cmd:
-            cmd += ' --usePFCTurl'
-        if '--directIn' not in cmd:
-            cmd += ' --directIn'
-
-    # update the payload command for forced accessmode
-    ## -- REDUNDANT logic, since it should be done from the beginning at
-    ## the step of FileSpec initialization (anisyonk)
-    #cmd = update_forced_accessmode(log, cmd, job.transfertype,
-    # job.jobparams, trf_name)  ## DEPRECATE ME (anisyonk)
-
-    # add guids when needed
-    # get the correct guids list (with only the direct access files)
-    if not job.is_build_job():
-        lfns, guids = job.get_lfns_and_guids()
-        _guids = get_guids_from_jobparams(job.jobparams, lfns, guids)
-        if _guids:
-            cmd += f' --inputGUIDs "{str(_guids)}"'
-
-    return cmd
-
-
-def get_guids_from_jobparams(jobparams: str, infiles: list, infilesguids: list) -> list:
-    """Extract the correct guid from the input file list.
-
-    The guids list is used for direct reading.
-    1. extract input file list for direct reading from job parameters
-    2. for each input file in this list, find the corresponding guid from
-    the input file guid list.
-    Since the job parameters string is entered by a human, the order of
-    the input files might not be the same.
-
-    Args:
-        jobparams: job parameters.
-        infiles: input file list.
-        infilesguids: input file guids list.
-
-    Returns:
-        list: guids.
-    """
-    guidlist = []
-    jobparams = jobparams.replace("'", "")
-    jobparams = jobparams.replace(", ", ",")
-
-    pattern = re.compile(r'\-i \"\[([A-Za-z0-9.,_-]+)\]\"')
-    directreadinginputfiles = re.findall(pattern, jobparams)
-    _infiles = []
-    if directreadinginputfiles != []:
-        _infiles = directreadinginputfiles[0].split(",")
-    else:
-        match = re.search(r"-i ([A-Za-z0-9.\[\],_-]+) ", jobparams)
-        if match is not None:
-            compactinfiles = match.group(1)
-            match = re.search(r'(.*)\[(.+)\](.*)\[(.+)\]', compactinfiles)
-            if match is not None:
-                infiles = []
-                head = match.group(1)
-                tail = match.group(3)
-                body = match.group(2).split(',')
-                attr = match.group(4).split(',')
-
-                for idx, item in enumerate(body):
-                    lfn = f'{head}{item}{tail}{attr[idx]}'
-                    infiles.append(lfn)
-            else:
-                infiles = [compactinfiles]
-
-    for infile in _infiles:
-        # get the corresponding index from the inputFiles list,
-        # which has the same order as infilesguids
-        try:
-            index = infiles.index(infile)
-        except ValueError as exc:
-            logger.warning(f"exception caught: {exc} (direct reading will fail)")
-        else:
-            # add the corresponding guid to the list
-            guidlist.append(infilesguids[index])
-
-    return guidlist
-
-
-def test_job_data(job: JobData) -> None:
-    """Test function to verify that the job object contains the expected data.
-
-    Args:
-        job: job object.
-    """
-    # in case the job was created with --outputs="regex|DST_.*\.root", we can now look for the corresponding
-    # output files and add them to the output file list
-    # add a couple of files to replace current output
-    filesizeinbytes = 1024
-    outputfiles = ['DST_.random1.root', 'DST_.random2.root', 'DST_.random3.root']
-    for outputfile in outputfiles:
-        with open(os.path.join(job.workdir, outputfile), 'wb') as fout:
-            fout.write(os.urandom(filesizeinbytes))  # replace 1024 with a size in kilobytes if it is not unreasonably large
-
-    outfiles = []
-    scope = ''
-    dataset = ''
-    ddmendpoint = ''
-    for fspec in job.outdata:
-
-        fspec.lfn = 'regex|DST_.*.root'
-        if fspec.lfn.startswith('regex|'):  # if this is true, job.outdata will be overwritten
-            regex_pattern = fspec.lfn.split('regex|')[1]  # "DST_.*.root"
-            logger.info(f'found regular expression {regex_pattern} - looking for the corresponding files in {job.workdir}')
-
-            # extract needed info for the output files for later
-            scope = fspec.scope
-            dataset = fspec.dataset
-            ddmendpoint = fspec.ddmendpoint
-
-            # now locate the corresponding files in the work dir
-            outfiles = [_file for _file in os.listdir(job.workdir) if re.search(regex_pattern, _file)]
-            logger.debug(f'outfiles={outfiles}')
-            if not outfiles:
-                logger.warning(f'no output files matching {regex_pattern} were found')
-            break
-
-    if outfiles:
-        new_outfiles = []
-        for outfile in outfiles:
-            new_file = {'scope': scope,
-                        'lfn': outfile,
-                        'guid': get_guid(),
-                        'workdir': job.workdir,
-                        'dataset': dataset,
-                        'ddmendpoint': ddmendpoint,
-                        'ddmendpoint_alt': None}
-            new_outfiles.append(new_file)
-        logger.debug(f'new_outfiles={new_outfiles}')
-        # create list of FileSpecs and overwrite the old job.outdata
-        _xfiles = [FileSpec(filetype='output', **_file) for _file in new_outfiles]
-        logger.info(f'overwriting old outdata list with new output file info (size={len(_xfiles)})')
-        job.outdata = _xfiles
-    else:
-        logger.debug('no regex found in outdata file list')
-
-
-def update_job_data(job: JobData) -> None:
-    """Update the job object.
-
-    This function can be used to update/add data to the job object.
-    E.g. user specific information can be extracted from other job object fields.
-    In the case of ATLAS, information is extracted from the metadata field and
-    added to other job object fields.
-
-    Args:
-        job: job object.
-    """
-    ## comment from Alexey:
-    ## it would be better to reallocate this logic (as well as parse
-    ## metadata values)directly to Job object since in general it's Job
-    ## related part. Later on once we introduce VO specific Job class
-    ## (inherited from JobData) this can be easily customized
-
-    # test_job_data(job)
-
-    # get label "all" or "log"
-    stageout = get_stageout_label(job)
-
-    if 'exeErrorDiag' in job.metadata:
-        job.exeerrordiag = job.metadata['exeErrorDiag']
-        if job.exeerrordiag:
-            logger.warning(f'payload failed: exeErrorDiag={job.exeerrordiag}')
-
-    # determine what should be staged out
-    job.stageout = stageout  # output and log file or only log file
-
-    try:
-        work_attributes = parse_jobreport_data(job.metadata)
-    except Exception as exc:
-        logger.warning(f'failed to parse job report (cannot set job.nevents): {exc}')
-    else:
-        # note: the number of events can be set already at this point
-        # if the value was extracted from the job report (a more thorough
-        # search for this value is done later unless it was set here)
-        nevents = work_attributes.get('nEvents', 0)
-        if nevents:
-            job.nevents = nevents
-
-    # extract output files from the job report if required, in case the trf
-    # has created additional (overflow) files. Also make sure all guids are
-    # assigned (use job report value if present, otherwise generate the guid)
-    is_raythena = os.environ.get('PILOT_ES_EXECUTOR_TYPE', 'generic') == 'raythena'
-    if not is_raythena:
-        if job.metadata and not job.is_eventservice:
-            # keep this for now, complicated to merge with verify_output_files?
-            extract_output_file_guids(job)
-            try:
-                verify_output_files(job)
-            except Exception as exc:
-                logger.warning(f'exception caught while trying verify output files: {exc}')
-        elif not job.allownooutput:  # i.e. if it's an empty list/string, do nothing
-            logger.debug((
-                "will not try to extract output files from jobReport "
-                "for user job (and allowNoOut list is empty)"))
-        else:
-            # remove the files listed in allowNoOutput if they don't exist
-            remove_no_output_files(job)
-
-        validate_output_data(job)
-
-
-def validate_output_data(job: JobData) -> None:
-    """Validate output data.
-
-    Set any missing GUIDs and make sure the output file names follow the ATLAS naming convention - if not, set the
-    error code.
-
-    Args:
-        job: job object.
-    """
-    ## validate output data (to be moved into the JobData)
-    ## warning: do no execute this code unless guid lookup in job report
-    # has failed - pilot should only generate guids
-    ## if they are not present in job report
-
-    pattern = re.compile(naming_convention_pattern())
-    bad_files = []
-    for dat in job.outdata:
-        if not dat.guid:
-            dat.guid = get_guid()
-            logger.warning(f'guid not set: generated guid={dat.guid} for lfn={dat.lfn}')
-        # is the output file following the naming convention?
-        found = re.findall(pattern, dat.lfn)
-        if found:
-            logger.info(f'verified that {dat.lfn} follows the naming convention')
-        else:
-            bad_files.append(dat.lfn)
-
-    # make sure there are no illegal characters in the file names
-    for bad_file_name in bad_files:
-        diagnostic = f'{bad_file_name} does not follow the naming convention: {naming_convention_pattern()}'
-        try:
-            bad_file_name.encode('ascii')
-        except UnicodeEncodeError as exc:
-            diagnostic += f' and contains illegal characters: {exc}'
-            # only fail the job in this case (otherwise test jobs would fail!), and only report on the first file
-            if errors.BADOUTPUTFILENAME not in job.piloterrorcodes:
-                job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.BADOUTPUTFILENAME, msg=diagnostic)
-        logger.warning(diagnostic)
-
-    if not bad_files:
-        logger.debug('verified that all output files follow the ATLAS naming convention')
-
-
-def naming_convention_pattern() -> str:
-    """Return a regular expression pattern in case the output file name should be verified.
-
-    Pattern as below in the return statement will match the following file names:
-    re.findall(pattern, 'AOD.29466419._001462.pool.root.1')
-    ['AOD.29466419._001462.pool.root.1']
-
-    Returns:
-        str: raw string pattern.
-    """
-    max_filename_size = 250
-
-    # pydocstyle does not like the backslash in the following line, but it is needed
-    return fr"^[A-Za-z0-9][A-Za-z0-9.\-_]{{1,{max_filename_size}}}$"
-
-
-def get_stageout_label(job: JobData) -> str:
-    """Get a proper stage-out label.
-
-    Args:
-        job: job object.
-
-    Returns:
-        str: "all" or "log" depending on stage-out type.
-    """
-    stageout = "all"
-
-    if job.is_eventservice:
-        logger.info('event service payload, will only stage-out log')
-        stageout = "log"
-    elif 'exeErrorCode' in job.metadata:
-        # handle any error codes
-        job.exeerrorcode = job.metadata['exeErrorCode']
-        if job.exeerrorcode == 0:
-            stageout = "all"
-        else:
-            logger.info(f'payload failed: exeErrorCode={job.exeerrorcode}')
-            stageout = "log"
-
-    return stageout
-
-
-def update_output_for_hpo(job: JobData) -> None:
-    """Update the output (outdata) for HPO jobs.
-
-    Args:
-        job: job object.
-    """
-    try:
-        new_outdata = discover_new_outdata(job)
-    except Exception as exc:
-        logger.warning(f'exception caught while discovering new outdata: {exc}')
-    else:
-        if new_outdata:
-            logger.info(f'replacing job outdata with discovered output ({len(new_outdata)} file(s))')
-            job.outdata = new_outdata
-
-
-def discover_new_outdata(job: JobData) -> list:
-    """Discover new outdata created by HPO job.
-
-    Args:
-        job: job object.
-
-    Returns:
-        list: new_outdata (list of FileSpec objects).
-    """
-    new_outdata = []
-
-    for outdata_file in job.outdata:
-        new_output = discover_new_output(outdata_file.lfn, job.workdir)
-        if new_output:
-            # create new FileSpec objects out of the new output
-            for outfile, file_info in new_output.items():
-                # note: guid will be taken from job report
-                # after this function has been called
-                files = [{
-                    'scope': outdata_file.scope,
-                    'lfn': outfile,
-                    'workdir': job.workdir,
-                    'dataset': outdata_file.dataset,
-                    'ddmendpoint': outdata_file.ddmendpoint,
-                    'ddmendpoint_alt': None,
-                    'filesize': file_info['filesize'],
-                    'checksum': file_info['checksum'],
-                    'guid': ''
-                }]
-
-                # do not abbreviate the following two lines as otherwise
-                # the content of xfiles will be a list of generator objects
-                _xfiles = [FileSpec(filetype='output', **f) for f in files]
-                new_outdata += _xfiles
-
-    return new_outdata
-
-
-def discover_new_output(name_pattern: str, workdir: str) -> dict:
-    """Discover new output created by HPO job in the given work directory.
-
-    name_pattern for known 'filename' is 'filename_N' (N = 0, 1, 2, ..).
-    Example: name_pattern = 23578835.metrics.000001.tgz
-             should discover files with names 23578835.metrics.000001.tgz_N (N = 0, 1, ..)
-
-    new_output = { lfn: {'path': path, 'size': size, 'checksum': checksum}, .. }
-
-    Args:
-        name_pattern: assumed name pattern for file to discover.
-        workdir: work directory.
-
-    Returns:
-        dict: new_output.
-    """
-    new_output = {}
-    outputs = glob(f"{workdir}/{name_pattern}_*")
-    if outputs:
-        lfns = [os.path.basename(path) for path in outputs]
-        for lfn, path in list(zip(lfns, outputs)):
-            # get file size
-            filesize = get_local_file_size(path)
-            # get checksum
-            try:
-                checksum = calculate_checksum(path, algorithm=config.File.checksum_type)
-            except (FileHandlingFailure, NotImplementedError) as exc:
-                logger.warning(f'failed to create file info (filesize={filesize}) for lfn={lfn}: {exc}')
-            else:
-                if filesize and checksum:
-                    new_output[lfn] = {'path': path, 'filesize': filesize, 'checksum': checksum}
-                else:
-                    logger.warning(f'failed to create file info (filesize={filesize}, checksum={checksum}) for lfn={lfn}')
-
-    return new_output
-
-
-def extract_output_file_guids(job: JobData) -> None:
-    """Extract output file info from the job report and make sure all guids are assigned.
-
-    Use job report value if present, otherwise generate the guid.
-    Note: guid generation is done later, not in this function since
-    this function might not be called if metadata info is not found prior
-    to the call.
-
-    Args:
-        job: job object.
-    """
-    # make sure there is a defined output file list in the job report -
-    # unless it is allowed by task parameter allowNoOutput
-    if not job.allownooutput:
-        output = job.metadata.get('files', {}).get('output', [])
-        if output:
-            logger.info(f'verified that job report contains metadata for {len(output)} file(s)')
-        else:
-            #- will fail job since allowNoOutput is not set')
-            logger.warning('job report contains no output files and allowNoOutput is not set')
-            #job.piloterrorcodes, job.piloterrordiags =
-            # errors.add_error_code(errors.NOOUTPUTINJOBREPORT)
-            return
-
-    # extract info from metadata (job report JSON)
-    data = dict([out.lfn, out] for out in job.outdata)
-    #extra = []
-    for dat in job.metadata.get('files', {}).get('output', []):
-        for fdat in dat.get('subFiles', []):
-            lfn = fdat['name']
-
-            # verify the guid if the lfn is known
-            # only extra guid if the file is known by the
-            # job definition (March 18 change, v 2.5.2)
-            if lfn in data:
-                data[lfn].guid = fdat['file_guid']
-                logger.info(f'set guid={data[lfn].guid} for lfn={lfn} (value taken from job report)')
-            else:  # found new entry
-                logger.warning(f'pilot no longer considers output files not mentioned in job definition (lfn={lfn})')
-                continue
-
-                #if job.outdata:
-                #    kw = {'lfn': lfn,
-                # .         # take value from 1st output file?
-                #          'scope': job.outdata[0].scope,
-                #          'guid': fdat['file_guid'],
-                #          'filesize': fdat['file_size'],
-                #           # take value from 1st output file?
-                #          'dataset': dat.get('dataset') or job.outdata[0].dataset
-                #          }
-                #    spec = FileSpec(filetype='output', **kw)
-                #    extra.append(spec)
-
-    # make sure the output list has set guids from job report
-    for fspec in job.outdata:
-        if fspec.guid != data[fspec.lfn].guid:
-            fspec.guid = data[fspec.lfn].guid
-            logger.debug(f'reset guid={fspec.guid} for lfn={fspec.lfn}')
-        elif fspec.guid:
-            logger.debug(f'verified guid={fspec.guid} for lfn={fspec.lfn}')
-        else:
-            logger.warning(f'guid not set for lfn={fspec.lfn}')
-    #if extra:
-        #logger.info('found extra output files in job report,
-        # will overwrite output file list: extra=%s' % extra)
-        #job.outdata = extra
-
-
-def verify_output_files(job: JobData) -> bool:
-    """Verify that the output files from the job definition are listed in the job report.
-
-    Also make sure that the number of processed events is greater than zero.
-
-    If the output file is not listed in the job report, then if the file is
-    listed in allowNoOutput remove it from stage-out, otherwise fail the job.
-
-    Note from Rod: fail scenario: The output file is not in output:[] or is
-    there with zero events. Then if allownooutput is not set - fail the job.
-    If it is set, then do not store the output, and finish ok.
-
-    Args:
-        job: job object.
-
-    Returns:
-        bool: True if output files were validated correctly, False otherwise.
-    """
-    failed = False
-
-    # get list of output files from the job definition
-    lfns_jobdef = []
-    for fspec in job.outdata:
-        lfns_jobdef.append(fspec.lfn)
-    if not lfns_jobdef:
-        logger.debug('empty output file list from job definition (nothing to verify)')
+    name = os.path.basename(path or "")
+    if not name:
+        return False
+
+    if name == SNAPSHOT_FILENAME:
         return True
 
-    # get list of output files from job report
-    # (if None is returned, it means the job report is from an old release
-    # and does not contain an output list)
-    output = job.metadata.get('files', {}).get('output', None)
-    if not output and output is not None:
-        # ie empty list, output=[] - are all known output files in allowNoOutput?
-        logger.warning('encountered an empty output file list in job report, consulting allowNoOutput list')
-        failed = False
-        for lfn in lfns_jobdef:
-            if lfn not in job.allownooutput:
-                if job.is_analysis():
-                    logger.warning(f'lfn {lfn} is not in allowNoOutput list - ignore for user job')
-                else:
-                    failed = True
-                    logger.warning(f'lfn {lfn} is not in allowNoOutput list - job will fail')
-                    job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.MISSINGOUTPUTFILE)
-                    break
-            else:
-                logger.info(f'lfn {lfn} listed in allowNoOutput - will be removed from stage-out')
-                remove_from_stageout(lfn, job)
+    if name.endswith(CORE_INFO_SUFFIX) or name.endswith(GDB_OUTPUT_SUFFIX):
+        return True
 
-    elif output is None:
-        # ie job report is ancient / output could not be extracted
-        logger.warning('output file list could not be extracted from job report (nothing to verify)')
-    else:
-        verified, nevents = verify_extracted_output_files(output, lfns_jobdef, job)
-        failed = (not verified)
-        if nevents > 0 and not failed and job.nevents == 0:
-            job.nevents = nevents
-            logger.info(f'number of events from summed up output files: {nevents}')
-        else:
-            logger.info(f'number of events previously set to {job.nevents}')
-
-    status = (not failed)
-
-    if status:
-        logger.info('output file verification succeeded')
-    else:
-        logger.warning('output file verification failed')
-
-    return status
+    return bool(CORE_FILE_PATTERN.match(name))
 
 
-def verify_extracted_output_files(output: list, lfns_jobdef: list, job: JobData) -> tuple[bool, int]:
-    """Make sure all output files extracted from the job report are listed.
+def remove_diagnostic_files(files: list) -> list:
+    """Return the given file list without the looping diagnostic artifacts.
 
-    Grab the number of events if possible.
+    Called by the looping algorithm on the list of recently modified files
+    before their modification times are used to decide whether the payload is
+    still alive.
 
     Args:
-        output: list of FileSpecs.
-        lfns_jobdef: list of lfns strings from job definition.
-        job: job object.
+        files: File paths.
 
     Returns:
-        tuple[bool, int]: True if successful, False if failed; number of events.
+        The paths that are not looping diagnostic artifacts.
     """
-    failed = False
-    nevents = 0
-    output_jobrep = {}  # {lfn: nentries, ..}
-    logger.debug((
-        'extracted output file list from job report - '
-        'make sure all known output files are listed'))
+    kept = [_file for _file in files or [] if not is_looping_diagnostic_file(_file)]
 
-    # first collect the output files from the job report
-    for dat in output:
-        for fdat in dat.get('subFiles', []):
-            # get the lfn
-            name = fdat.get('name', None)
+    dropped = len(files or []) - len(kept)
+    if dropped:
+        logger.debug(
+            f"{LOG_PREFIX}: ignoring {dropped} looping diagnostic file(s) in the work directory - "
+            f"they are pilot output, not payload activity"
+        )
 
-            # get the number of processed events and add the output file info to the dictionary
-            output_jobrep[name] = fdat.get('nentries', None)
-
-    # now make sure that the known output files are in the job report dictionary
-    for lfn in lfns_jobdef:
-        if lfn not in output_jobrep and lfn not in job.allownooutput:
-            if job.is_analysis():
-                logger.warning(f'output file {lfn} from job definition is not present in job report and '
-                               f'is not listed in allowNoOutput')
-            else:
-                logger.warning(f'output file {lfn} from job definition is not present in job report and '
-                               f'is not listed in allowNoOutput - job will fail')
-                job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.MISSINGOUTPUTFILE)
-                failed = True
-                break
-        if lfn not in output_jobrep and lfn in job.allownooutput:
-            logger.warning(f'output file {lfn} from job definition is not present in job report but '
-                           f'is listed in allowNoOutput - remove from stage-out')
-            remove_from_stageout(lfn, job)
-        else:
-            nentries = output_jobrep[lfn]
-            if nentries == "UNDEFINED":
-                logger.warning(f'encountered file with nentries=UNDEFINED - will ignore {lfn}')
-
-            elif nentries is None:
-                if lfn not in job.allownooutput:
-                    logger.warning(f'output file {lfn} is listed in job report, but has no events and '
-                                   f'is not listed in allowNoOutput - will ignore')
-                else:
-                    logger.warning(f'output file {lfn} is listed in job report, nentries is None and is listed in '
-                                   f'allowNoOutput - remove from stage-out')
-                    remove_from_stageout(lfn, job)
-
-            elif nentries == 0:
-                if lfn not in job.allownooutput:
-                    logger.warning(f'output file {lfn} is listed in job report, has zero events and '
-                                   f'is not listed in allowNoOutput - will ignore')
-                else:
-                    logger.warning(f'output file {lfn} is listed in job report, has zero events and is listed in '
-                                   f'allowNoOutput - remove from stage-out')
-                    remove_from_stageout(lfn, job)
-
-            elif isinstance(nentries, int) and nentries:
-                logger.info(f'output file {lfn} has {nentries} event(s)')
-                nevents += nentries
-            else:  # should not reach this step
-                logger.warning(f'case not handled for output file {lfn} with {nentries} event(s) (ignore)')
-
-    status = (not failed)
-
-    return status, nevents
+    return kept
 
 
-def remove_from_stageout(lfn: str, job: JobData) -> None:
-    """Remove the given lfn from the stage-out list.
+def read_proc_file(pid: int, name: str) -> str:
+    """Return the contents of a file under ``/proc/<pid>/``.
 
     Args:
-        lfn: local file name.
-        job: job object.
-    """
-    outdata = []
-    for fspec in job.outdata:
-        if fspec.lfn == lfn:
-            logger.info(f'removing {lfn} from stage-out list')
-        else:
-            outdata.append(fspec)
-    job.outdata = outdata
-
-
-def remove_no_output_files(job: JobData) -> None:
-    """Remove files from output file list if they are listed in allowNoOutput and do not exist.
-
-    Args:
-        job: job object.
-    """
-    # first identify the files to keep
-    _outfiles = []
-    for fspec in job.outdata:
-        filename = fspec.lfn
-        path = os.path.join(job.workdir, filename)
-
-        if filename in job.allownooutput:
-            if os.path.exists(path):
-                logger.info(f"file {filename} is listed in allowNoOutput but exists (will not be removed from "
-                            f"list of files to be staged-out)")
-                _outfiles.append(filename)
-            else:
-                logger.info(f"file {filename} is listed in allowNoOutput and does not exist (will be removed from list of files to be staged-out)")
-        else:
-            if os.path.exists(path):
-                logger.info(f"file {filename} is not listed in allowNoOutput (will be staged-out)")
-            else:
-                logger.warning(f"file {filename} is not listed in allowNoOutput and does not exist (job will fail)")
-            _outfiles.append(filename)
-
-    # now remove the unwanted fspecs
-    if len(_outfiles) != len(job.outdata):
-        outdata = []
-        for fspec in job.outdata:
-            if fspec.lfn in _outfiles:
-                outdata.append(fspec)
-        job.outdata = outdata
-
-
-def get_outfiles_records(subfiles: list) -> dict:
-    """Extract file info from job report JSON subfiles entry.
-
-    Args:
-        subfiles: list of subfiles.
+        pid: Process id.
+        name: File name relative to ``/proc/<pid>/``, e.g. ``"stat"``.
 
     Returns:
-        dict: file info dictionary with format { 'guid': .., 'size': .., 'nentries': .. (optional)}.
+        File contents, or an empty string if the file could not be read (the
+        process may have exited, or the kernel may not provide the file).
     """
-    res = {}
-    for subfile in subfiles:
-        res[subfile['name']] = {
-            'guid': subfile['file_guid'],
-            'size': subfile['file_size']
-        }
-
-        nentries = subfile.get('nentries', 'UNDEFINED')
-        if isinstance(nentries, int):
-            res[subfile['name']]['nentries'] = nentries
-        else:
-            logger.warning("nentries is undefined in job report")
-
-    return res
-
-
-class DictQuery(dict):
-    """Helper class for parsing the job report."""
-
-    def get(self, path: str, dst_dict: dict, dst_key: str) -> None:
-        """Get value from dictionary.
-
-        Updates dst_dict[dst_key] with the value from the dictionary.
-
-        Args:
-            path: path to the value.
-            dst_dict: destination dictionary.
-            dst_key: destination key.
-        """
-        keys = path.split("/")
-        if len(keys) == 0:
-            return
-        last_key = keys.pop()
-        me_ = self
-        for key in keys:
-            if not (key in me_ and isinstance(me_[key], dict)):
-                return
-
-            me_ = me_[key]
-
-        if last_key in me_:
-            dst_dict[dst_key] = me_[last_key]
-
-
-def parse_jobreport_data(job_report: dict) -> dict:  # noqa: C901
-    """Parse a job report and extract relevant fields.
-
-    Args:
-        job_report: job report dictionary.
-
-    Returns:
-        dict: work_attributes.
-    """
-    work_attributes = {}
-    if job_report is None or not any(job_report):
-        return work_attributes
-
-    # these are default values for job metrics
-    core_count = ""
-    work_attributes["nEvents"] = 0
-    work_attributes["dbTime"] = ""
-    work_attributes["dbData"] = ""
-    work_attributes["inputfiles"] = []
-    work_attributes["outputfiles"] = []
-
-    if "ATHENA_PROC_NUMBER" in os.environ:
-        logger.debug(f"ATHENA_PROC_NUMBER: {os.environ['ATHENA_PROC_NUMBER']}")
-        work_attributes['core_count'] = int(os.environ['ATHENA_PROC_NUMBER'])
-        core_count = os.environ['ATHENA_PROC_NUMBER']
-
-    dictq = DictQuery(job_report)
-    dictq.get("resource/transform/processedEvents", work_attributes, "nEvents")
-    dictq.get("resource/transform/cpuTimeTotal", work_attributes, "cpuConsumptionTime")
-    dictq.get("resource/machine/node", work_attributes, "node")
-    dictq.get("resource/machine/model_name", work_attributes, "cpuConsumptionUnit")
-    dictq.get("resource/dbTimeTotal", work_attributes, "dbTime")
-    dictq.get("resource/dbDataTotal", work_attributes, "dbData")
-    dictq.get("exitCode", work_attributes, "transExitCode")
-    dictq.get("exitMsg", work_attributes, "exeErrorDiag")
-    dictq.get("files/input", work_attributes, "inputfiles")
-    dictq.get("files/output", work_attributes, "outputfiles")
-
-    outputfiles_dict = {}
-    for opf in work_attributes['outputfiles']:
-        outputfiles_dict.update(get_outfiles_records(opf['subFiles']))
-    work_attributes['outputfiles'] = outputfiles_dict
-
-    if work_attributes['inputfiles']:
-        work_attributes['nInputFiles'] = reduce(lambda a, b: a + b, [len(inpfiles['subFiles']) for inpfiles in
-                                                                     work_attributes['inputfiles']])
-    if 'resource' in job_report and 'executor' in job_report['resource']:
-        j = job_report['resource']['executor']
-
-        fin_report = defaultdict(int)
-        for value in j.values():
-            mem = value.get('memory', {})
-            for key in ('Avg', 'Max'):
-                for subk, subv in mem.get(key, {}).items():
-                    fin_report[subk] += subv
-
-        work_attributes.update(fin_report)
-
-    workdir_size = get_disk_usage('.')
-    work_attributes['jobMetrics'] = f"coreCount={core_count} " \
-                                    f"nEvents={work_attributes['nEvents']} " \
-                                    f"dbTime={work_attributes['dbTime']} " \
-                                    f"dbData={work_attributes['dbData']} " \
-                                    f"workDirSize={workdir_size}"
-    del work_attributes["dbData"]
-    del work_attributes["dbTime"]
-
-    return work_attributes
-
-
-def get_executor_dictionary(jobreport_dictionary: dict) -> dict:
-    """Extract the 'executor' dictionary from within a job report.
-
-    Args:
-        jobreport_dictionary: job report dictionary.
-
-    Returns:
-        dict: executor_dictionary.
-    """
-    executor_dictionary = {}
-    if jobreport_dictionary != {}:
-
-        if 'resource' in jobreport_dictionary:
-            resource_dictionary = jobreport_dictionary['resource']
-            if 'executor' in resource_dictionary:
-                executor_dictionary = resource_dictionary['executor']
-            else:
-                logger.warning("no such key: executor")
-        else:
-            logger.warning("no such key: resource")
-
-    return executor_dictionary
-
-
-def get_resimevents(jobreport_dictionary: dict) -> Optional[int]:
-    """Extract and add up the resimevents from the job report.
-
-    This information is reported with the jobMetrics.
-
-    Args:
-        jobreport_dictionary: job report dictionary.
-
-    Returns:
-        Optional[int]: resimevents, or None if not found.
-    """
-    resimevents = None
-
-    executor_dictionary = get_executor_dictionary(jobreport_dictionary)
-    if executor_dictionary != {}:
-        for fmt in list(executor_dictionary.keys()):  # "ReSim"
-            if 'resimevents' in executor_dictionary[fmt]:
-                try:
-                    resimevents = int(executor_dictionary[fmt]['resimevents'])
-                except (KeyError, ValueError, TypeError):
-                    pass
-                else:
-                    break
-
-    return resimevents
-
-
-def get_db_info(jobreport_dictionary: dict) -> tuple[int, int]:
-    """Extract and add up the DB info from the job report.
-
-    This information is reported with the jobMetrics.
-    Note: this function adds up the different dbData and dbTime's in
-    the different executor steps. In modern job reports this might have
-    been done already by the transform and stored in dbDataTotal and dbTimeTotal.
-
-    Args:
-        jobreport_dictionary: job report dictionary.
-
-    Returns:
-        tuple[int, int]: db_time, db_data.
-    """
-    db_time = 0
-    db_data = 0
-
-    executor_dictionary = get_executor_dictionary(jobreport_dictionary)
-    if executor_dictionary != {}:
-        for fmt in list(executor_dictionary.keys()):  # "RAWtoESD", ..,
-            if 'dbData' in executor_dictionary[fmt]:
-                try:
-                    db_data += executor_dictionary[fmt]['dbData']
-                except Exception:
-                    pass
-            else:
-                logger.warning(f"format {fmt} has no such key: dbData")
-            if 'dbTime' in executor_dictionary[fmt]:
-                try:
-                    db_time += executor_dictionary[fmt]['dbTime']
-                except Exception:
-                    pass
-            else:
-                logger.warning(f"format {fmt} has no such key: dbTime")
-
-    return db_time, db_data
-
-
-def get_db_info_str(db_time: int, db_data: int) -> tuple[str, str]:
-    """Convert db_time, db_data to strings.
-
-    E.g. dbData="105077960", dbTime="251.42".
-
-    Args:
-        db_time: time in seconds.
-        db_data: long integer.
-
-    Returns:
-        tuple[str, str]: db_time_s, db_data_s.
-    """
-    zero = 0
-
-    db_data_s = ""
-    if db_data != zero:
-        db_data_s = f"{db_data}"
-
-    db_time_s = ""
-    if db_time != 0:
-        db_time_s = f"{db_time:.2f}"
-
-    return db_time_s, db_data_s
-
-
-def get_cpu_times(jobreport_dictionary: dict) -> tuple[str, int, float]:
-    """Extract and add up the total CPU times from the job report.
-
-    E.g. ('s', 5790L, 1.0).
-
-    Note: this function is used with Event Service jobs
-
-    Args:
-        jobreport_dictionary: job report dictionary.
-
-    Returns:
-        tuple[str, int, float]: cpu_conversion_unit, total_cpu_time, conversion_factor
-            (output consistent with set_time_consumed()).
-    """
-    total_cpu_time = 0
-
-    executor_dictionary = get_executor_dictionary(jobreport_dictionary)
-    if executor_dictionary != {}:
-        for fmt in list(executor_dictionary.keys()):  # "RAWtoESD", ..,
-            try:
-                total_cpu_time += executor_dictionary[fmt]['cpuTime']
-            except KeyError:
-                logger.warning(f"format {fmt} has no such key: cpuTime")
-            except Exception:
-                pass
-
-    conversion_factor = 1.0
-    cpu_conversion_unit = "s"
-
-    return cpu_conversion_unit, total_cpu_time, conversion_factor
-
-
-def get_exit_info(jobreport_dictionary: dict) -> tuple[int, str]:
-    """Return the exit code (exitCode) and exit message (exitMsg).
-
-    E.g. (0, 'OK').
-
-    Args:
-        jobreport_dictionary: job report dictionary.
-
-    Returns:
-        tuple[int, str]: exit_code, exit_message.
-    """
-    return jobreport_dictionary.get('exitCode'), jobreport_dictionary.get('exitMsg')
-
-
-def cleanup_looping_payload(workdir: str) -> None:
-    """Run a special cleanup for looping payloads.
-
-    Remove any root and tmp files.
-
-    Args:
-        workdir: working directory.
-    """
-    for (root, _, files) in os.walk(workdir):
-        for filename in files:
-            if 'pool.root' in filename:
-                path = os.path.join(root, filename)
-                path = os.path.abspath(path)
-                remove(path)
-
-
-def cleanup_payload(workdir: str, outputfiles: list = None, removecores: bool = True) -> None:
-    """Clean up payload (specifically AthenaMP) sub-directories prior to log file creation.
-
-    Also remove core dumps.
-
-    Args:
-        workdir: working directory.
-        outputfiles: list of output files.
-        removecores: remove core files if True.
-    """
-    if outputfiles is None:
-        outputfiles = []
-
-    if removecores:
-        remove_core_dumps(workdir)
-
-    for ampdir in glob(f'{workdir}/athenaMP-workers-*'):
-        for (root, _, files) in os.walk(ampdir):
-            for filename in files:
-                path = os.path.abspath(os.path.join(root, filename))
-
-                core_file = ('core' in filename and removecores)
-                pool_root_file = 'pool.root' in filename
-                tmp_file = 'tmp.' in filename
-
-                if core_file or pool_root_file or tmp_file:
-                    remove(path)
-
-                for outfile in outputfiles:
-                    if outfile in filename:
-                        remove(path)
-
-
-def get_redundant_path() -> str:
-    """Return the path to the file containing the redundant files and directories to be removed prior to log file creation.
-
-    Returns:
-        str: file path.
-    """
-    filename = config.Pilot.redundant
-
-    # correct /cvmfs if necessary
-    if filename.startswith('/cvmfs') and os.environ.get('ATLAS_SW_BASE', False):
-        filename = filename.replace('/cvmfs', os.environ.get('ATLAS_SW_BASE'))
-
-    return filename
-
-
-def get_redundants() -> list:
-    """Get list of redundant files and directories (to be removed).
-
-    The function will return the content of an external file. It that
-    can't be read, then a list defined in this function will be returned instead.
-    Any updates to the external file must be propagated to this function.
-
-    Returns:
-        list: files and directories.
-    """
-    # try to read the list from the external file
-    filename = get_redundant_path()
-
-    # do not use the cvmfs file since it is not being updated
-    # If you uncomment this block, need to also uncomment the read_list import
-    # if os.path.exists(filename) and False:
-    #    dir_list = read_list(filename)
-    #    if dir_list:
-    #        return dir_list
-
-    logger.debug(f'list of redundant files could not be read from external file: {filename} (will use internal list)')
-
-    # else return the following
-    dir_list = [".asetup.save",
-                "AtlasProduction*",
-                "AtlasPoint1",
-                "AtlasTier0",
-                "buildJob*",
-                "CDRelease*",
-                "ckpt*",
-                "csc*.log",
-                "DBRelease*",
-                "EvgenJobOptions",
-                "external",
-                "fort.*",
-                "geant4",
-                "geomDB",
-                "geomDB_sqlite",
-                "home",
-                "LICENSE",
-                "madevent",
-                "o..pacman..o",
-                "pacman-*",
-                "python*",
-                "requirements.txt",
-                "runAthena*",
-                "runGen-*",
-                "scratch",
-                "setup.cfg",
-                "share",
-                "sources.*",
-                "sqlite*",
-                "sw",
-                "stage*.sh",
-                "tcf_*",
-                "triggerDB",
-                "trusted.caches",
-                "workdir",
-                "*.data*",
-                "*.events",
-                "*.py",
-                "*.pyc",
-                "*.root*",
-                "tmp*",
-                "*.tmp",
-                "*.TMP",
-                "*.writing",
-                "pwg*",
-                "pwhg*",
-                "*PROC*",
-                "*proxy",
-                "*runcontainer*",
-                "*job.log.tgz",
-                "pandawnutil",
-                "src",
-                "singularity_cachedir",
-                "apptainer_cachedir",
-                "_joproxy15",
-                "HAHM_*",
-                "Process",
-                "merged_lhef._0.events-new",
-                "panda_secrets.json",
-                "singularity",
-                "apptainer",
-                "work",
-                "PILOTVERSION",
-                "README*",
-                "CLAUDE.md",
-                "MANIFEST*",
-                "*.part*",
-                "__pycache__*",
-                "x509*",
-                "docs",
-                "venv",
-                "usr",
-                "%1",
-                "open_remote_file_cmd.sh",
-                "*.md"]
-
-    return dir_list
-
-
-def remove_archives(workdir: str) -> None:
-    """Explicitly remove any soft linked archives (.a files) since they will be dereferenced by the tar command.
-
-    (--dereference option).
-
-    Args:
-        workdir: working directory.
-    """
-    matches = []
-    for root, _, filenames in os.walk(workdir):
-        for filename in fnmatch.filter(filenames, '*.a'):
-            matches.append(os.path.join(root, filename))
-    for root, _, filenames in os.walk(os.path.dirname(workdir)):
-        for filename in fnmatch.filter(filenames, 'EventService_premerge_*.tar'):
-            matches.append(os.path.join(root, filename))
-
-    for match in matches:
-        remove(match)
-
-
-def cleanup_broken_links(workdir: str) -> None:
-    """Run a second pass to clean up any broken links prior to log file creation.
-
-    Args:
-        workdir: working directory.
-    """
-    broken = []
-    for root, _, files in os.walk(workdir):
-        for filename in files:
-            path = os.path.join(root, filename)
-            if not os.path.islink(path):
-                continue
-
-            target_path = os.readlink(path)
-            # Resolve relative symlinks
-            if not os.path.isabs(target_path):
-                target_path = os.path.join(os.path.dirname(path), target_path)
-            if not os.path.exists(target_path):
-                broken.append(path)
-
-    for brok in broken:
-        remove(brok)
-
-
-def list_work_dir(workdir: str) -> None:
-    """Execute ls -lF for the given directory and dump to log.
-
-    Args:
-        workdir: directory name.
-    """
-    cmd = f'ls -lF {workdir}'
-    _, stdout, stderr = execute(cmd)
-    logger.debug(f'{stdout}:\n' + stderr)
-
-
-def remove_special_files(workdir: str, dir_list: list) -> None:
-    """Remove list of special files from the workdir.
-
-    Args:
-        workdir: work directory.
-        dir_list: list of special files.
-    """
-    # note: these should be partial file/dir names, not containing any wildcards
-    exceptions_list = ["runargs", "runwrapper", "jobReport", "log.", "xrdlog"]
-
-    to_delete = []
-    for _dir in dir_list:
-        files = glob(os.path.join(workdir, _dir))
-        if not files:
-            continue
-
-        exclude = []
-        for exc in exceptions_list:
-            for item in files:
-                if exc in item:
-                    exclude.append(os.path.abspath(item))
-
-        _files = [os.path.abspath(item) for item in files if item not in exclude]
-        to_delete += _files
-
-    for item in to_delete:
-        if os.path.isfile(item):
-            remove(item)
-        else:
-            remove_dir_tree(item)
-
-
-def remove_redundant_files(workdir: str, outputfiles: list = None, piloterrors: list = None, debugmode: bool = False) -> None:
-    """Remove redundant files and directories prior to creating the log file.
-
-    Note: in debug mode, any core files should not be removed before creating the log.
-
-    Args:
-        workdir: working directory.
-        outputfiles: list of protected output files.
-        piloterrors: list of Pilot assigned error codes.
-        debugmode: True if debug mode has been switched on.
-    """
-    if outputfiles is None:
-        outputfiles = []
-    if piloterrors is None:
-        piloterrors = []
-    logger.debug("removing redundant files prior to log creation")
-    workdir = os.path.abspath(workdir)
-
-    # remove core and pool.root files from AthenaMP subdirectories
     try:
-        cleanup_payload(workdir, outputfiles, removecores=not debugmode)
-    except OSError as exc:
-        logger.warning(f"failed to execute cleanup_payload(): {exc}")
-
-    # explicitly remove any soft linked archives (.a files)
-    # since they will be dereferenced by the tar command (--dereference option)
-    remove_archives(workdir)
-
-    # remove special files
-    # get list of redundant files and directories (to be removed)
-    dir_list = get_redundants()
-
-    remove_special_files(workdir, dir_list)
-
-    # verify_container_script(os.path.join(workdir, config.Container.container_script))
-
-    # run a second pass to clean up any broken links
-    cleanup_broken_links(workdir)
-
-    # remove any present user workDir
-    path = os.path.join(workdir, 'workDir')
-    if os.path.exists(path):
-        # remove at least root files from workDir (ie also in the case of looping job)
-        cleanup_looping_payload(path)
-        islooping = errors.LOOPINGJOB in piloterrors
-        ismemerror = errors.PAYLOADEXCEEDMAXMEM in piloterrors
-        if not islooping and not ismemerror:
-            logger.debug(f'removing \'workDir\' from workdir={workdir}')
-            remove_dir_tree(path)
-
-    # remove additional dirs
-    additionals = ['singularity', 'pilot', 'cores']
-    for additional in additionals:
-        path = os.path.join(workdir, additional)
-        if os.path.exists(path):
-            logger.debug(f"removing \'{additional}\' from workdir={workdir}")
-            remove_dir_tree(path)
-
-    list_work_dir(workdir)
+        with open(f"/proc/{pid}/{name}", "r", encoding="utf-8", errors="replace") as _file:
+            return _file.read().strip()
+    except OSError:
+        return ""
 
 
-def download_command(process: dict, workdir: str, base_urls: list) -> dict:
-    """Download the pre/postprocess commands if necessary.
-
-    Process FORMAT: {'command': <command>, 'args': <args>, 'label': <some name>}
+def read_proc_link(pid: int, name: str) -> str:
+    """Return the target of a symlink under ``/proc/<pid>/``.
 
     Args:
-        process: pre/postprocess dictionary.
-        workdir: job workdir.
-        base_urls: list of base URLs.
+        pid: Process id.
+        name: Link name relative to ``/proc/<pid>/``, e.g. ``"exe"``.
 
     Returns:
-        dict: updated pre/postprocess dictionary.
+        Link target, or an empty string if it could not be resolved.
     """
-    cmd = process.get('command', '')
-
-    # download the command if necessary
-    if cmd.startswith('http'):
-        # Try to download the trf (skip when user container is to be used)
-        exitcode, _, cmd = get_analysis_trf(cmd, workdir, base_urls)
-        if exitcode != 0:
-            logger.warning(f'cannot execute command due to previous error: {cmd}')
-            return {}
-
-        # update the preprocess command (the URL should be stripped)
-        process['command'] = './' + cmd
-
-    return process
-
-
-def get_utility_commands(order: int = None, job: JobData = None, base_urls: list = None) -> Optional[dict]:
-    """Return a dictionary of utility commands and arguments to be executed in parallel with the payload.
-
-    This could e.g. be memory and network monitor commands. A separate function can be used to determine the
-    corresponding command setups using the utility command name. If the optional order parameter is set, the
-    function should return the list of corresponding commands.
-
-    For example:
-
-    If order=UTILITY_BEFORE_PAYLOAD, the function should return all
-    commands that are to be executed before the payload.
-
-    If order=UTILITY_WITH_PAYLOAD, the corresponding commands will be
-    prepended to the payload execution string.
-
-    If order=UTILITY_AFTER_PAYLOAD_STARTED, the commands that should be
-    executed after the payload has been started should be returned.
-
-    If order=UTILITY_WITH_STAGEIN, the commands that should be executed
-    parallel with stage-in will be returned.
-
-    FORMAT: {'command': <command>, 'args': <args>, 'label': <some name>, 'ignore_failure': <Boolean>}
-
-    Args:
-        order: optional sorting order (see pilot.util.constants).
-        job: optional job object.
-        base_urls: list of base URLs.
-
-    Returns:
-        Optional[dict]: dictionary of utilities to be executed in parallel with the payload, or None.
-    """
-    if order == UTILITY_BEFORE_PAYLOAD and job.preprocess:
-        return get_precopostprocess_command(job.preprocess, job.workdir, 'preprocess', base_urls)
-
-    if order == UTILITY_WITH_PAYLOAD:
-        return {'command': 'NetworkMonitor', 'args': '', 'label': 'networkmonitor', 'ignore_failure': True}
-
-    if order == UTILITY_AFTER_PAYLOAD_STARTED:
-        return get_utility_after_payload_started()
-
-    if order == UTILITY_AFTER_PAYLOAD_STARTED2 and job.coprocess:
-        return get_precopostprocess_command(job.coprocess, job.workdir, 'coprocess', base_urls)
-
-    if order == UTILITY_AFTER_PAYLOAD_FINISHED:
-        return get_xcache_command(
-            job.infosys.queuedata.catchall,
-            job.workdir,
-            job.jobid,
-            'xcache_kill',
-            xcache_deactivation_command,
-        )
-
-    if order == UTILITY_AFTER_PAYLOAD_FINISHED2 and job.postprocess:
-        return get_precopostprocess_command(job.postprocess, job.workdir, 'postprocess', base_urls)
-
-    if order == UTILITY_BEFORE_STAGEIN:
-        return get_xcache_command(
-            job.infosys.queuedata.catchall,
-            job.workdir,
-            job.jobid,
-            'xcache_start',
-            xcache_activation_command,
-        )
-
-    return None
-
-
-def get_precopostprocess_command(process: dict, workdir: str, label: str, base_urls: list) -> dict:
-    """Return the pre/co/post-process command dictionary.
-
-    Command FORMAT: {'command': <command>, 'args': <args>, 'label': <some name>}
-
-    The returned command has the structure: { 'command': <string>, }
-
-    Args:
-        process: pre/co/post-process dictionary.
-        workdir: working directory.
-        label: label.
-        base_urls: base URLs for trf download.
-
-    Returns:
-        dict: command dictionary.
-    """
-    com = {}
-    if process.get('command', ''):
-        com = download_command(process, workdir, base_urls)
-        com['label'] = label
-        com['ignore_failure'] = False
-
-    return com
-
-
-def get_utility_after_payload_started() -> dict:
-    """Return the command dictionary for the utility after the payload has started.
-
-    Command FORMAT: {'command': <command>, 'args': <args>, 'label': <some name>}
-
-    Returns:
-        dict: command dictionary.
-    """
-    com = {}
     try:
-        cmd = config.Pilot.utility_after_payload_started
-    except Exception:
-        pass
-    else:
-        if cmd:
-            com = {'command': cmd, 'args': '', 'label': cmd.lower(), 'ignore_failure': True}
-
-    return com
+        return os.readlink(f"/proc/{pid}/{name}")
+    except OSError:
+        return ""
 
 
-def get_xcache_command(catchall: str, workdir: str, jobid: int, label: str, xcache_function: Any) -> dict:
-    """Return the proper xcache command for either activation or deactivation.
-
-    Command FORMAT: {'command': <command>, 'args': <args>, 'label': <some name>}
+def get_cmdline(pid: int) -> str:
+    """Return the full command line of a process.
 
     Args:
-        catchall: queuedata catchall field.
-        workdir: job working directory.
-        jobid: PanDA job id.
-        label: label.
-        xcache_function: activation/deactivation function name.
+        pid: Process id.
 
     Returns:
-        dict: command dictionary.
+        Space separated command line, or an empty string if unavailable.
     """
-    com = {}
-    if 'pilotXcache' in catchall:
-        com = xcache_function(jobid=jobid, workdir=workdir)
-        com['label'] = label
-        com['ignore_failure'] = True
+    raw = read_proc_file(pid, "cmdline")
 
-    return com
+    return raw.replace("\x00", " ").strip() if raw else ""
 
 
-def post_prestagein_utility_command(**kwargs: Any) -> None:
-    """Execute any post pre-stage-in utility commands.
+def get_cpu_time(pid: int) -> float:
+    """Return the accumulated CPU time (user + system) of a process.
 
     Args:
-        **kwargs: keyword arguments including 'label' and 'output'.
-    """
-    label = kwargs.get('label', 'unknown_label')
-    stdout = kwargs.get('output', None)
-
-    if stdout:
-        logger.debug(f'processing stdout for label={label}')
-        xcache_proxy(stdout)
-    else:
-        logger.warning(f'no output for label={label}')
-
-    alrb_xcache_files = os.environ.get('ALRB_XCACHE_FILES', '')
-    if alrb_xcache_files:
-        cmd = 'cat $ALRB_XCACHE_FILES/settings.sh'
-        _, _stdout, _ = execute(cmd)
-        logger.debug(f'cmd={cmd}:\n\n{_stdout}\n\n')
-
-
-def xcache_proxy(output: str) -> None:
-    """Extract env vars from xcache stdout and set them.
-
-    Args:
-        output: command output.
-    """
-    # loop over each line in the xcache stdout and identify the needed environmental variables
-    for line in output.split('\n'):
-        if 'ALRB_XCACHE_PROXY' in line:
-            suffix = '_REMOTE' if 'REMOTE' in line else ''
-            name = f'ALRB_XCACHE_PROXY{suffix}'
-            pattern = fr'\ export\ ALRB_XCACHE_PROXY{suffix}\=\"(.+)\"'
-            set_xcache_var(line, name=name, pattern=pattern)
-
-        elif 'ALRB_XCACHE_MYPROCESS' in line:
-            set_xcache_var(
-                line,
-                name='ALRB_XCACHE_MYPROCESS',
-                pattern=r'\ ALRB_XCACHE_MYPROCESS\=(.+)'
-            )
-
-        elif 'Messages logged in' in line:
-            set_xcache_var(
-                line,
-                name='ALRB_XCACHE_LOG',
-                pattern=r'xcache\ started\ successfully.\ \ Messages\ logged\ in\ (.+)'
-            )
-
-        elif 'ALRB_XCACHE_FILES' in line:
-            set_xcache_var(
-                line,
-                name='ALRB_XCACHE_FILES',
-                pattern=r'\ ALRB_XCACHE_FILES\=(.+)'
-            )
-
-
-def set_xcache_var(line: str, name: str = '', pattern: str = '') -> None:
-    """Extract the value of a given environmental variable from a given stdout line.
-
-    Args:
-        line: line from stdout to be investigated.
-        name: name of env var.
-        pattern: regular expression pattern.
-    """
-    pattern = re.compile(pattern)
-    result = re.findall(pattern, line)
-    if result:
-        os.environ[name] = result[0]
-
-
-def xcache_activation_command(workdir: str = '', jobid: int = 0) -> dict:
-    """Return the xcache service activation command.
-
-    Note: the workdir is not used here, but the function prototype
-    needs it in the called (xcache_activation_command needs it).
-
-    Args:
-        workdir: unused work directory - do not remove.
-        jobid: PanDA job id to guarantee that xcache process is unique.
+        pid: Process id.
 
     Returns:
-        dict: xcache command dictionary.
+        CPU time in seconds, or 0.0 if it could not be determined.
     """
-    if workdir:  # to bypass pylint warning
-        pass
-    # a successful startup will set ALRB_XCACHE_PROXY and ALRB_XCACHE_PROXY_REMOTE
-    # so any file access with root://...  should be replaced with one of
-    # the above (depending on whether you are on the same machine or not)
-    # example:
-    # ${ALRB_XCACHE_PROXY}root://atlasxrootd-kit.gridka.de:1094//pnfs/gridka.de/../DAOD_FTAG4.24348858._000020.pool.root.1
-    command = f"{get_asetup(asetup=False)} "
+    stat = read_proc_file(pid, "stat")
+    if not stat:
+        return 0.0
 
-    # add 'xcache list' which will also kill any
-    # orphaned processes lingering in the system
-    command += (
-        f"lsetup xcache; xcache list; xcache start -d $PWD/{jobid}/xcache -C centos7 --disklow 4g --diskhigh 5g -b 4"
-    )
-
-    return {'command': command, 'args': ''}
+    # the comm field is parenthesised and can itself contain spaces, so split
+    # after the closing parenthesis: fields 14 and 15 (1-based) are utime/stime
+    try:
+        fields = stat[stat.rindex(")") + 1:].split()
+        return (int(fields[11]) + int(fields[12])) / CLOCK_TICKS
+    except (ValueError, IndexError):
+        return 0.0
 
 
-def xcache_deactivation_command(workdir: str = '', jobid: int = 0) -> dict:
-    """Return the xcache service deactivation command.
-
-    This service should be stopped after the payload has finished.
-    Copy the messages log before shutting down.
-
-    Note: the job id is not used here, but the function prototype
-    needs it in the called (xcache_activation_command needs it).
+def get_process_state(pid: int) -> str:
+    """Return the single-letter process state from ``/proc/<pid>/stat``.
 
     Args:
-        workdir: payload work directory.
-        jobid: unused job id - do not remove.
+        pid: Process id.
 
     Returns:
-        dict: xcache command dictionary.
+        Process state (``R``, ``S``, ``D``, ``Z``, ``T``, ...), or an empty
+        string if it could not be determined.
     """
-    if jobid:  # to bypass pylint warning
-        pass
-    path = os.environ.get('ALRB_XCACHE_LOG', None)
-    if path and os.path.exists(path):
-        logger.debug(f'copying xcache messages log file ({path}) to work dir ({workdir})')
-        dest = os.path.join(workdir, 'xcache-messages.log')
-        try:
-            copy(path, dest)
-        except Exception as exc:
-            logger.warning(f'exception caught copying xcache log: {exc}')
-    else:
-        if not path:
-            logger.warning('ALRB_XCACHE_LOG is not set')
-        if path and not os.path.exists(path):
-            logger.warning(f'path does not exist: {path}')
-    command = f"{get_asetup(asetup=False)} "
-    command += "lsetup xcache; xcache kill"  # -C centos7
+    stat = read_proc_file(pid, "stat")
+    if not stat:
+        return ""
 
-    return {'command': command, 'args': '-p $ALRB_XCACHE_MYPROCESS'}
+    try:
+        return stat[stat.rindex(")") + 1:].split()[0]
+    except (ValueError, IndexError):
+        return ""
 
 
-def get_utility_command_setup(name: str, job: JobData, setup: str = None) -> str:
-    """Return the proper setup for the given utility command.
-
-    If a payload setup is specified, then the utility command string should be prepended to it.
+def get_status_value(pid: int, key: str) -> str:
+    """Return a single field from ``/proc/<pid>/status``.
 
     Args:
-        name: name of utility.
-        job: job object.
-        setup: optional payload setup string.
+        pid: Process id.
+        key: Field name without the colon, e.g. ``"VmRSS"``.
 
     Returns:
-        str: utility command setup.
+        Field value with surrounding whitespace stripped, or an empty string.
     """
-    if name == 'MemoryMonitor':
-        # must know if payload is running in a container or not
-        # (enables search for pid in ps output)
-        use_container = job.usecontainer or 'runcontainer' in job.transformation
+    status = read_proc_file(pid, "status")
+    if not status:
+        return ""
 
-        setup, pid = get_memory_monitor_setup(
-            job.pid,
-            job.jobid,
-            job.workdir,
-            use_container=use_container
-        )
-
-        # Allow the prmon invocation to be replaced entirely, e.g. on HPC sites
-        # using fapptainer where the pilot runs inside a container and cannot
-        # observe the payload process tree.  The override command receives the
-        # detected payload PID appended as '--pid <pid>' and is responsible for
-        # writing memory_monitor_output.txt and memory_monitor_summary.json to
-        # the job work directory.  The CLI option --prmon-cmd is published to
-        # this environment variable by pilot.py; a value set in the environment
-        # before pilot launch is superseded by the CLI option.
-        prmon_cmd_override = os.environ.get('PILOT_PRMON_CMD', '')
-        if prmon_cmd_override:
-            if pid and pid != -1:
-                setup = f'{prmon_cmd_override} --pid {pid}'
-            else:
-                setup = prmon_cmd_override
-            job.memorymonitor = 'prmon'
-            logger.info(f'prmon command overridden via PILOT_PRMON_CMD: {setup}')
-        else:
-            _pattern = r"([\S]+)\ ."
-            pattern = re.compile(_pattern)
-            _name = re.findall(pattern, setup.split(';')[-1])
-            if _name:
-                job.memorymonitor = _name[0]
-            else:
-                logger.warning('trf name could not be identified in setup string')
-
-        # update the pgrp if the pid changed
-        if pid not in (job.pid, -1):
-            logger.debug(f'updating pgrp={job.pgrp} for pid={pid}')
-            try:
-                job.pgrp = os.getpgid(pid)
-            except ProcessLookupError as exc:
-                logger.warning(f'os.getpgid({pid}) failed with: {exc}')
-        return setup
-
-    if name == 'NetworkMonitor' and setup:
-        return get_network_monitor_setup(setup, job)
+    for line in status.split("\n"):
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip()
 
     return ""
 
 
-def get_utility_command_execution_order(name: str) -> int:
-    """Determine if the given utility command should be executed before or after the payload.
+def get_rss(pid: int) -> int:
+    """Return the resident set size of a process in bytes.
 
     Args:
-        name: utility name.
+        pid: Process id.
 
     Returns:
-        int: execution order constant.
+        Resident set size in bytes, or 0 if it could not be determined.
     """
-    # example implementation
-    if name == 'NetworkMonitor':
-        return UTILITY_WITH_PAYLOAD
-
-    if name == 'MemoryMonitor':
-        return UTILITY_AFTER_PAYLOAD_STARTED
-
-    logger.warning(f'unknown utility name: {name}')
-
-    return UTILITY_AFTER_PAYLOAD_STARTED
-
-
-def post_utility_command_action(name: str, job: JobData) -> None:
-    """Perform post action for given utility command.
-
-    Args:
-        name: name of utility command.
-        job: job object.
-    """
-    if name == 'NetworkMonitor':
-        pass
-    elif name == 'MemoryMonitor':
-        post_memory_monitor_action(job)
-
-
-def get_utility_command_kill_signal(name: str) -> int:
-    """Return the proper kill signal used to stop the utility command.
-
-    Args:
-        name: name of utility command.
-
-    Returns:
-        int: kill signal.
-    """
-    # note that the NetworkMonitor does not require killing (to be confirmed)
-    return SIGUSR1 if name == 'MemoryMonitor' else SIGTERM
-
-
-def get_utility_command_output_filename(name: str, selector: bool = None) -> str:
-    """Return the filename to the output of the utility command.
-
-    Args:
-        name: utility name.
-        selector: optional special conditions flag.
-
-    Returns:
-        str: filename.
-    """
-    return get_memory_monitor_summary_filename(selector=selector) if name == 'MemoryMonitor' else ""
-
-
-def verify_lfn_length(outdata: list) -> tuple[int, str]:
-    """Make sure that the LFNs are all within the allowed length.
-
-    Args:
-        outdata: list of FileSpec objects.
-
-    Returns:
-        tuple[int, str]: error code, diagnostics.
-    """
-    exitcode = 0
-    diagnostics = ""
-    max_length = 255
-
-    # loop over all output files
-    for fspec in outdata:
-        if len(fspec.lfn) > max_length:
-            diagnostics = f"LFN too long (length: {len(fspec.lfn)}, " \
-                          f"must be less than {max_length} characters): {fspec.lfn}"
-            exitcode = errors.LFNTOOLONG
-            break
-
-    return exitcode, diagnostics
-
-
-def verify_ncores(corecount: int) -> None:
-    """Verify that nCores settings are correct.
-
-    Args:
-        corecount: number of cores.
-    """
-    try:
-        del os.environ['ATHENA_PROC_NUMBER_JOB']
-        logger.debug("unset existing ATHENA_PROC_NUMBER_JOB")
-    except Exception:
-        pass
+    value = get_status_value(pid, "VmRSS")
+    if not value:
+        return 0
 
     try:
-        athena_proc_number = int(os.environ.get('ATHENA_PROC_NUMBER', None))
-    except Exception:
-        athena_proc_number = None
-
-    # Note: if ATHENA_PROC_NUMBER is set (by the wrapper), then do not
-    # overwrite it. Otherwise, set it to the value of job.coreCount
-    # (actually set ATHENA_PROC_NUMBER_JOB and use it if it exists,
-    # otherwise use ATHENA_PROC_NUMBER directly; ATHENA_PROC_NUMBER_JOB
-    # will always be the value from the job definition)
-    if athena_proc_number:
-        logger.info(f"encountered a set ATHENA_PROC_NUMBER ({athena_proc_number}), will not overwrite it")
-        logger.info('set ATHENA_CORE_NUMBER to same value as ATHENA_PROC_NUMBER')
-        os.environ['ATHENA_CORE_NUMBER'] = str(athena_proc_number)
-    else:
-        os.environ['ATHENA_PROC_NUMBER_JOB'] = str(corecount)
-        os.environ['ATHENA_CORE_NUMBER'] = str(corecount)
-        logger.info(f"set ATHENA_PROC_NUMBER_JOB and ATHENA_CORE_NUMBER to {corecount} "
-                    f"(ATHENA_PROC_NUMBER will not be overwritten)")
+        # value looks like '4194304 kB'
+        return int(value.split()[0]) * 1024
+    except (ValueError, IndexError):
+        return 0
 
 
-def verify_job(job: JobData) -> bool:
-    """Verify job parameters for specific errors.
+def get_current_syscall(pid: int) -> str:
+    """Return the syscall a process is currently executing.
 
-    Note:
-      in case of problem, the function should set the corresponding pilot error code using:
-      job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(error.get_error_code())
+    ``/proc/<pid>/syscall`` is extremely cheap to read and immediately
+    separates a process spinning in user space (``running``) from one blocked
+    in a syscall, which is the single most useful discriminator between a
+    genuine loop and a hang on I/O.
 
     Args:
-        job: job object.
+        pid: Process id.
 
     Returns:
-        bool: True if verified, False otherwise.
+        Raw ``/proc/<pid>/syscall`` contents, or an empty string if the kernel
+        does not expose it (it requires ``CONFIG_HAVE_ARCH_TRACEHOOK``).
     """
-    status = False
-
-    logger.debug(f"verifying job parameters for job {job.jobid}")
-
-    # are LFNs of correct lengths?
-    exitcode, diagnostics = verify_lfn_length(job.outdata)
-    if exitcode != 0:
-        logger.fatal(diagnostics)
-        job.piloterrordiag = diagnostics
-        job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(exitcode)
-    else:
-        status = True
-
-    # check the ATHENA_PROC_NUMBER settings
-    verify_ncores(job.corecount)
-
-    # make sure there were no earlier problems
-    if status and job.piloterrorcodes:
-        logger.warning(f'job has errors: {job.piloterrorcodes}')
-        status = False
-
-    return status
+    return read_proc_file(pid, "syscall")
 
 
-def update_stagein(job: JobData) -> None:
-    """Skip DBRelease files during stage-in.
+def is_denylisted(cmdline: str) -> bool:
+    """Return True if the given command line belongs to a known non-payload helper.
+
+    Only processes the pilot demonstrably puts into the payload tree are
+    rejected (see :data:`DENYLISTED_NAMES`). Everything else is kept, on the
+    principle that a process wrongly dropped here disappears from the ranking
+    silently, whereas a process wrongly kept is at worst outranked - and is
+    visible either way in the logged inventory.
 
     Args:
-        job: job object.
-    """
-    for fspec in job.indata:
-        if 'DBRelease' in fspec.lfn:
-            fspec.status = 'no_transfer'
-
-
-def get_metadata(workdir: str) -> str:
-    """Return the metadata from file.
-
-    Args:
-        workdir: work directory.
+        cmdline: Full command line of the process.
 
     Returns:
-        str: metadata.
+        True if the process should not be considered as a dump target.
     """
-    path = os.path.join(workdir, config.Payload.jobreport)
-    logger.info(f"reading metadata from: {path}")
-    metadata = read_json(path) if os.path.exists(path) else None
-    if not os.path.exists(path):
-        logger.warning(f'path does not exist: {path}')
+    if not cmdline:
+        # a process with an unreadable command line is a kernel thread or has
+        # already exited - either way it is not a dump target
+        return True
+
+    lowered = cmdline.lower()
+    for fragment in DENYLISTED_ARGS:
+        if fragment in lowered:
+            return True
+
+    # note: interpreters (python, python3, ...) are deliberately not denylisted,
+    # since the ATLAS payload itself runs as 'python .../Sim_tf.py ...'
+    argv0 = os.path.basename(lowered.split()[0])
+
+    return argv0 in DENYLISTED_NAMES
+
+
+def get_payload_process_names() -> list:
+    """Return the process names the experiment plugin considers interesting.
+
+    Returns:
+        List of lowercase name fragments, empty if the plugin does not define
+        any (in which case selection falls back to the generic ranking).
+    """
+    pilot_user = os.environ.get("PILOT_USER", "generic").lower()
+    try:
+        definitions = __import__(
+            f"pilot.user.{pilot_user}.loopingjob_definitions",
+            globals(), locals(), [pilot_user], 0
+        )
+        names = definitions.get_payload_process_names()
+    except (ImportError, AttributeError) as exc:
+        logger.debug(f"{LOG_PREFIX}: no payload process names from the {pilot_user} plugin: {exc}")
+        return []
+
+    return [name.lower() for name in names or []]
+
+
+def get_descendants(pid: int) -> list:
+    """Return the descendants of a process as ``(pid, cmdline)`` tuples.
+
+    Args:
+        pid: Root process id.
+
+    Returns:
+        List of ``(pid, cmdline)`` tuples; empty on failure.
+    """
+    try:
+        descendants = get_child_processes(pid)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f"{LOG_PREFIX}: failed to walk the process tree of pid={pid}: {exc}")
+        return []
+
+    normalised = []
+    for entry in descendants or []:
+        try:
+            _pid, cmdline = entry
+        except (TypeError, ValueError):
+            continue
+        if isinstance(cmdline, list):
+            cmdline = " ".join([str(item) for item in cmdline])
+        normalised.append((_pid, (cmdline or "").strip()))
+
+    return normalised
+
+
+def get_ppid(pid: int) -> int:
+    """Return the parent process id from ``/proc/<pid>/stat``.
+
+    Args:
+        pid: Process id.
+
+    Returns:
+        Parent process id, or 0 if it could not be determined.
+    """
+    stat = read_proc_file(pid, "stat")
+    if not stat:
+        return 0
+
+    try:
+        return int(stat[stat.rindex(")") + 1:].split()[1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def get_process_name(cmdline: str) -> str:
+    """Return the process name that a payload name list would be made of.
+
+    For an interpreted payload the interpreter is not the interesting name, so
+    the first argument that looks like a script is preferred over ``argv[0]``
+    (``python .../Generate_tf.py`` gives ``Generate_tf.py``, not ``python3``).
+    Shells are deliberately not unwrapped: the first word of a ``bash -c``
+    string is usually a variable assignment or a setup call rather than the
+    payload, and the inventory carries the full command line anyway.
+
+    Args:
+        cmdline: Full command line of the process.
+
+    Returns:
+        Process name, or an empty string when the command line is unreadable.
+    """
+    if not cmdline:
         return ""
-    if not metadata:
-        logger.warning('empty metadata')
-        return ""
 
-    # convert dictionary to string
-    return dumps(metadata)
+    parts = cmdline.split()
+    argv0 = os.path.basename(parts[0])
+    if argv0.startswith("python") or argv0.startswith("perl"):
+        for part in parts[1:]:
+            if part.startswith("-") or "=" in part:
+                continue
+            candidate = os.path.basename(part)
+            if candidate:
+                return candidate
+
+    return argv0
 
 
-def should_update_logstash(frequency: int = 10) -> bool:
-    """Determine if logstash should be updated with prmon dictionary.
+def get_tree_depth(pid: int, root_pid: int, ppids: dict, maximum: int = 25) -> int:
+    """Return the depth of a process below the payload process.
 
     Args:
-        frequency: update frequency.
+        pid: Process id.
+        root_pid: Payload process id, i.e. the root of the tree.
+        ppids: Mapping of pid to parent pid for the known descendants.
+        maximum: Guard against a cycle in a pathological ``/proc``.
 
     Returns:
-        bool: True once per 'frequency' times.
+        Depth below *root_pid* (1 for a direct child), or 0 if it could not be
+        established.
     """
-    return randint(0, frequency - 1) == 0
+    depth = 0
+    current = pid
+    while current and current != root_pid and depth < maximum:
+        current = ppids.get(current) or get_ppid(current)
+        depth += 1
+
+    return depth if current == root_pid else 0
 
 
-def update_server(job: JobData) -> None:
-    """Perform any user specific server actions.
+def log_process_inventory(job: Any, label: str = "") -> list:
+    """Log every process in the payload tree, whether or not it is a candidate.
 
-    E.g. this can be used to send special information to a logstash.
+    This is the observational half of the diagnostics and is deliberately
+    unfiltered: the denylist and the ranking are both built on assumptions about
+    what an ATLAS payload tree actually contains during a loop, and nobody has
+    yet looked at one. Logging the complete inventory - names, depth, state, CPU
+    time and resident set for every descendant, including the ones that were
+    dropped - makes it possible to derive a payload name list from real jobs
+    instead of guessing at one, and to check the denylist against reality.
+
+    The block is bracketed by :data:`INVENTORY_MARKER` so that the inventories
+    from many jobs can be grepped out of their logs and compared.
 
     Args:
-        job: job object.
+        job: Job object; ``job.pid`` must be set.
+        label: Optional context added to the header, e.g. a snapshot number.
+
+    Returns:
+        List of ``(pid, cmdline)`` tuples for the whole tree, as collected.
     """
-    # attempt to read memory_monitor_output.txt and convert it to json
-    if not should_update_logstash():
-        logger.debug('no need to update logstash for this job')
+    descendants = get_descendants(job.pid)
+    ppids = {pid: get_ppid(pid) for pid, _ in descendants}
+
+    header = f"{INVENTORY_MARKER}"
+    if label:
+        header += f" ({label})"
+    lines = [
+        header,
+        f"payload process: pid={job.pid} name={get_process_name(get_cmdline(job.pid))!r}",
+        f"descendants: {len(descendants)}",
+        "",
+        f"{'depth':>5}  {'pid':>7}  {'ppid':>7}  {'name':<28}  {'st':<2}  "
+        f"{'cpu_s':>9}  {'rss_MB':>7}  {'drop':<4}  cmdline",
+    ]
+    rows = []
+    for pid, cmdline in descendants:
+        rows.append((
+            get_tree_depth(pid, job.pid, ppids),
+            pid,
+            ppids.get(pid, 0),
+            get_process_name(cmdline),
+            get_process_state(pid),
+            get_cpu_time(pid),
+            get_rss(pid),
+            is_denylisted(cmdline),
+            cmdline,
+        ))
+    for depth, pid, ppid, name, state, cpu, rss, dropped, cmdline in sorted(rows):
+        lines.append(
+            f"{depth:>5}  {pid:>7}  {ppid:>7}  {name[:28]:<28}  {state:<2}  "
+            f"{cpu:>9.1f}  {rss // (1024 * 1024):>7}  {'yes' if dropped else 'no':<4}  {cmdline}"
+        )
+    if not descendants:
+        lines.append("  (no descendants found)")
+    lines.append(INVENTORY_MARKER)
+
+    logger.info("\n".join(lines))
+
+    return descendants
+
+
+def rank_candidate(cmdline: str, pid: int, payload_names: list) -> tuple:
+    """Return the sort key ranking a candidate process as a dump target.
+
+    Higher is better. A name declared interesting by the experiment plugin wins
+    outright; among the rest the process burning the most CPU time comes first,
+    since a looping payload normally spins, followed by the largest resident
+    set.
+
+    Args:
+        cmdline: Full command line of the process.
+        pid: Process id.
+        payload_names: Name fragments declared interesting by the plugin.
+
+    Returns:
+        Tuple of ``(name_match, cpu_time, rss)`` used as a sort key.
+    """
+    lowered = cmdline.lower()
+    name_match = 1 if any(name in lowered for name in payload_names) else 0
+
+    return name_match, get_cpu_time(pid), get_rss(pid)
+
+
+def select_dump_candidates(job: Any, label: str = "") -> list:
+    """Return the payload processes ranked by how likely they are to be looping.
+
+    The complete tree is logged first by :func:`log_process_inventory`, including
+    the processes that are dropped, so that a wrong choice can be diagnosed from
+    the log afterwards rather than guessed at.
+
+    Note that positive name matching is currently inert: no plugin except a
+    deliberately configured one declares any payload names, so in practice the
+    ranking is decided by accumulated CPU time and then resident set. That is on
+    purpose - the name list is meant to be derived from the logged inventories of
+    real looping jobs, not assumed in advance.
+
+    Args:
+        job: Job object; ``job.pid`` must be set.
+        label: Optional context passed through to the inventory header.
+
+    Returns:
+        List of ``(pid, cmdline)`` tuples, best candidate first, truncated to
+        :data:`MAX_CANDIDATES`. Falls back to ``[(job.pid, <cmdline>)]`` when
+        every descendant was filtered out.
+    """
+    if not job.pid:
+        logger.warning(f"{LOG_PREFIX}: cannot select a dump candidate - job.pid is not set")
+        return []
+
+    payload_names = get_payload_process_names()
+    descendants = log_process_inventory(job, label=label)
+
+    kept = [(pid, cmdline) for pid, cmdline in descendants if not is_denylisted(cmdline)]
+
+    if not kept:
+        cmdline = get_cmdline(job.pid)
+        logger.info(
+            f"{LOG_PREFIX}: every descendant was filtered out - falling back to the payload "
+            f"process itself (pid={job.pid})"
+        )
+        return [(job.pid, cmdline)]
+
+    kept.sort(key=lambda entry: rank_candidate(entry[1], entry[0], payload_names), reverse=True)
+    candidates = kept[:MAX_CANDIDATES]
+
+    lines = [f"{LOG_PREFIX}: candidate ranking (best first):"]
+    for pid, cmdline in candidates:
+        name_match, cpu_time, rss = rank_candidate(cmdline, pid, payload_names)
+        lines.append(
+            f"  pid={pid} name_match={name_match} cpu_time={cpu_time:.1f}s "
+            f"rss={rss // (1024 * 1024)}MB: {cmdline}"
+        )
+    if not payload_names:
+        lines.append(
+            "  (no payload names declared for this experiment - ranked on CPU time and "
+            "resident set only; see the inventory above to derive a name list)"
+        )
+    logger.info("\n".join(lines))
+
+    return candidates
+
+
+def get_stack_tool() -> str:
+    """Return the first available stack trace tool.
+
+    Returns:
+        Name of the tool (``"eu-stack"`` or ``"pstack"``), or an empty string
+        if neither is available (gdb is then used instead).
+    """
+    for tool in STACK_TOOLS:
+        if which(tool):
+            return tool
+
+    return ""
+
+
+def get_stack_trace(pid: int, tool: str = "") -> str:
+    """Return a truncated backtrace for the given process.
+
+    Args:
+        pid: Process id.
+        tool: Stack tool to use; resolved automatically when not given.
+
+    Returns:
+        Backtrace text truncated to :data:`MAX_BACKTRACE_LINES` lines, or a
+        short explanatory string when no backtrace could be obtained.
+    """
+    if not tool:
+        tool = get_stack_tool()
+    if not tool:
+        return "(no stack trace tool available)"
+
+    cmd = f"{tool} -p {pid}" if tool == "eu-stack" else f"{tool} {pid}"
+    try:
+        _, stdout, stderr = execute(cmd, mute=True, timeout=STACK_TOOL_TIMEOUT)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return f"({tool} failed: {exc})"
+
+    output = (stdout or stderr or "").strip()
+    if not output:
+        return f"({tool} returned no output)"
+
+    lines = output.split("\n")
+    if len(lines) > MAX_BACKTRACE_LINES:
+        remaining = len(lines) - MAX_BACKTRACE_LINES
+        lines = lines[:MAX_BACKTRACE_LINES] + [f"... ({remaining} more lines)"]
+
+    return "\n".join(lines)
+
+
+def get_snapshot_fraction() -> float:
+    """Return the fraction of the looping limit after which snapshots start.
+
+    Returns:
+        Fraction between 0 and 1; the default is used when the configuration
+        value is missing or unusable.
+    """
+    try:
+        fraction = float(config.Pilot.looping_snapshot_fraction)
+    except (AttributeError, ValueError, TypeError):
+        return DEFAULT_SNAPSHOT_FRACTION
+
+    return fraction if 0 < fraction < 1 else DEFAULT_SNAPSHOT_FRACTION
+
+
+def get_core_dump_timeout() -> int:
+    """Return the timeout for phase A, the core file, in seconds.
+
+    Returns:
+        Timeout in seconds.
+    """
+    try:
+        return convert_to_int(config.Pilot.looping_core_dump_timeout, default=DEFAULT_CORE_DUMP_TIMEOUT)
+    except AttributeError:
+        return DEFAULT_CORE_DUMP_TIMEOUT
+
+
+def get_backtrace_timeout() -> int:
+    """Return the timeout for phase B, the backtraces, in seconds.
+
+    Returns:
+        Timeout in seconds.
+    """
+    try:
+        return convert_to_int(config.Pilot.looping_backtrace_timeout, default=DEFAULT_BACKTRACE_TIMEOUT)
+    except AttributeError:
+        return DEFAULT_BACKTRACE_TIMEOUT
+
+
+def get_diagnostics_budget() -> int:
+    """Return the total time the looping diagnostics may take, in seconds.
+
+    Bounds the sum of the dump phases rather than each of them individually,
+    since they all run between the decision to kill the payload and the kill.
+
+    Returns:
+        Budget in seconds.
+    """
+    try:
+        return convert_to_int(config.Pilot.looping_diagnostics_budget, default=DEFAULT_DIAGNOSTICS_BUDGET)
+    except AttributeError:
+        return DEFAULT_DIAGNOSTICS_BUDGET
+
+
+def get_remaining_budget(deadline: float) -> int:
+    """Return the time left before the diagnostics deadline, in seconds.
+
+    Args:
+        deadline: Deadline as a :func:`time.monotonic` value.
+
+    Returns:
+        Seconds remaining, never negative.
+    """
+    return max(0, int(deadline - time.monotonic()))
+
+
+def get_core_dump_max_size() -> int:
+    """Return the resident set size above which the core dump is skipped.
+
+    Returns:
+        Maximum size in bytes.
+    """
+    try:
+        value = config.Pilot.looping_core_dump_max_size
+    except AttributeError:
+        value = DEFAULT_CORE_DUMP_MAX_SIZE
+
+    try:
+        return human2bytes(value)
+    except ValueError:
+        return human2bytes(DEFAULT_CORE_DUMP_MAX_SIZE)
+
+
+def is_core_dump_wanted() -> bool:
+    """Return True if a core dump should be produced for a looping job.
+
+    Returns:
+        True unless the configuration disables it.
+    """
+    try:
+        value = str(config.Pilot.looping_core_dump).lower()
+    except AttributeError:
+        return True
+
+    return value not in ("false", "0", "no", "off")
+
+
+def take_process_snapshot(pid: int, cmdline: str, tool: str) -> dict:
+    """Return a cheap diagnostic snapshot of a single process.
+
+    Args:
+        pid: Process id.
+        cmdline: Full command line of the process.
+        tool: Stack trace tool to use.
+
+    Returns:
+        Dictionary with the collected fields.
+    """
+    return {
+        "pid": pid,
+        "cmdline": cmdline,
+        "state": get_process_state(pid),
+        "cpu_time": get_cpu_time(pid),
+        "rss": get_rss(pid),
+        "threads": get_status_value(pid, "Threads"),
+        "wchan": read_proc_file(pid, "wchan"),
+        "syscall": get_current_syscall(pid),
+        "cwd": read_proc_link(pid, "cwd"),
+        "exe": read_proc_link(pid, "exe"),
+        "backtrace": get_stack_trace(pid, tool=tool),
+    }
+
+
+def format_snapshot(snapshot: dict) -> str:
+    """Return a snapshot rendered for the snapshot file.
+
+    Args:
+        snapshot: Snapshot dictionary as returned by :func:`take_looping_snapshot`.
+
+    Returns:
+        Formatted multi-line text.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot["time"]))
+    lines = [
+        "=" * 78,
+        f"snapshot #{snapshot['index']} at {stamp} "
+        f"(files last touched {snapshot['since_touch']} s ago)",
+        "=" * 78,
+    ]
+    for process in snapshot["processes"]:
+        lines += [
+            "",
+            f"pid={process['pid']} state={process['state']} "
+            f"cpu_time={process['cpu_time']:.1f}s "
+            f"rss={process['rss'] // (1024 * 1024)}MB threads={process['threads']}",
+            f"  cmdline: {process['cmdline']}",
+            f"  exe:     {process['exe']}",
+            f"  cwd:     {process['cwd']}",
+            f"  wchan:   {process['wchan']}",
+            f"  syscall: {process['syscall']}",
+            "  backtrace:",
+        ]
+        lines += [f"    {line}" for line in process["backtrace"].split("\n")]
+
+    return "\n".join(lines) + "\n"
+
+
+def take_looping_snapshot(job: Any, since_touch: int, looping_limit: int) -> None:
+    """Record a diagnostic snapshot if the job is approaching the looping limit.
+
+    Called from the looping job algorithm on every verification. No-op until
+    the time since the last file touch exceeds
+    ``looping_limit * looping_snapshot_fraction``, so that healthy jobs never
+    pay for it. Never raises: a diagnostic must not be able to disturb the job
+    monitoring loop.
+
+    Args:
+        job: Job object.
+        since_touch: Seconds since the payload last touched a file.
+        looping_limit: Looping detection limit in seconds.
+    """
+    try:
+        threshold = int(looping_limit * get_snapshot_fraction())
+        if since_touch < threshold:
+            return
+
+        jobid = str(getattr(job, "jobid", "") or "")
+        if _snapshot_state["jobid"] != jobid:
+            _snapshot_state["jobid"] = jobid
+            _snapshot_state["snapshots"] = []
+
+        index = len(_snapshot_state["snapshots"]) + 1
+        candidates = select_dump_candidates(job, label=f"snapshot #{index}")
+        if not candidates:
+            return
+
+        tool = get_stack_tool()
+        snapshot = {
+            "index": index,
+            "time": int(time.time()),
+            "since_touch": since_touch,
+            "processes": [take_process_snapshot(pid, cmdline, tool) for pid, cmdline in candidates],
+        }
+        _snapshot_state["snapshots"].append(snapshot)
+
+        logger.info(
+            f"{LOG_PREFIX}: recorded snapshot #{index} "
+            f"({since_touch} s since last file touch, threshold={threshold} s, "
+            f"looping limit={looping_limit} s)"
+        )
+        store_snapshot(job, snapshot)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f"{LOG_PREFIX}: snapshot failed (ignored): {exc}")
+
+
+def pin_diagnostic_mtime(path: str, mtime: int) -> None:
+    """Set the modification time of a diagnostic file to the given time.
+
+    The snapshot file lives in the job work directory, which is exactly what
+    the looping algorithm scans for payload activity, so writing it would
+    otherwise make the payload look alive and reset the looping clock. Pinning
+    the modification time to the payload's own last touch makes the file
+    incapable of being the newest file in the work directory, independently of
+    any name based filtering.
+
+    Args:
+        path: File path.
+        mtime: Modification time to set, in seconds since the Unix epoch.
+    """
+    try:
+        os.utime(path, (mtime, mtime))
+    except OSError as exc:
+        # the central filter in the looping algorithm still covers this file
+        logger.warning(f"{LOG_PREFIX}: could not pin the modification time of {path}: {exc}")
+
+
+def store_snapshot(job: Any, snapshot: dict) -> None:
+    """Append a snapshot to the snapshot file in the job work directory.
+
+    The modification time of the file is pinned to the time of the payload's
+    last file touch (see :func:`pin_diagnostic_mtime`), which for the first
+    snapshot is derived from the snapshot itself and afterwards is simply the
+    time already carried by the file.
+
+    Args:
+        job: Job object.
+        snapshot: Snapshot dictionary.
+    """
+    if not job.workdir:
         return
 
-    path = os.path.join(job.workdir, get_memory_monitor_output_filename())
-    if not os.path.exists(path):
-        logger.warning(f'path does not exist: {path}')
+    path = os.path.join(job.workdir, SNAPSHOT_FILENAME)
+
+    # the time the payload last touched a file: never later than this, so that the
+    # snapshot file cannot look like payload activity
+    pinned = get_modification_time(path)
+    if pinned is None:
+        pinned = int(snapshot.get("time", time.time())) - int(snapshot.get("since_touch", 0))
+
+    try:
+        write_file(path, format_snapshot(snapshot), mode="a")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f"{LOG_PREFIX}: failed to append to {path}: {exc}")
         return
 
-    # convert memory monitor text output to json and return the selection
-    # (don't store it, log has already been created)
-    metadata_dictionary = get_metadata_dict_from_txt(path, storejson=True, jobid=job.jobid)
-    if metadata_dictionary:
-        # the output was previously written to file,
-        # update the path and tell curl to send it
-        new_path = update_extension(path=path, extension='json')
+    pin_diagnostic_mtime(path, pinned)
 
-        # out = read_json(new_path)
-        # logger.debug(f'prmon json=\n{out}')
-        # logger.debug(f'final logstash prmon dictionary: {metadata_dictionary}')
-        url = 'https://pilot.atlas-ml.org'  # 'http://collector.atlas-ml.org:80'
-        status = upload_file(url, new_path)
-        if status:
-            logger.info('sent prmon JSON dictionary to logstash server (urllib method)')
+
+def summarise_snapshots() -> str:
+    """Return a summary of the deltas between the recorded snapshots.
+
+    The deltas are the actual diagnosis: whether CPU time is advancing (a
+    genuine loop) or frozen (a hang), whether the backtrace is unchanged
+    (stuck in one place) or moving, and whether the resident set is still
+    growing.
+
+    Returns:
+        Multi-line summary, or an explanatory string when there is nothing to
+        compare.
+    """
+    snapshots = _snapshot_state["snapshots"]
+    if not snapshots:
+        return "no looping snapshots were recorded"
+    if len(snapshots) == 1:
+        return "only one looping snapshot was recorded - no deltas available"
+
+    lines = [f"looping snapshot summary ({len(snapshots)} snapshots):"]
+    first = snapshots[0]
+    last = snapshots[-1]
+    elapsed = last["time"] - first["time"]
+
+    previous = {process["pid"]: process for process in first["processes"]}
+    for process in last["processes"]:
+        pid = process["pid"]
+        if pid not in previous:
+            lines.append(f"  pid={pid} appeared after the first snapshot: {process['cmdline']}")
+            continue
+        was = previous[pid]
+        cpu_delta = process["cpu_time"] - was["cpu_time"]
+        rss_delta = process["rss"] - was["rss"]
+        same_stack = process["backtrace"] == was["backtrace"]
+        same_syscall = process["syscall"] == was["syscall"]
+        if elapsed > 0:
+            cpu_fraction = 100.0 * cpu_delta / elapsed
+            verdict = "spinning (CPU advancing)" if cpu_fraction > 5.0 else "not consuming CPU (hang, not a loop)"
         else:
-            cmd = (
-                f"curl --connect-timeout 20 --max-time 120 -H \"Content-Type: application/json\" -X POST "
-                f"--upload-file {new_path} {url}"
+            cpu_fraction = 0.0
+            verdict = "unknown (no elapsed time between snapshots)"
+        lines.append(
+            f"  pid={pid} {verdict}: cpu +{cpu_delta:.1f}s over {elapsed}s ({cpu_fraction:.0f}%), "
+            f"rss {rss_delta // (1024 * 1024):+d}MB, "
+            f"stack {'unchanged' if same_stack else 'changed'}, "
+            f"syscall {'unchanged' if same_syscall else 'changed'}"
+        )
+
+    return "\n".join(lines)
+
+
+def get_hostname() -> str:
+    """Return the worker node host name.
+
+    Returns:
+        Host name, or ``"unknown"`` if it could not be determined.
+    """
+    host = os.environ.get("PANDA_HOSTNAME", "")
+    if not host and hasattr(os, "uname"):
+        host = os.uname()[1]
+
+    return host or "unknown"
+
+
+def get_release_info(job: Any) -> list:
+    """Return the software release fields of a job, for core file analysis.
+
+    Args:
+        job: Job object.
+
+    Returns:
+        List of ``"key: value"`` strings for the fields that are set.
+    """
+    fields = (
+        ("swrelease", "swRelease"),
+        ("homepackage", "homePackage"),
+        ("platform", "cmtConfig/platform"),
+        ("transformation", "transformation"),
+        ("imagename", "container image"),
+    )
+    info = []
+    for attribute, label in fields:
+        value = getattr(job, attribute, "")
+        if value:
+            info.append(f"{label}: {value}")
+
+    return info
+
+
+def get_shared_libraries(pid: int, maximum: int = 40) -> list:
+    """Return the shared libraries mapped by a process.
+
+    gdb needs the libraries as well as the main executable in order to resolve
+    a core file, and on a grid worker node they come from CVMFS paths that are
+    not reconstructable from the release name alone.
+
+    Args:
+        pid: Process id.
+        maximum: Maximum number of paths to return.
+
+    Returns:
+        List of library paths truncated to *maximum* entries, with libraries
+        from outside the system directories listed first - those are the release
+        libraries that gdb will not find on its own.
+    """
+    maps = read_proc_file(pid, "maps")
+    if not maps:
+        return []
+
+    paths = set()
+    for line in maps.split("\n"):
+        match = re.search(r"\s(/\S+\.so(?:\.\S+)?)$", line)
+        if match:
+            paths.add(match.group(1))
+
+    system_prefixes = ("/usr/", "/lib/", "/lib64/", "/bin/", "/sbin/")
+    ordered = sorted(paths, key=lambda path: (path.startswith(system_prefixes), path))
+
+    return ordered[:maximum]
+
+
+def get_container_analysis_info(job: Any, setup: str) -> list:
+    """Return the notes explaining how to reproduce the payload's environment.
+
+    A core file has to be read by a gdb running in the same environment as the
+    payload produced it in. The payload's system libraries - libc, libpthread,
+    the dynamic loader - come from the container image and not from the worker
+    node, so a gdb running on the host resolves those frames against the wrong
+    binaries even though the release libraries on CVMFS resolve correctly.
+
+    The container invocation is taken verbatim from the payload process rather
+    than reconstructed from the job description, so that it stays right for
+    whatever the pilot actually did, including the bind mounts.
+
+    Args:
+        job: Job object.
+        setup: Experiment setup string as returned by :func:`get_gdb_setup`.
+
+    Returns:
+        List of lines, empty when nothing could be established.
+    """
+    lines = [
+        "",
+        "IMPORTANT: run gdb inside a container of the same platform as the payload.",
+        "The payload's system libraries (libc, libpthread, the dynamic loader) come from",
+        "the container image, not from the worker node, so a gdb running on the host will",
+        "resolve the system frames against the wrong binaries. The working directory given",
+        "above is the one seen inside the container.",
+    ]
+
+    container_command = get_cmdline(job.pid)
+    if container_command:
+        lines += [
+            "",
+            "the payload container was started with:",
+            f"  {container_command}",
+        ]
+
+    if setup:
+        lines += [
+            "",
+            "release setup (as used by the pilot):",
+            f"  {setup.strip().rstrip(';')}",
+        ]
+
+    lines += [
+        "",
+        "if gdb aborts with \"ModuleNotFoundError: No module named 'encodings'\", the",
+        "release setup has exported a PYTHONHOME/PYTHONPATH that does not match the Python",
+        "that gdb itself is linked against - unset both before starting gdb.",
+    ]
+
+    return lines
+
+
+def get_core_analysis_info(job: Any, pid: int, cmdline: str, core_path: str,
+                           *, with_core: bool = True, setup: str = "") -> str:
+    """Return the block describing how to analyse a core file.
+
+    gdb cannot open a core file without being told which binary produced it,
+    and that information is only available while the job is still running. It
+    is therefore recorded here, both in the pilot log (behind
+    :data:`CORE_INFO_MARKER`) and in a companion file next to the core file.
+
+    Args:
+        job: Job object.
+        pid: Process id the core file was taken from.
+        cmdline: Full command line of that process.
+        core_path: Path to the core file.
+        with_core: Whether a core file was actually requested. When False the
+            block still records the executable identity, since the backtraces
+            in the pilot log need it too.
+        setup: Experiment setup string, recorded so that the release can be set
+            up again when the core file is opened.
+
+    Returns:
+        Multi-line text block.
+    """
+    executable = read_proc_link(pid, "exe")
+    cwd = read_proc_link(pid, "cwd")
+    core_name = os.path.basename(core_path)
+
+    lines = [
+        CORE_INFO_MARKER,
+        f"core file: {core_name if with_core else '(none - backtraces only)'}",
+        f"PanDA job id: {getattr(job, 'jobid', 'unknown')}",
+        f"pid: {pid}",
+        f"executable: {executable or 'unknown'}",
+        f"command line: {cmdline or 'unknown'}",
+        f"working directory: {cwd or 'unknown'}",
+        f"resident set at dump time: {get_rss(pid) // (1024 * 1024)} MB",
+        f"host: {get_hostname()}",
+        f"queue: {os.environ.get('PILOT_SITENAME', 'unknown')}",
+    ]
+    lines += get_release_info(job)
+
+    if not executable:
+        lines += [
+            "",
+            "the executable could not be resolved from /proc - use the command line",
+            "above to identify the binary within the software release",
+        ]
+    elif with_core:
+        lines += [
+            "",
+            "to analyse:",
+            f"  gdb {executable} {core_name}",
+        ]
+
+    lines.append(f"gdb output from the dump phases: {os.path.basename(core_path)}{GDB_OUTPUT_SUFFIX}")
+    lines += get_container_analysis_info(job, setup)
+
+    libraries = get_shared_libraries(pid)
+    if libraries:
+        lines += ["", "shared libraries mapped at dump time:"]
+        lines += [f"  {library}" for library in libraries]
+
+    lines.append(CORE_INFO_MARKER)
+
+    return "\n".join(lines)
+
+
+def store_core_analysis_info(job: Any, pid: int, cmdline: str, core_path: str,
+                             *, with_core: bool = True, setup: str = "") -> None:
+    """Log the core file analysis information and write it next to the core file.
+
+    Args:
+        job: Job object.
+        pid: Process id the core file was taken from.
+        cmdline: Full command line of that process.
+        core_path: Path to the core file in the job work directory.
+        with_core: Whether a core file was actually requested.
+        setup: Experiment setup string, recorded in the block.
+    """
+    info = get_core_analysis_info(job, pid, cmdline, core_path, with_core=with_core, setup=setup)
+    logger.info(f"\n{info}")
+
+    path = f"{core_path}{CORE_INFO_SUFFIX}"
+    try:
+        write_file(path, info + "\n")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f"{LOG_PREFIX}: failed to write {path}: {exc}")
+    else:
+        logger.info(f"{LOG_PREFIX}: wrote core file analysis information to {os.path.basename(path)}")
+
+
+def get_gdb_setup(job: Any) -> str:
+    """Return the experiment setup needed to get a usable gdb.
+
+    The system gdb on a worker node is frequently too old to read a core file
+    from a current software release, which is why the server-driven debug path
+    already prepends a setup before running gdb. The same hook is reused here.
+
+    Args:
+        job: Job object.
+
+    Returns:
+        Setup command ending in ``'; '``, or an empty string when the plugin
+        does not provide one.
+    """
+    pilot_user = os.environ.get("PILOT_USER", "generic").lower()
+    try:
+        user = __import__(f"pilot.user.{pilot_user}.common", globals(), locals(), [pilot_user], 0)
+    except ImportError as exc:
+        logger.warning(f"{LOG_PREFIX}: cannot import the {pilot_user} plugin: {exc}")
+        return ""
+
+    # reuse the debug command preprocessing, which prepends the setup to
+    # job.debug_command; do it on a scratch object so that job.debug_command
+    # (which the looping algorithm uses as a marker) is left alone
+    class _Scratch:  # pylint: disable=too-few-public-methods
+        """Minimal stand-in carrying the fields preprocess_debug_command() touches."""
+
+        def __init__(self, _job: Any):
+            self.debug_command = ""
+            self.noexecstrcnv = getattr(_job, "noexecstrcnv", False)
+            self.jobparams = getattr(_job, "jobparams", "")
+            self.infosys = getattr(_job, "infosys", None)
+            self.swrelease = getattr(_job, "swrelease", "")
+            self.homepackage = getattr(_job, "homepackage", "")
+            self.platform = getattr(_job, "platform", "")
+            self.jobid = getattr(_job, "jobid", "")
+            self.workdir = getattr(_job, "workdir", "")
+
+    scratch = _Scratch(job)
+    try:
+        user.preprocess_debug_command(scratch)
+    except AttributeError:
+        logger.debug(f"{LOG_PREFIX}: the {pilot_user} plugin has no preprocess_debug_command()")
+        return ""
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f"{LOG_PREFIX}: failed to build the gdb setup: {exc}")
+        return ""
+
+    return scratch.debug_command
+
+
+def has_room_for_core(workdir: str, rss: int) -> bool:
+    """Return True if there is enough free space in the work directory.
+
+    Args:
+        workdir: Job work directory.
+        rss: Resident set size of the process to be dumped, in bytes.
+
+    Returns:
+        True if the core file is expected to fit.
+    """
+    needed = int(rss * CORE_SIZE_SAFETY_FACTOR)
+    try:
+        free = disk_usage(workdir).free
+    except OSError as exc:
+        logger.warning(f"{LOG_PREFIX}: cannot determine free space in {workdir}: {exc}")
+        return True
+
+    if free < needed:
+        logger.warning(
+            f"{LOG_PREFIX}: skipping core dump - {needed // (1024 * 1024)} MB needed but only "
+            f"{free // (1024 * 1024)} MB free in {workdir}"
+        )
+        return False
+
+    return True
+
+
+def resume_process(pid: int) -> None:
+    """Send ``SIGCONT`` to a process.
+
+    A gdb that is killed while attached can leave its inferior group-stopped,
+    so the payload is explicitly resumed after a failed or timed out dump. The
+    payload is about to be killed anyway, but a stopped process cannot be
+    killed cleanly.
+
+    Args:
+        pid: Process id.
+    """
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except OSError as exc:
+        logger.debug(f"{LOG_PREFIX}: could not resume pid={pid}: {exc}")
+    else:
+        logger.info(f"{LOG_PREFIX}: sent SIGCONT to pid={pid} in case gdb left it stopped")
+
+
+def get_environment_prefix() -> str:
+    """Return the shell fragment that strips the Python environment before gdb.
+
+    See :data:`PYTHON_ENVIRONMENT_VARIABLES` for why this is needed.
+
+    Returns:
+        Shell fragment ending in ``'; '``.
+    """
+    return "unset " + " ".join(PYTHON_ENVIRONMENT_VARIABLES) + "; "
+
+
+def has_python_startup_failure(output: str) -> bool:
+    """Return True if the gdb output shows its interpreter failed to start.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if the failure signature is present.
+    """
+    return any(signature in (output or "") for signature in PYTHON_FAILURE_SIGNATURES)
+
+
+def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbols: bool = True) -> str:
+    """Return the gdb invocation attaching to a process and running commands.
+
+    ``--nx`` keeps a stray ``.gdbinit`` out of the way, and debuginfod and the
+    index cache are disabled before the inferior is loaded: a worker node has no
+    route to a debuginfod server, so leaving it enabled risks a stall inside a
+    step that is already the slowest one here.
+
+    ``symbols=False`` is what makes the core file affordable. gdb reads the
+    symbol table of every mapped shared object *during the attach*, before it
+    executes a single ``-ex`` command, so a phase that needs no symbols at all
+    still pays for all of them. For an AnalysisBase or athena process that is
+    several hundred objects read over CVMFS, and in production it exhausted a
+    300 s timeout on a 989 MB payload before ``generate-core-file`` was ever
+    reached. ``set auto-solib-add off`` has to be an ``-iex``, since by the time
+    an ``-ex`` runs the reading has already happened. It costs nothing here: the
+    core file records memory and mappings, and symbols are resolved when the
+    core file is opened, not when it is written.
+
+    Args:
+        pid: Process id to attach to.
+        commands: gdb ``-ex`` options to run, in order.
+        environment: Optional command prefix, e.g. :data:`CLEAN_ENVIRONMENT`.
+        symbols: Whether shared library symbols should be read on attach.
+
+    Returns:
+        gdb command string.
+    """
+    options = [
+        "--nx",
+        f"-p {pid}",
+        "-batch",
+        "-iex 'set debuginfod enabled off'",
+        "-iex 'set index-cache enabled off'",
+    ]
+    if not symbols:
+        options += [
+            "-iex 'set auto-solib-add off'",
+            "-iex 'set auto-load no'",
+        ]
+    options += [
+        "-ex 'set confirm off'",
+        "-ex 'set pagination off'",
+        f"-ex 'echo {STARTUP_MARKER}\\n'",
+    ]
+    options += commands
+    options += ["-ex detach", "-ex quit"]
+
+    return f"{environment}gdb {' '.join(options)}"
+
+
+def build_phase_command(invocation: str, output_path: str, header: str, setup: str = "") -> str:
+    """Return the full shell command for one dump phase.
+
+    Everything is redirected to *output_path* rather than read from the return
+    value of :func:`pilot.util.container.execute`, which discards stdout on a
+    timeout. The identity of the gdb that was actually used is recorded in the
+    same file: whether the release gdb or the system one was picked up is the
+    first question asked when a dump fails, and it is not answerable from any
+    log the pilot currently writes.
+
+    Args:
+        invocation: gdb command as returned by :func:`build_gdb_invocation`.
+        output_path: File the phase appends its output to.
+        header: Single line marking the phase in the output file; must not
+            contain a single quote.
+        setup: Experiment setup prepended to the command.
+
+    Returns:
+        Full shell command string.
+    """
+    identity = "echo \"gdb: $(command -v gdb)\"; gdb --version 2>&1 | head -1"
+    inner = f"echo '{header}'; date -u '+%Y-%m-%dT%H:%M:%SZ'; {identity}; {invocation}"
+
+    return f'{setup}{get_environment_prefix()}{{ {inner}; }} >> "{output_path}" 2>&1'
+
+
+def get_file_size(path: str) -> int:
+    """Return the size of a file, or 0 if it does not exist.
+
+    Args:
+        path: File path.
+
+    Returns:
+        Size in bytes.
+    """
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def read_gdb_output(path: str, offset: int = 0) -> str:
+    """Return the gdb output written from *offset* onwards.
+
+    Args:
+        path: Output file path.
+        offset: Byte offset to read from, so that one phase does not read the
+            output of the previous one.
+
+    Returns:
+        File contents from *offset*, or an empty string.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as _file:
+            _file.seek(offset)
+            return _file.read()
+    except OSError as exc:
+        logger.warning(f"{LOG_PREFIX}: could not read {os.path.basename(path)}: {exc}")
+        return ""
+
+
+def create_scratch_directory(job: Any) -> str:
+    """Return a working directory for the gdb phases, outside the job work directory.
+
+    The experiment setup writes ``.asetup.save`` into its working directory, and
+    the job work directory is exactly what the looping algorithm scans for
+    payload activity, so running gdb there makes the pilot's own diagnostic look
+    like the payload doing work. Keeping the setup out of that directory is
+    preferred over filtering the file by name, since a multi-step transform
+    rewrites ``.asetup.save`` legitimately between steps.
+
+    Args:
+        job: Job object.
+
+    Returns:
+        Path to a new directory, or an empty string if none could be created.
+    """
+    parent = os.path.dirname(os.path.abspath(job.workdir)) if job.workdir else ""
+    for directory in (parent, None):
+        try:
+            return tempfile.mkdtemp(prefix="looping-dump-", dir=directory or None)
+        except OSError as exc:
+            logger.debug(f"{LOG_PREFIX}: could not create a scratch directory in {directory}: {exc}")
+
+    logger.warning(f"{LOG_PREFIX}: no scratch directory could be created - gdb will run in the current directory")
+
+    return ""
+
+
+def remove_scratch_directory(path: str) -> None:
+    """Remove the scratch directory used by the gdb phases.
+
+    Args:
+        path: Directory path; ignored when empty.
+    """
+    if path:
+        rmtree(path, ignore_errors=True)
+
+
+def log_gdb_output(output: str, label: str, output_path: str) -> None:
+    """Echo a bounded amount of one phase's gdb output into the pilot log.
+
+    Called per phase rather than once at the end: a phase whose output is only
+    logged after the following phase has finished is invisible for minutes, and
+    invisible altogether if the pilot does not get that far.
+
+    Args:
+        output: Output produced by this phase.
+        label: Phase label used in the log message.
+        output_path: Output file path, named in the log for the truncated case.
+    """
+    output = (output or "").strip()
+    if not output:
+        logger.warning(f"{LOG_PREFIX}: {label}: gdb produced no output at all")
+        return
+
+    lines = output.split("\n")
+    if len(lines) > MAX_GDB_LOG_LINES:
+        remaining = len(lines) - MAX_GDB_LOG_LINES
+        lines = lines[-MAX_GDB_LOG_LINES:]
+        lines.insert(0, f"... ({remaining} earlier lines in {os.path.basename(output_path)})")
+
+    text = "\n".join(lines)
+    logger.info(f"{LOG_PREFIX}: {label}: gdb output:\n{text}")
+
+
+def has_cvmfs_io_failure(output: str) -> bool:
+    """Return True if the gdb output shows a CVMFS path could not be read.
+
+    Both a CVMFS path and a read failure have to appear on the same line. gdb
+    emits plenty of warnings that mention neither, and plenty that mention a
+    path without failing on it, so requiring the pair keeps this from firing on
+    ordinary noise.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if a CVMFS read failure is present.
+    """
+    return any(
+        CVMFS_PATH_MARKER in line and any(signature in line for signature in CVMFS_FAILURE_SIGNATURES)
+        for line in (output or "").split("\n")
+    )
+
+
+def has_attach_failure(output: str) -> bool:
+    """Return True if the gdb output shows the attach itself failed.
+
+    Args:
+        output: Captured gdb output.
+
+    Returns:
+        True if the failure signature is present.
+    """
+    return any(signature in (output or "") for signature in ATTACH_FAILURE_SIGNATURES)
+
+
+def log_stall_diagnosis(output: str, label: str) -> None:
+    """Say how far gdb got before it was stopped, using the stage markers.
+
+    A timeout leaves no exit status to reason from, and "gdb was still reading
+    symbols" and "gdb attached and then stalled writing the core file" point at
+    completely different causes.
+
+    Args:
+        output: Output produced by this phase.
+        label: Phase label used in the log message.
+    """
+    if CORE_WRITTEN_MARKER in output:
+        logger.info(f"{LOG_PREFIX}: {label}: the core file was complete before gdb was stopped")
+    elif STARTUP_MARKER in output:
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb reached the requested commands and was stopped while "
+            f"running them"
+        )
+    else:
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb never reached the requested commands - it was still "
+            f"starting up, which on an attach means reading the symbol table of every mapped "
+            f"shared object"
+        )
+
+
+def run_gdb_phase(cmd: str, output_path: str, timeout: int, scratch: str, label: str) -> tuple:
+    """Run one gdb phase and return its exit code and its own output.
+
+    Args:
+        cmd: Full shell command as returned by :func:`build_phase_command`.
+        output_path: File the phase appends its output to.
+        timeout: Timeout in seconds.
+        scratch: Working directory for the command.
+        label: Phase label used in the log messages.
+
+    Returns:
+        Tuple of ``(exit_code, output)`` where *output* is what this phase
+        appended, so that a phase never inspects the previous phase's result.
+    """
+    offset = get_file_size(output_path)
+
+    # execute() is muted here on purpose: print_executable() redacts the value
+    # following '-p', so it would log 'gdb -p ********' and mask the pid
+    # everywhere else in the command as well
+    logger.info(f"{LOG_PREFIX}: {label}: timeout={timeout} s, command: {cmd}")
+    start = time.time()
+    exit_code, _, stderr = execute(cmd, cwd=scratch or None, timeout=timeout, mute=True)
+    elapsed = int(time.time() - start)
+
+    output = read_gdb_output(output_path, offset=offset)
+    if exit_code == errors.COMMANDTIMEDOUT:
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb timed out after {elapsed} s - whatever it had produced "
+            f"by then was kept in {os.path.basename(output_path)}"
+        )
+        log_stall_diagnosis(output, label)
+    elif exit_code != 0:
+        logger.warning(f"{LOG_PREFIX}: {label}: gdb failed with exit code {exit_code} after {elapsed} s")
+        if stderr:
+            logger.warning(f"{LOG_PREFIX}: {label}: {stderr}")
+    else:
+        logger.info(f"{LOG_PREFIX}: {label}: gdb finished in {elapsed} s")
+
+    log_gdb_output(output, label, output_path)
+
+    if has_python_startup_failure(output):
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb's own embedded interpreter failed to start "
+            f"(the 'encodings' error refers to gdb's Python, not to the payload's) - "
+            f"a PYTHONHOME/PYTHONPATH in the environment does not match the Python gdb is "
+            f"linked against, and gdb aborted before running any command"
+        )
+
+    if has_attach_failure(output):
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb could not attach to the process - it may have exited "
+            f"already, or ptrace may be restricted on this node"
+        )
+
+    if has_cvmfs_io_failure(output):
+        logger.warning(
+            f"{LOG_PREFIX}: {label}: gdb could not read a CVMFS path on this node. The payload "
+            f"executes from CVMFS, so this is likely to be why it appeared to loop, and is "
+            f"likely to affect other jobs on the same node"
+        )
+
+    return exit_code, output
+
+
+def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str, deadline: float) -> bool:
+    """Run phase A: write the core file with a bare gdb.
+
+    No experiment setup is used. ``generate-core-file`` only walks the
+    inferior's mappings, so it needs no symbols at all, and the setup would add
+    about a minute of asetup plus its own failure modes for nothing. The release
+    gdb is only needed to *read* the core file, which happens offline.
+
+    Args:
+        pid: Process id to dump.
+        core_path: Absolute path of the core file to write.
+        output_path: File the phase appends its output to.
+        scratch: Working directory for the command.
+        deadline: Diagnostics deadline as a :func:`time.monotonic` value.
+
+    Returns:
+        True if gdb reported a CVMFS path it could not read.
+    """
+    timeout = min(get_core_dump_timeout(), get_remaining_budget(deadline))
+    if timeout <= 0:
+        logger.warning(f"{LOG_PREFIX}: phase A (core file): skipped - the diagnostics budget is spent")
+        return False
+
+    commands = [
+        f"-ex 'generate-core-file {core_path}'",
+        f"-ex 'echo {CORE_WRITTEN_MARKER}\\n'",
+    ]
+    cmd = build_phase_command(
+        build_gdb_invocation(pid, commands, symbols=False),
+        output_path,
+        "=== phase A: core file (bare gdb, no release setup, no symbols) ===",
+    )
+    exit_code, output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase A (core file)")
+
+    if exit_code != 0 and has_python_startup_failure(output):
+        timeout = min(get_core_dump_timeout(), get_remaining_budget(deadline))
+        if timeout > 0:
+            logger.info(f"{LOG_PREFIX}: phase A (core file): retrying with a clean environment")
+            cmd = build_phase_command(
+                build_gdb_invocation(pid, commands, environment=CLEAN_ENVIRONMENT, symbols=False),
+                output_path,
+                "=== phase A (retry): core file (clean environment) ===",
             )
-            # send metadata to logstash
-            try:
-                _, stdout, stderr = execute(cmd, usecontainer=False)
-            except Exception as exc:
-                logger.warning(f'exception caught: {exc}')
-            else:
-                logger.info('sent prmon JSON dictionary to logstash server (curl method)')
-                logger.debug(f'stdout: {stdout}')
-                logger.debug(f'stderr: {stderr}')
+            exit_code, _ = run_gdb_phase(cmd, output_path, timeout, scratch, "phase A retry (core file)")
+
+    if exit_code != 0:
+        resume_process(pid)
+
+    return has_cvmfs_io_failure(output)
+
+
+def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, deadline: float) -> bool:
+    """Run phase B: collect the backtraces with the experiment setup.
+
+    This is the expensive phase, since every mapped object's symbol table has to
+    be read, several hundred of them over CVMFS for an athena process. It is
+    therefore run last and is allowed to fail: the same stacks are in the core
+    file that phase A already wrote.
+
+    ``py-bt`` is requested because for a looping transform the Python stack
+    usually identifies the algorithm directly; a gdb without the Python
+    extension ignores it.
+
+    Args:
+        pid: Process id to attach to.
+        output_path: File the phase appends its output to.
+        scratch: Working directory for the command.
+        setup: Experiment setup prepended to the command.
+        deadline: Diagnostics deadline as a :func:`time.monotonic` value.
+
+    Returns:
+        True if gdb reported a CVMFS path it could not read.
+    """
+    timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
+    if timeout <= 0:
+        logger.warning(
+            f"{LOG_PREFIX}: phase B (backtraces): skipped - the diagnostics budget is spent "
+            f"(the stacks are in the core file)"
+        )
+        return False
+
+    commands = [
+        f"-ex 'set backtrace limit {MAX_BACKTRACE_FRAMES}'",
+        "-ex bt",
+        "-ex 'thread apply all bt'",
+        "-ex 'py-bt'",
+    ]
+    invocation = build_gdb_invocation(pid, commands)
+    cmd = build_phase_command(
+        invocation, output_path, "=== phase B: backtraces (release setup) ===", setup=setup
+    )
+    exit_code, output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B (backtraces)")
+
+    if exit_code != 0 and has_python_startup_failure(output):
+        timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
+        if timeout > 0:
+            logger.info(
+                f"{LOG_PREFIX}: phase B (backtraces): retrying without the release setup - "
+                f"the frames will be less well resolved, but the thread and Python stacks are "
+                f"worth more than nothing"
+            )
+            cmd = build_phase_command(
+                invocation, output_path, "=== phase B (retry): backtraces (no release setup) ==="
+            )
+            exit_code, retry_output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B retry (backtraces)")
+            output += retry_output
+
+    if exit_code != 0:
+        resume_process(pid)
+
+    return has_cvmfs_io_failure(output)
+
+
+def is_core_file_wanted_for(job: Any, pid: int) -> bool:
+    """Return True if a core file should be written for the given process.
+
+    Args:
+        job: Job object.
+        pid: Process id to dump.
+
+    Returns:
+        True if the core file is wanted and expected to fit.
+    """
+    if not is_core_dump_wanted():
+        return False
+
+    rss = get_rss(pid)
+    maximum = get_core_dump_max_size()
+    if rss > maximum:
+        logger.warning(
+            f"{LOG_PREFIX}: not dumping a core file for pid={pid} - its resident set "
+            f"({rss // (1024 * 1024)} MB) exceeds the configured maximum "
+            f"({maximum // (1024 * 1024)} MB); keeping the backtraces only. The core file is "
+            f"kept in the log tarball, so this limit bounds the log file size as well"
+        )
+        return False
+
+    return has_room_for_core(job.workdir, rss)
+
+
+def report_core_file(core_path: str) -> None:
+    """Log whether the core file was written, and how large it is.
+
+    Args:
+        core_path: Path to the core file.
+    """
+    name = os.path.basename(core_path)
+    size = get_file_size(core_path)
+    if size:
+        logger.info(f"{LOG_PREFIX}: core file written: {name} ({size // (1024 * 1024)} MB)")
     else:
-        msg = 'no prmon json available - cannot send anything to logstash server'
-        logger.warning(msg)
-
-    return
+        logger.warning(f"{LOG_PREFIX}: no core file was produced at {core_path}")
 
 
-def preprocess_debug_command(job: JobData) -> None:
-    """Pre-process the debug command in debug mode.
+def create_core_dump(job: Any) -> bool:
+    """Create a core dump of the looping payload and record how to analyse it.
 
-    Args:
-        job: job object.
-    """
-    # Should the pilot do the setup or does jobPars already contain the information?
-    preparesetup = should_pilot_prepare_setup(job.noexecstrcnv, job.jobparams)
-    # get the general setup command and then verify it if required
-    resource_name = get_resource_name()  # 'grid' if no hpc_resource is set
-
-    resource = __import__(f'pilot.user.atlas.resource.{resource_name}', globals(), locals(), [resource_name], 0)
-
-    cmd = resource.get_setup_command(job, preparesetup)
-    if not cmd.endswith(';'):
-        cmd += '; '
-    if cmd not in job.debug_command:
-        job.debug_command = cmd + job.debug_command
-
-
-def process_debug_command(debug_command: str, pandaid: int) -> str:
-    """Process the debug command in debug mode.
-
-    In debug mode, the server can send a special debug command to the piloti
-    via the updateJob backchannel. This function can be used to process that
-    command, i.e. to identify a proper pid to debug (which is unknown
-    to the server).
-
-    For gdb, the server might send a command with gdb option --pid %.
-    The pilot need to replace the % with the proper pid. The default
-    (hardcoded) process will be that of athena.py. The pilot will find the
-    corresponding pid.
+    Targets the best candidate from :func:`select_dump_candidates` rather than
+    an arbitrary descendant, and runs in two phases with independent timeouts
+    under one overall budget: phase A writes the core file with a bare gdb,
+    phase B collects the backtraces with the experiment setup and is allowed to
+    fail. Both redirect to a file next to the core file, so a timeout keeps
+    whatever was produced. The executable identity, the container the payload
+    ran in and the release setup are recorded in the pilot log and in a
+    companion file, so that the core file can still be opened long after the
+    worker node is gone.
 
     Args:
-        debug_command: debug command.
-        pandaid: PanDA id.
+        job: Job object. Must have ``pid`` and ``workdir`` set.
 
     Returns:
-        str: updated debug command.
+        True if either phase found a CVMFS path it could not read. The caller
+        uses this to distinguish a payload that was looping from a payload on a
+        node that could not serve it.
     """
-    if '--pid %' not in debug_command:
-        return debug_command
+    if not job.pid or not job.workdir:
+        logger.warning(f"{LOG_PREFIX}: cannot create a core file since pid or workdir is unknown")
+        return False
 
-    # replace the % with the pid for athena.py
-    # note: if athena.py is not yet running, the --pid % will remain.
-    # Otherwise the % will be replaced by the pid first find the pid
-    # (if athena.py is running)
-    cmd = 'ps axo pid,ppid,pgid,args'
-    _, stdout, _ = execute(cmd)
-    if stdout:
-        # convert the ps output to a dictionary
-        dictionary = convert_ps_to_dict(stdout)
+    logger.info(summarise_snapshots())
 
-        # trim this dictionary to reduce the size
-        # (only keep the PID and PPID lists)
-        trimmed_dictionary = get_trimmed_dictionary(['PID', 'PPID'], dictionary)
+    candidates = select_dump_candidates(job, label="before diagnostics")
+    if not candidates:
+        logger.warning(f"{LOG_PREFIX}: no dump candidate could be identified")
+        return False
 
-        # what is the pid of the trf?
-        pandaid_pid = find_pid(pandaid, dictionary)
+    pid, cmdline = candidates[0]
+    logger.info(f"{LOG_PREFIX}: selected pid={pid} for the core dump: {cmdline}")
 
-        # find all athena processes
-        pids = find_cmd_pids('athena.py', dictionary)
+    with_core = is_core_file_wanted_for(job, pid)
+    core_path = os.path.join(job.workdir, f"core.{pid}")
+    output_path = f"{core_path}{GDB_OUTPUT_SUFFIX}"
+    setup = get_gdb_setup(job)
 
-        # which of the found pids are children of the trf?
-        # (which has an export PandaID=.. attached to it)
-        for pid in pids:
-            try:
-                child = is_child(pid, pandaid_pid, trimmed_dictionary)
-            except RuntimeError as rte:
-                logger.warning(f'too many recursions: {rte} (cannot identify athena process)')
-            else:
-                if child:
-                    logger.info(f'pid={pid} is a child process of the trf of this job')
-                    debug_command = debug_command.replace('--pid %', f'--pid {pid}')
-                    logger.info(f'updated debug command: {debug_command}')
-                    break
-                logger.info(f'pid={pid} is not a child process of the trf of this job')
+    # the analysis information must be collected while the process still exists,
+    # since /proc/<pid>/exe, /proc/<pid>/cwd and /proc/<pid>/maps disappear with it
+    store_core_analysis_info(job, pid, cmdline, core_path, with_core=with_core, setup=setup)
 
-        if not pids or '--pid %' in debug_command:
-            logger.debug('athena is not yet running (no corresponding pid)')
+    budget = get_diagnostics_budget()
+    deadline = time.monotonic() + budget
+    logger.info(f"{LOG_PREFIX}: diagnostics budget for pid={pid}: {budget} s (core file={with_core})")
 
-            # reset the command to prevent the payload from being killed
-            # (will be killed when gdb has run)
-            debug_command = ''
-
-    return debug_command
-
-
-def allow_timefloor(submitmode: str) -> bool:
-    """Decide if the timefloor mechanism (for multi-jobs) should be allowed for the given submit mode.
-
-    Args:
-        submitmode: submit mode.
-
-    Returns:
-        bool: always True for ATLAS.
-    """
-    if submitmode:  # to bypass pylint score 0
-        pass
-
-    return True
-
-
-def get_pilot_id(data: dict) -> str:
-    """Get the pilot id from the environment variable GTAG.
-
-    Update if necessary (not for ATLAS since we want the same pilot id for all multi-jobs).
-
-    Args:
-        data: data dictionary.
-
-    Returns:
-        str: pilot id.
-    """
-    base_url = os.environ.get("GTAG", "unknown")
-    jobid = data.get("job_id")
-    site_name = data.get("site_name", "unknown")
-
-    # If GTAG is not set or not a URL, return as-is
-    if base_url == "unknown" or not base_url.startswith("http"):
-        return base_url
-
-    # Append PandaID to construct job-specific log directory URL
+    scratch = create_scratch_directory(job)
+    cvmfs_failure = False
     try:
-        # This points to the directory containing all logs for this specific job
-        if "perlmutter" in site_name.lower():
-            return f"{base_url}/{jobid}"
-        else:
-            return base_url
-    except Exception:
-        # Fall back to base URL if URL construction fails
-        return base_url
+        if with_core:
+            cvmfs_failure = run_core_dump_phase(pid, core_path, output_path, scratch, deadline)
+            report_core_file(core_path)
+        cvmfs_failure = run_backtrace_phase(pid, output_path, scratch, setup, deadline) or cvmfs_failure
+    finally:
+        remove_scratch_directory(scratch)
 
-
-def allow_send_workernode_map() -> bool:
-    """Return True if the workernode map should be sent to the server.
-
-    Returns:
-        bool: always True for ATLAS.
-    """
-    return True
+    return cvmfs_failure
