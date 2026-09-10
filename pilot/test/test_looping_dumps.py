@@ -53,6 +53,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1442,6 +1443,152 @@ class TestEmptySetupHandling(unittest.TestCase):
             info = get_core_analysis_info(FakeJob(), 1003, "python x.py", "/srv/core.1003", setup="")
 
         self.assertNotIn("release setup (as used by the pilot)", info)
+
+
+class TestInContainerBacktraces(unittest.TestCase):
+    """gdb resolves shared libraries by path, and those paths mean the image.
+
+    For a containerised payload a gdb on the worker node either cannot open the
+    payload's libraries or, when the host happens to have a file of the same
+    name, resolves them against the wrong binary and reports plausible
+    nonsense. Running gdb in the same image makes the paths mean what the
+    payload meant by them.
+    """
+
+    IMAGE = "/cvmfs/atlas.cern.ch/repo/containers/images/apptainer/x86_64-el9.img"
+
+    def setUp(self):
+        """Create a work directory."""
+        reset_looping_dump_state()
+        self._tmp = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.workdir = self._tmp.name
+
+    def tearDown(self):
+        """Remove the work directory."""
+        self._tmp.cleanup()
+        reset_looping_dump_state()
+
+    def test_the_image_comes_from_the_payload_itself(self):
+        """Not inferred from the platform: this is the image actually in use."""
+        environment = {"APPTAINER_CONTAINER": self.IMAGE, "HOME": "/srv"}
+        with patch.object(loopingdumps, "get_process_environment", return_value=environment):
+            self.assertEqual(loopingdumps.get_payload_container_image(1003), self.IMAGE)
+
+    def test_the_singularity_variable_is_honoured_too(self):
+        """Older sites still export the Singularity name."""
+        with patch.object(loopingdumps, "get_process_environment",
+                          return_value={"SINGULARITY_CONTAINER": self.IMAGE}):
+            self.assertEqual(loopingdumps.get_payload_container_image(1003), self.IMAGE)
+
+    def test_an_uncontainerised_payload_yields_no_image(self):
+        """Nothing to wrap, so the host gdb is the right answer."""
+        with patch.object(loopingdumps, "get_process_environment", return_value={"HOME": "/srv"}):
+            self.assertEqual(loopingdumps.get_payload_container_image(1003), "")
+
+    def test_the_environment_is_read_from_proc(self):
+        """The pilot runs as the same user, so the payload's environ is readable."""
+        environment = loopingdumps.get_process_environment(os.getpid())
+
+        # every process has PATH; the point is that /proc/<pid>/environ parsed at all
+        self.assertIn("PATH", environment)
+
+    def test_an_unreadable_environment_is_not_fatal(self):
+        """The process may have exited between the ranking and the dump."""
+        self.assertEqual(loopingdumps.get_process_environment(999999999), {})
+
+    def test_the_invocation_binds_what_gdb_needs(self):
+        """CVMFS for the release setup, the work directory for the output."""
+        # a relocated CVMFS, so that the assertion cannot be satisfied by the
+        # image path (which is itself under /cvmfs) instead of by the bind
+        with patch.object(loopingdumps, "get_container_runtime", return_value="apptainer"), \
+             patch.object(loopingdumps, "get_cvmfs_bind", return_value="/mnt/sw/cvmfs"):
+            cmd = loopingdumps.build_container_invocation(
+                "gdb -p 7 -batch", self.IMAGE, "/srv/workdir", "/tmp/scratch")
+
+        self.assertIn("apptainer exec", cmd)
+        self.assertIn("-B /mnt/sw/cvmfs,", cmd)
+        self.assertIn("/srv/workdir", cmd)
+        self.assertIn("--pwd /tmp/scratch", cmd)
+        self.assertIn(self.IMAGE, cmd)
+        self.assertIn("gdb -p 7 -batch", cmd)
+
+    def test_no_runtime_means_no_wrapping(self):
+        """Better a host gdb than a command that cannot run at all."""
+        with patch.object(loopingdumps, "get_container_runtime", return_value=""):
+            self.assertEqual(loopingdumps.build_container_invocation(
+                "gdb", self.IMAGE, "/srv", "/tmp/s"), "")
+
+    def _run_phase_b(self, responses, image=IMAGE, enabled=True):
+        """Run the backtrace phase against the stub.
+
+        Args:
+            responses (list): Canned (exit_code, output) pairs.
+            image (str): Image reported for the payload.
+            enabled (bool): Whether in-container backtraces are enabled.
+
+        Returns:
+            GdbStub: The stub, for inspection of the commands issued.
+        """
+        stub = GdbStub([(code, output, None) for code, output in responses])
+        output_path = os.path.join(self.workdir, "core.1003.gdb.txt")
+        with patch.object(loopingdumps, "execute", stub), \
+             patch.object(loopingdumps, "get_payload_container_image", return_value=image), \
+             patch.object(loopingdumps, "get_container_runtime", return_value="apptainer"), \
+             patch.object(loopingdumps, "get_cvmfs_bind", return_value="/cvmfs"), \
+             patch.object(loopingdumps, "is_backtrace_in_container_wanted", return_value=enabled), \
+             patch.object(loopingdumps, "resume_process"), \
+             self.assertLogs("pilot.util.loopingdumps", level="INFO"):
+            loopingdumps.run_backtrace_phase(1003, output_path, "/tmp/scratch", "asetup Athena; ",
+                                             deadline=time.monotonic() + 600,
+                                             job_workdir=self.workdir)
+
+        return stub
+
+    def test_the_container_is_tried_first(self):
+        """And nothing else runs when it works."""
+        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)])
+
+        self.assertEqual(len(stub.calls), 1)
+        self.assertIn("apptainer exec", stub.calls[0][0])
+        self.assertIn("asetup Athena", stub.calls[0][0])
+
+    def test_a_failing_container_falls_back_to_the_worker_node(self):
+        """Some backtraces are worth more than none."""
+        stub = self._run_phase_b([(1, "apptainer: command failed"), (0, PARTIAL_BACKTRACE)])
+
+        self.assertEqual(len(stub.calls), 2)
+        self.assertIn("apptainer exec", stub.calls[0][0])
+        self.assertNotIn("apptainer exec", stub.calls[1][0])
+
+    def test_an_uncontainerised_payload_goes_straight_to_the_host(self):
+        """No image, no wrapping, no wasted attempt."""
+        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)], image="")
+
+        self.assertEqual(len(stub.calls), 1)
+        self.assertNotIn("apptainer exec", stub.calls[0][0])
+
+    def test_the_switch_is_read_from_the_configuration(self):
+        """The site-facing control, not just the internal flag."""
+        self.assertTrue(loopingdumps.is_backtrace_in_container_wanted())
+
+        with patch.object(loopingdumps.config, "Pilot") as pilot:
+            pilot.looping_backtrace_in_container = False
+            self.assertFalse(loopingdumps.is_backtrace_in_container_wanted())
+
+    def test_the_feature_can_be_turned_off(self):
+        """A site that cannot run a second container needs a way out."""
+        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)], enabled=False)
+
+        self.assertEqual(len(stub.calls), 1)
+        self.assertNotIn("apptainer exec", stub.calls[0][0])
+
+    def test_the_environment_is_sanitised_inside_the_container_too(self):
+        """The release setup runs in there, so it exports PYTHONHOME in there."""
+        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)])
+
+        # once outside the container and once inside it: the release setup runs in
+        # there, so that is where it exports the PYTHONHOME that breaks gdb
+        self.assertEqual(stub.calls[0][0].count("unset PYTHONHOME"), 2)
 
 
 if __name__ == "__main__":

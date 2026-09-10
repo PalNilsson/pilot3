@@ -142,6 +142,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import signal
 import tempfile
 import threading
@@ -289,6 +290,13 @@ DEFAULT_BACKTRACE_TIMEOUT = 300
 # upload on a worker node that may be close to its wall clock limit.
 DEFAULT_DIAGNOSTICS_BUDGET = 900
 
+# Whether the backtraces are collected inside the payload's own container image
+# by default. gdb resolves shared libraries by path, and for a containerised
+# payload those paths name files in the image, so a gdb on the host either
+# cannot open them or resolves them against the wrong binary. Falls back to a
+# gdb on the worker node when the image or the runtime cannot be found.
+DEFAULT_BACKTRACE_IN_CONTAINER = True
+
 # Default upper bound on the resident set of a process for which a core file is
 # still attempted. Above this the backtraces are kept and the core file skipped.
 # The core file is deliberately kept in the log tarball so that it can be
@@ -346,6 +354,17 @@ CVMFS_PATH_PATTERN = re.compile(r"/cvmfs/\S+")
 
 # Time allowed for the pilot's own read of a path gdb failed on, in seconds.
 PATH_CHECK_TIMEOUT = 20
+
+# Environment variables through which Apptainer and Singularity tell a process
+# which image it is running in. Read from the payload itself, so the image is
+# the one actually in use rather than one inferred from the platform.
+CONTAINER_IMAGE_VARIABLES = (
+    "APPTAINER_CONTAINER",
+    "SINGULARITY_CONTAINER",
+)
+
+# Container runtimes, in order of preference.
+CONTAINER_RUNTIMES = ("apptainer", "singularity")
 
 # Maximum number of gdb frames requested per thread in phase B.
 MAX_BACKTRACE_FRAMES = 100
@@ -1026,6 +1045,18 @@ def get_diagnostics_budget() -> int:
         return DEFAULT_DIAGNOSTICS_BUDGET
 
 
+def is_backtrace_in_container_wanted() -> bool:
+    """Return True if the backtraces should be collected inside the container.
+
+    Returns:
+        True if in-container backtraces are enabled.
+    """
+    try:
+        return config.Pilot.looping_backtrace_in_container
+    except AttributeError:
+        return DEFAULT_BACKTRACE_IN_CONTAINER
+
+
 def get_remaining_budget(deadline: float) -> int:
     """Return the time left before the diagnostics deadline, in seconds.
 
@@ -1654,6 +1685,128 @@ def get_executable_argument(pid: int) -> str:
     return f"-se {path}"
 
 
+def get_process_environment(pid: int) -> dict:
+    """Return the environment of a running process.
+
+    Args:
+        pid: Process id.
+
+    Returns:
+        Mapping of variable name to value, empty if it could not be read.
+    """
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as _file:
+            raw = _file.read()
+    except OSError as exc:
+        logger.debug(f"{LOG_PREFIX}: cannot read the environment of pid={pid}: {exc}")
+        return {}
+
+    environment = {}
+    for entry in raw.split(b"\0"):
+        if b"=" in entry:
+            name, _, value = entry.partition(b"=")
+            environment[name.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+
+    return environment
+
+
+def get_payload_container_image(pid: int) -> str:
+    """Return the container image the payload is running in.
+
+    Read from the payload's own environment rather than reconstructed from the
+    job description or the platform, so it names the image that is actually in
+    use. Apptainer and Singularity both export this into the container.
+
+    Args:
+        pid: Process id of a process inside the container.
+
+    Returns:
+        Path to the image, or an empty string if it could not be established.
+    """
+    environment = get_process_environment(pid)
+    for name in CONTAINER_IMAGE_VARIABLES:
+        image = environment.get(name, "")
+        if image:
+            logger.info(f"{LOG_PREFIX}: the payload container image is {image} (from {name})")
+            return image
+
+    logger.info(f"{LOG_PREFIX}: could not establish the payload container image from pid={pid}")
+
+    return ""
+
+
+def get_container_runtime() -> str:
+    """Return the container runtime to use, preferring the one that exists.
+
+    Returns:
+        ``apptainer`` or ``singularity``, or an empty string if neither is on
+        the path.
+    """
+    for runtime in CONTAINER_RUNTIMES:
+        if which(runtime):
+            return runtime
+
+    logger.warning(f"{LOG_PREFIX}: neither {' nor '.join(CONTAINER_RUNTIMES)} is available")
+
+    return ""
+
+
+def get_cvmfs_bind() -> str:
+    """Return the CVMFS mount point to bind into the diagnostic container.
+
+    Mirrors the experiment plugin's own notion of the file system root, which a
+    site can move by exporting ATLAS_SW_BASE (an HPC, typically). Resolved here
+    rather than imported so that this module stays independent of any one
+    plugin.
+
+    Returns:
+        Path to bind, or an empty string if it is not there.
+    """
+    path = os.environ.get("ATLAS_SW_BASE", "/cvmfs")
+
+    return path if os.path.isdir(path) else ""
+
+
+def build_container_invocation(inner: str, image: str, workdir: str, scratch: str) -> str:
+    """Wrap a command so that it runs inside the payload's container image.
+
+    This is what makes the backtraces worth reading for a containerised
+    payload. gdb resolves shared libraries by path, and for a payload inside a
+    container those paths name files in the image: a gdb on the host either
+    fails to open them, or - worse, when the host happens to have a file of the
+    same name - resolves them against the wrong binary and reports plausible
+    nonsense. Running gdb in the same image makes the paths mean what the
+    payload meant by them.
+
+    The payload keeps running in its own container; this is a second one on the
+    same image. That is enough, because Apptainer leaves the payload in the
+    host PID namespace, so gdb can still see and attach to the process, and
+    ``/proc`` is mounted from the host, so ``/proc/<pid>/exe`` still resolves.
+
+    Args:
+        inner: Command to run inside the container.
+        image: Container image path.
+        workdir: Job work directory, bound so that output can be written.
+        scratch: Working directory for the command, bound and used as the
+            container's working directory so that the setup writes there.
+
+    Returns:
+        The wrapped command, or the original if no runtime is available.
+    """
+    runtime = get_container_runtime()
+    if not runtime:
+        return ""
+
+    binds = [get_cvmfs_bind(), workdir]
+    if scratch:
+        binds.append(scratch)
+    options = "-B " + ",".join(bind for bind in binds if bind)
+    if scratch:
+        options += f" --pwd {scratch}"
+
+    return f"{runtime} exec {options} {image} /bin/bash -c {shlex.quote(inner)}"
+
+
 def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbols: bool = True) -> str:
     """Return the gdb invocation attaching to a process and running commands.
 
@@ -2133,7 +2286,47 @@ def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str
     return has_cvmfs_io_failure(output)
 
 
-def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, deadline: float) -> bool:
+def _try_backtraces_in_container(pid: int, invocation: str, output_path: str, scratch: str, *,
+                                 setup: str, timeout: int, job_workdir: str) -> tuple:
+    """Attempt the backtraces inside the payload's own container image.
+
+    Args:
+        pid: Process id to attach to.
+        invocation: gdb command to run inside the container.
+        output_path: File the phase appends its output to.
+        scratch: Working directory, bound into the container.
+        setup: Experiment setup, run inside the container.
+        timeout: Timeout in seconds.
+        job_workdir: Job work directory, bound into the container.
+
+    Returns:
+        Tuple of ``(exit_code, output, attempted)``. The exit code is -1 when
+        no attempt was made, so that the caller falls through to the host.
+    """
+    if not is_backtrace_in_container_wanted():
+        return -1, "", False
+
+    image = get_payload_container_image(pid)
+    if not image:
+        return -1, "", False
+
+    contained = build_container_invocation(f"{setup}{get_environment_prefix()}{invocation}",
+                                           image, job_workdir, scratch)
+    if not contained:
+        return -1, "", False
+
+    cmd = build_phase_command(
+        contained, output_path, "=== phase B: backtraces (in the payload's container) ==="
+    )
+    exit_code, output = run_gdb_phase(
+        cmd, output_path, timeout, scratch, "phase B (backtraces, in container)"
+    )
+
+    return exit_code, output, True
+
+
+def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, *, deadline: float,
+                        job_workdir: str = "") -> bool:
     """Run phase B: collect the backtraces with the experiment setup.
 
     This is the expensive phase, since every mapped object's symbol table has to
@@ -2151,6 +2344,7 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, de
         scratch: Working directory for the command.
         setup: Experiment setup prepended to the command.
         deadline: Diagnostics deadline as a :func:`time.monotonic` value.
+        job_workdir: Job work directory, bound into the diagnostic container.
 
     Returns:
         True if gdb reported a CVMFS path it could not read.
@@ -2170,10 +2364,26 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, de
         "-ex 'py-bt'",
     ]
     invocation = build_gdb_invocation(pid, commands)
-    cmd = build_phase_command(
-        invocation, output_path, "=== phase B: backtraces (release setup) ===", setup=setup
+
+    exit_code, output, attempted_in_container = _try_backtraces_in_container(
+        pid, invocation, output_path, scratch,
+        setup=setup, timeout=timeout, job_workdir=job_workdir
     )
-    exit_code, output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B (backtraces)")
+
+    if exit_code != 0:
+        if attempted_in_container:
+            logger.info(
+                f"{LOG_PREFIX}: phase B (backtraces): falling back to a gdb on the worker node - "
+                f"frames inside the container's own libraries will not resolve"
+            )
+        timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
+        if timeout <= 0:
+            return has_cvmfs_io_failure(output)
+        cmd = build_phase_command(
+            invocation, output_path, "=== phase B: backtraces (release setup) ===", setup=setup
+        )
+        exit_code, host_output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B (backtraces)")
+        output += host_output
 
     if exit_code != 0 and has_python_startup_failure(output):
         timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
@@ -2290,7 +2500,8 @@ def create_core_dump(job: Any) -> bool:
         if with_core:
             cvmfs_failure = run_core_dump_phase(pid, core_path, output_path, scratch, deadline)
             report_core_file(core_path)
-        cvmfs_failure = run_backtrace_phase(pid, output_path, scratch, setup, deadline) or cvmfs_failure
+        cvmfs_failure = run_backtrace_phase(pid, output_path, scratch, setup, deadline=deadline,
+                                            job_workdir=job.workdir) or cvmfs_failure
     finally:
         remove_scratch_directory(scratch)
 
