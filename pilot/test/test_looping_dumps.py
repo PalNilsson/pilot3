@@ -770,6 +770,7 @@ class TestDumpPhases(unittest.TestCase):
              patch.object(loopingdumps, "get_rss", return_value=rss), \
              patch.object(loopingdumps, "has_room_for_core", return_value=True), \
              patch.object(loopingdumps, "get_gdb_setup", return_value="asetup AthGeneration,23.6.11; "), \
+             patch.object(loopingdumps, "get_payload_container_image", return_value=""), \
              patch.object(loopingdumps, "get_shared_libraries", return_value=[]), \
              patch.object(loopingdumps, "read_proc_link", return_value="/cvmfs/sw/bin/python"), \
              patch.object(loopingdumps, "get_cmdline", return_value="/bin/bash -c source atlasLocalSetup.sh -c x86_64"), \
@@ -894,9 +895,11 @@ class TestDumpPhases(unittest.TestCase):
         """
         stub, _, _ = self._run([(0, "Saved corefile", True), (0, PARTIAL_BACKTRACE, False)])
 
-        for command, kwargs in stub.calls:
+        for _, kwargs in stub.calls:
             self.assertTrue(kwargs.get("mute"), msg="execute() must be muted or the pid is redacted")
-            self.assertIn("-p 1003", command)
+
+        # phase A attaches, so it carries the option that triggers the redaction
+        self.assertIn("-p 1003", stub.calls[0][0])
 
     def test_gdb_runs_outside_the_job_work_directory(self):
         """asetup writes .asetup.save into its working directory.
@@ -1446,17 +1449,24 @@ class TestEmptySetupHandling(unittest.TestCase):
         self.assertNotIn("release setup (as used by the pilot)", info)
 
 
-class TestInContainerBacktraces(unittest.TestCase):
-    """gdb resolves shared libraries by path, and those paths mean the image.
+class TestPostMortemBacktraces(unittest.TestCase):
+    """Phase B reads the core file, and resolves libraries against the image.
 
-    For a containerised payload a gdb on the worker node either cannot open the
-    payload's libraries or, when the host happens to have a file of the same
-    name, resolves them against the wrong binary and reports plausible
-    nonsense. Running gdb in the same image makes the paths mean what the
-    payload meant by them.
+    The first design ran gdb inside a second instance of the payload's own
+    container image, so that the library paths recorded in the inferior would
+    mean what the payload meant by them. That cannot work: unprivileged
+    Apptainer puts the second gdb in a new user namespace, where it holds no
+    capability over a process in the parent namespace, and the attach is
+    refused with "ptrace: Operation not permitted" even though the payload is
+    visible in the shared PID namespace. Observed in production on job
+    7305590981 at ANALY_CERN-PTEST.
+
+    Reading the core file instead needs no ptrace at all, and pointing gdb's
+    sysroot at the image directory resolves the same libraries from the host.
     """
 
-    IMAGE = "/cvmfs/atlas.cern.ch/repo/containers/images/apptainer/x86_64-el9.img"
+    IMAGE = "/cvmfs/atlas.cern.ch/repo/containers/fs/singularity/x86_64-almalinux9"
+    SIF = "/cvmfs/atlas.cern.ch/repo/containers/images/apptainer/x86_64-el9.img"
 
     def setUp(self):
         """Create a work directory."""
@@ -1482,7 +1492,7 @@ class TestInContainerBacktraces(unittest.TestCase):
             self.assertEqual(loopingdumps.get_payload_container_image(1003), self.IMAGE)
 
     def test_an_uncontainerised_payload_yields_no_image(self):
-        """Nothing to wrap, so the host gdb is the right answer."""
+        """Nothing to resolve against, so the host's own libraries it is."""
         with patch.object(loopingdumps, "get_process_environment", return_value={"HOME": "/srv"}):
             self.assertEqual(loopingdumps.get_payload_container_image(1003), "")
 
@@ -1497,99 +1507,179 @@ class TestInContainerBacktraces(unittest.TestCase):
         """The process may have exited between the ranking and the dump."""
         self.assertEqual(loopingdumps.get_process_environment(999999999), {})
 
-    def test_the_invocation_binds_what_gdb_needs(self):
-        """CVMFS for the release setup, the work directory for the output."""
-        # a relocated CVMFS, so that the assertion cannot be satisfied by the
-        # image path (which is itself under /cvmfs) instead of by the bind
-        with patch.object(loopingdumps, "get_container_runtime", return_value="apptainer"), \
-             patch.object(loopingdumps, "get_cvmfs_bind", return_value="/mnt/sw/cvmfs"):
-            cmd = loopingdumps.build_container_invocation(
-                "gdb -p 7 -batch", self.IMAGE, "/srv/workdir", "/tmp/scratch")
+    def test_a_directory_image_becomes_the_sysroot(self):
+        """The ATLAS images on CVMFS are unpacked directories the host can read.
 
-        self.assertIn("apptainer exec", cmd)
-        self.assertIn("-B /mnt/sw/cvmfs,", cmd)
-        self.assertIn("/srv/workdir", cmd)
-        self.assertIn("--pwd /tmp/scratch", cmd)
-        self.assertIn(self.IMAGE, cmd)
-        self.assertIn("gdb -p 7 -batch", cmd)
+        Measured against gdb 15.1: without this the frames are '?? ()' and gdb
+        reports "Unable to find dynamic linker breakpoint function", which is
+        exactly the production symptom; with it the frames are named and carry
+        source lines.
+        """
+        with patch.object(loopingdumps, "get_payload_container_image", return_value=self.workdir):
+            options = loopingdumps.get_sysroot_options(1003)
 
-    def test_no_runtime_means_no_wrapping(self):
-        """Better a host gdb than a command that cannot run at all."""
-        with patch.object(loopingdumps, "get_container_runtime", return_value=""):
-            self.assertEqual(loopingdumps.build_container_invocation(
-                "gdb", self.IMAGE, "/srv", "/tmp/s"), "")
+        self.assertIn(f"-iex 'set sysroot {self.workdir}'", " ".join(options))
 
-    def _run_phase_b(self, responses, image=IMAGE, enabled=True):
+    def test_a_sif_image_yields_no_sysroot(self):
+        """gdb cannot look inside a single-file image, so pointing at it would lie."""
+        with patch.object(loopingdumps, "get_payload_container_image", return_value=self.SIF):
+            options = loopingdumps.get_sysroot_options(1003)
+
+        self.assertEqual(options, [])
+
+    def test_an_unreadable_image_yields_no_sysroot(self):
+        """A path that cannot be read is not a sysroot, whatever it names."""
+        with patch.object(loopingdumps, "get_payload_container_image", return_value=self.IMAGE), \
+             patch.object(loopingdumps.os.path, "isdir", return_value=True), \
+             patch.object(loopingdumps.os, "access", return_value=False):
+            options = loopingdumps.get_sysroot_options(1003)
+
+        self.assertEqual(options, [])
+
+    def test_an_uncontainerised_payload_yields_no_sysroot(self):
+        """Nothing to point at, and gdb's own defaults are then correct."""
+        with patch.object(loopingdumps, "get_payload_container_image", return_value=""):
+            self.assertEqual(loopingdumps.get_sysroot_options(1003), [])
+
+    def test_the_python_extension_is_allowed_to_load_with_a_sysroot(self):
+        """py-bt is a script in the image, and auto-load refuses it by default."""
+        with patch.object(loopingdumps, "get_payload_container_image", return_value=self.workdir):
+            options = loopingdumps.get_sysroot_options(1003)
+
+        self.assertIn("-iex 'set auto-load safe-path /'", options)
+
+    def test_the_core_file_is_read_instead_of_attaching(self):
+        """A second attach can be refused; reading a core file needs no ptrace."""
+        invocation = build_gdb_invocation(1003, ["-ex bt"], core_path="/srv/core.1003")
+
+        self.assertIn("-c /srv/core.1003", invocation)
+        self.assertNotIn("-p 1003", invocation)
+
+    def test_the_core_file_invocation_does_not_detach(self):
+        """Nothing is attached, so a detach only prints noise into the frames."""
+        invocation = build_gdb_invocation(1003, ["-ex bt"], core_path="/srv/core.1003")
+
+        self.assertNotIn("detach", invocation)
+        self.assertIn("-ex quit", invocation)
+
+    def test_a_live_attach_still_detaches(self):
+        """The payload is killed by the caller, not left stopped by the diagnostic."""
+        invocation = build_gdb_invocation(1003, ["-ex bt"])
+
+        self.assertIn("-p 1003", invocation)
+        self.assertIn("-ex detach", invocation)
+
+    def _run_phase_b(self, responses, core_path="", sysroot_options=None):
         """Run the backtrace phase against the stub.
 
         Args:
             responses (list): Canned (exit_code, output) pairs.
-            image (str): Image reported for the payload.
-            enabled (bool): Whether in-container backtraces are enabled.
+            core_path (str): Core file handed to the phase.
+            sysroot_options (list): Options the image resolves to.
 
         Returns:
-            GdbStub: The stub, for inspection of the commands issued.
+            tuple: (GdbStub, captured log text, resume_process mock).
         """
         stub = GdbStub([(code, output, None) for code, output in responses])
         output_path = os.path.join(self.workdir, "core.1003.gdb.txt")
         with patch.object(loopingdumps, "execute", stub), \
-             patch.object(loopingdumps, "get_payload_container_image", return_value=image), \
-             patch.object(loopingdumps, "get_container_runtime", return_value="apptainer"), \
-             patch.object(loopingdumps, "get_cvmfs_bind", return_value="/cvmfs"), \
-             patch.object(loopingdumps, "is_backtrace_in_container_wanted", return_value=enabled), \
-             patch.object(loopingdumps, "resume_process"), \
-             self.assertLogs("pilot.util.loopingdumps", level="INFO"):
+             patch.object(loopingdumps, "get_sysroot_options",
+                          return_value=sysroot_options or []), \
+             patch.object(loopingdumps, "resume_process") as resume, \
+             self.assertLogs("pilot.util.loopingdumps", level="INFO") as captured:
             loopingdumps.run_backtrace_phase(1003, output_path, "/tmp/scratch", "asetup Athena; ",
                                              deadline=time.monotonic() + 600,
-                                             job_workdir=self.workdir)
+                                             core_path=core_path)
 
-        return stub
+        return stub, "\n".join(captured.output), resume
 
-    def test_the_container_is_tried_first(self):
+    def _core(self):
+        """Write a core file for the phase to read.
+
+        Returns:
+            str: Path to the core file.
+        """
+        core_path = os.path.join(self.workdir, "core.1003")
+        with open(core_path, "wb") as _file:
+            _file.write(b"\x7fELF" + b"\x00" * 1024)
+
+        return core_path
+
+    def test_the_core_file_is_used_when_there_is_one(self):
         """And nothing else runs when it works."""
-        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)])
+        stub, _, _ = self._run_phase_b([(0, PARTIAL_BACKTRACE)], core_path=self._core())
 
         self.assertEqual(len(stub.calls), 1)
-        self.assertIn("apptainer exec", stub.calls[0][0])
+        self.assertIn("core.1003", stub.calls[0][0])
+        self.assertNotIn("-p 1003", stub.calls[0][0])
         self.assertIn("asetup Athena", stub.calls[0][0])
 
-    def test_a_failing_container_falls_back_to_the_worker_node(self):
+    def test_a_payload_without_a_core_file_is_attached_to(self):
+        """An oversized payload keeps the backtraces, so they must still be taken."""
+        stub, _, _ = self._run_phase_b([(0, PARTIAL_BACKTRACE)])
+
+        self.assertEqual(len(stub.calls), 1)
+        self.assertIn("-p 1003", stub.calls[0][0])
+
+    def test_a_core_file_that_was_never_written_is_not_read(self):
+        """report_core_file() says so, but the phase must not take its word for it."""
+        stub, _, _ = self._run_phase_b([(0, PARTIAL_BACKTRACE)],
+                                       core_path=os.path.join(self.workdir, "core.1003"))
+
+        self.assertIn("-p 1003", stub.calls[0][0])
+
+    def test_an_unreadable_core_file_falls_back_to_the_live_process(self):
         """Some backtraces are worth more than none."""
-        stub = self._run_phase_b([(1, "apptainer: command failed"), (0, PARTIAL_BACKTRACE)])
+        stub, log, _ = self._run_phase_b(
+            [(1, '"core.1003" is not a core dump: file format not recognized'),
+             (0, PARTIAL_BACKTRACE)],
+            core_path=self._core()
+        )
 
         self.assertEqual(len(stub.calls), 2)
-        self.assertIn("apptainer exec", stub.calls[0][0])
-        self.assertNotIn("apptainer exec", stub.calls[1][0])
+        self.assertNotIn("-p 1003", stub.calls[0][0])
+        self.assertIn("-p 1003", stub.calls[1][0])
+        self.assertIn("the core file could not be read", log)
 
-    def test_an_uncontainerised_payload_goes_straight_to_the_host(self):
-        """No image, no wrapping, no wasted attempt."""
-        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)], image="")
+    def test_a_timed_out_core_read_is_not_retried_against_the_process(self):
+        """A slow read is not an unreadable one, and the attach is slower still.
 
-        self.assertEqual(len(stub.calls), 1)
-        self.assertNotIn("apptainer exec", stub.calls[0][0])
-
-    def test_the_switch_is_read_from_the_configuration(self):
-        """The site-facing control, not just the internal flag."""
-        self.assertTrue(loopingdumps.is_backtrace_in_container_wanted())
-
-        with patch.object(loopingdumps.config, "Pilot") as pilot:
-            pilot.looping_backtrace_in_container = False
-            self.assertFalse(loopingdumps.is_backtrace_in_container_wanted())
-
-    def test_the_feature_can_be_turned_off(self):
-        """A site that cannot run a second container needs a way out."""
-        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)], enabled=False)
+        The symbol tables are the cost either way, and the fallback would pay
+        for them a second time out of what is left of the budget.
+        """
+        stub, _, _ = self._run_phase_b([(errors.COMMANDTIMEDOUT, PARTIAL_BACKTRACE)],
+                                       core_path=self._core())
 
         self.assertEqual(len(stub.calls), 1)
-        self.assertNotIn("apptainer exec", stub.calls[0][0])
 
-    def test_the_environment_is_sanitised_inside_the_container_too(self):
-        """The release setup runs in there, so it exports PYTHONHOME in there."""
-        stub = self._run_phase_b([(0, PARTIAL_BACKTRACE)])
+    def test_the_sysroot_reaches_the_command(self):
+        """The option is useless unless the phase actually passes it to gdb."""
+        stub, _, _ = self._run_phase_b([(0, PARTIAL_BACKTRACE)], core_path=self._core(),
+                                       sysroot_options=[f"-iex 'set sysroot {self.IMAGE}'"])
 
-        # once outside the container and once inside it: the release setup runs in
-        # there, so that is where it exports the PYTHONHOME that breaks gdb
-        self.assertEqual(stub.calls[0][0].count("unset PYTHONHOME"), 2)
+        self.assertIn(f"set sysroot {self.IMAGE}", stub.calls[0][0])
+
+    def test_a_refused_attach_is_a_failure_even_though_gdb_exits_zero(self):
+        """gdb in batch mode carries on after an error and still exits 0.
+
+        In production the in-container phase B printed "ptrace: Operation not
+        permitted", produced no frames, exited 0 and was logged as having
+        finished in 1 s. The fallback that should have followed never ran.
+        """
+        self.assertTrue(loopingdumps.phase_failed(0, "ptrace: Operation not permitted.\nNo stack."))
+        self.assertFalse(loopingdumps.phase_failed(0, PARTIAL_BACKTRACE))
+
+    def test_a_refused_attach_leaves_the_payload_running(self):
+        """A phase killed mid-attach leaves the payload stopped; exit 0 hides it."""
+        _, _, resume = self._run_phase_b([(0, "ptrace: Operation not permitted.\nNo stack.")])
+
+        resume.assert_called_once_with(1003)
+
+    def test_the_python_environment_is_stripped(self):
+        """The pilot itself runs under an ALRB Python, so it can poison gdb."""
+        stub, _, _ = self._run_phase_b([(0, PARTIAL_BACKTRACE)], core_path=self._core())
+
+        self.assertIn("unset PYTHONHOME PYTHONPATH", stub.calls[0][0])
 
 
 class TestHeaderQuoting(unittest.TestCase):

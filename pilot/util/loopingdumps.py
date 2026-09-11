@@ -103,6 +103,19 @@ write there. The total is bounded by a single diagnostics budget
 (:func:`get_diagnostics_budget`), because everything here happens between the
 decision to kill and the kill itself.
 
+Phase B reads the core file phase A has just written rather than attaching to
+the payload a second time. A live attach cannot work from inside a second
+container: unprivileged Apptainer places that gdb in a new user namespace, and
+a tracer there holds no capability over a process in the parent namespace, so
+the attach is refused with ``ptrace: Operation not permitted`` even though the
+payload is plainly visible in the shared PID namespace. Nor is it needed - the
+core file holds the same stacks and reading it requires no ``ptrace`` at all.
+What the frames need in order to resolve is the payload's own libraries, and
+:func:`get_sysroot_options` supplies those by pointing gdb's ``sysroot`` at the
+container image, which for ATLAS is an unpacked directory on CVMFS that the
+host can read directly. A live attach on the worker node remains the fallback
+for a payload that has no core file.
+
 The release gdb is only needed to *read* a core file, and that happens offline,
 long after the worker node is gone. What it needs in order to be possible at
 all is recorded next to the core file by :func:`get_core_analysis_info`,
@@ -290,13 +303,6 @@ DEFAULT_BACKTRACE_TIMEOUT = 300
 # upload on a worker node that may be close to its wall clock limit.
 DEFAULT_DIAGNOSTICS_BUDGET = 900
 
-# Whether the backtraces are collected inside the payload's own container image
-# by default. gdb resolves shared libraries by path, and for a containerised
-# payload those paths name files in the image, so a gdb on the host either
-# cannot open them or resolves them against the wrong binary. Falls back to a
-# gdb on the worker node when the image or the runtime cannot be found.
-DEFAULT_BACKTRACE_IN_CONTAINER = True
-
 # Default upper bound on the resident set of a process for which a core file is
 # still attempted. Above this the backtraces are kept and the core file skipped.
 # The core file is deliberately kept in the log tarball so that it can be
@@ -362,9 +368,6 @@ CONTAINER_IMAGE_VARIABLES = (
     "APPTAINER_CONTAINER",
     "SINGULARITY_CONTAINER",
 )
-
-# Container runtimes, in order of preference.
-CONTAINER_RUNTIMES = ("apptainer", "singularity")
 
 # Maximum number of gdb frames requested per thread in phase B.
 MAX_BACKTRACE_FRAMES = 100
@@ -1045,18 +1048,6 @@ def get_diagnostics_budget() -> int:
         return DEFAULT_DIAGNOSTICS_BUDGET
 
 
-def is_backtrace_in_container_wanted() -> bool:
-    """Return True if the backtraces should be collected inside the container.
-
-    Returns:
-        True if in-container backtraces are enabled.
-    """
-    try:
-        return config.Pilot.looping_backtrace_in_container
-    except AttributeError:
-        return DEFAULT_BACKTRACE_IN_CONTAINER
-
-
 def get_remaining_budget(deadline: float) -> int:
     """Return the time left before the diagnostics deadline, in seconds.
 
@@ -1735,85 +1726,85 @@ def get_payload_container_image(pid: int) -> str:
     return ""
 
 
-def get_container_runtime() -> str:
-    """Return the container runtime to use, preferring the one that exists.
+def get_sysroot_options(pid: int) -> list:
+    """Return the gdb options that make the container's libraries resolvable.
 
-    Returns:
-        ``apptainer`` or ``singularity``, or an empty string if neither is on
-        the path.
-    """
-    for runtime in CONTAINER_RUNTIMES:
-        if which(runtime):
-            return runtime
+    gdb resolves a shared library by opening the path recorded in the inferior,
+    and for a containerised payload those paths name files in the image. Its
+    default ``sysroot = target:`` sends it through ``/proc/<pid>/root``, which
+    against an unprivileged Apptainer image fails with ``Input/output error``
+    for every library, leaving ``?? ()`` in every frame and "Unable to find
+    dynamic linker breakpoint function" in the output.
 
-    logger.warning(f"{LOG_PREFIX}: neither {' nor '.join(CONTAINER_RUNTIMES)} is available")
+    Pointing ``sysroot`` at the image itself fixes that without a second
+    container, but only when the image is a directory the host can read. The
+    ATLAS images on CVMFS are unpacked directories; a ``.sif`` is a single file
+    gdb cannot look inside, and there the frames stay unresolved. Measured
+    against gdb 15.1, reading a core file: without a sysroot a frame in an
+    unavailable library is ``?? ()`` and the unwind then fails outright
+    ("Backtrace stopped: frame did not save the PC"); with one it is a named
+    function with its source line, and the remaining frames unwind cleanly. So
+    this recovers the whole stack, not only the names in it.
 
-    return ""
+    A library the payload brought itself, in the job work directory rather than
+    in the image, is *not* covered by this: it needs ``solib-search-path`` as
+    well, naming the exact directory holding it, since gdb does not search that
+    path recursively. Measured, and not yet implemented.
 
-
-def get_cvmfs_bind() -> str:
-    """Return the CVMFS mount point to bind into the diagnostic container.
-
-    Mirrors the experiment plugin's own notion of the file system root, which a
-    site can move by exporting ATLAS_SW_BASE (an HPC, typically). Resolved here
-    rather than imported so that this module stays independent of any one
-    plugin.
-
-    Returns:
-        Path to bind, or an empty string if it is not there.
-    """
-    path = os.environ.get("ATLAS_SW_BASE", "/cvmfs")
-
-    return path if os.path.isdir(path) else ""
-
-
-def build_container_invocation(inner: str, image: str, workdir: str, scratch: str) -> str:
-    """Wrap a command so that it runs inside the payload's container image.
-
-    This is what makes the backtraces worth reading for a containerised
-    payload. gdb resolves shared libraries by path, and for a payload inside a
-    container those paths name files in the image: a gdb on the host either
-    fails to open them, or - worse, when the host happens to have a file of the
-    same name - resolves them against the wrong binary and reports plausible
-    nonsense. Running gdb in the same image makes the paths mean what the
-    payload meant by them.
-
-    The payload keeps running in its own container; this is a second one on the
-    same image. That is enough, because Apptainer leaves the payload in the
-    host PID namespace, so gdb can still see and attach to the process, and
-    ``/proc`` is mounted from the host, so ``/proc/<pid>/exe`` still resolves.
+    ``auto-load safe-path`` is widened at the same time so that the image's
+    ``libpython*-gdb.py`` can be loaded, since that is what ``py-bt`` is. Note
+    that this lets gdb execute a script out of the image; it is done only for
+    the image the payload was already running in, and only for a diagnostic
+    that is allowed to fail. It is necessary but not sufficient: ``py-bt`` also
+    needs the interpreter's debug information, and without it the command loads
+    and then reports "unable to read python frame information" rather than a
+    Python stack. Measured; whether the ATLAS images carry that debug
+    information has not been established.
 
     Args:
-        inner: Command to run inside the container.
-        image: Container image path.
-        workdir: Job work directory, bound so that output can be written.
-        scratch: Working directory for the command, bound and used as the
-            container's working directory so that the setup writes there.
+        pid: Process id of a process inside the container.
 
     Returns:
-        The wrapped command, or the original if no runtime is available.
+        List of gdb options, empty when no sysroot can be established.
     """
-    runtime = get_container_runtime()
-    if not runtime:
-        return ""
+    image = get_payload_container_image(pid)
+    if not image:
+        return []
 
-    binds = [get_cvmfs_bind(), workdir]
-    if scratch:
-        binds.append(scratch)
-    options = "-B " + ",".join(bind for bind in binds if bind)
-    if scratch:
-        options += f" --pwd {scratch}"
+    if not os.path.isdir(image) or not os.access(image, os.R_OK | os.X_OK):
+        logger.info(
+            f"{LOG_PREFIX}: the payload container image {image} is not a readable directory "
+            f"(a .sif image, typically) - frames inside the container's own libraries will "
+            f"not resolve"
+        )
+        return []
 
-    return f"{runtime} exec {options} {image} /bin/bash -c {shlex.quote(inner)}"
+    logger.info(f"{LOG_PREFIX}: resolving the payload's libraries against {image}")
+
+    sysroot = shlex.quote(f"set sysroot {image}")
+
+    return [
+        f"-iex {sysroot}",
+        "-iex 'set auto-load safe-path /'",
+    ]
 
 
-def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbols: bool = True) -> str:
-    """Return the gdb invocation attaching to a process and running commands.
+def build_gdb_invocation(pid: int, commands: list, *, environment: str = "", symbols: bool = True,
+                         core_path: str = "", sysroot_options: list = None) -> str:
+    """Return the gdb invocation running the requested commands.
 
     ``--nx`` keeps a stray ``.gdbinit`` out of the way, and debuginfod and the
     index cache are disabled before the inferior is loaded: a worker node has no
     route to a debuginfod server, so leaving it enabled risks a stall inside a
     step that is already the slowest one here.
+
+    With *core_path* set, gdb opens that core file instead of attaching. This is
+    what phase B does whenever phase A produced one. Reading a core file needs
+    no ``ptrace``, which removes a whole class of failure: a second attach can
+    be refused outright, and is refused unconditionally from inside another
+    container, where the tracer sits in a user namespace with no capability over
+    the payload. The stacks are the same either way, since the core file records
+    them.
 
     ``symbols=False`` is what makes the core file affordable. gdb reads the
     symbol table of every mapped shared object *during the attach*, before it
@@ -1822,29 +1813,37 @@ def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbol
     several hundred objects read over CVMFS, and in production it exhausted a
     300 s timeout on a 989 MB payload before ``generate-core-file`` was ever
     reached. ``set auto-solib-add off`` has to be an ``-iex``, since by the time
-    an ``-ex`` runs the reading has already happened. It costs nothing here: the
-    core file records memory and mappings, and symbols are resolved when the
+    an ``-ex`` runs the reading has already happened. It costs nothing there:
+    the core file records memory and mappings, and symbols are resolved when the
     core file is opened, not when it is written.
 
     Args:
-        pid: Process id to attach to.
+        pid: Process id to attach to, and the source of the executable.
         commands: gdb ``-ex`` options to run, in order.
         environment: Optional command prefix, e.g. :data:`CLEAN_ENVIRONMENT`.
         symbols: Whether shared library symbols should be read on attach.
+        core_path: Core file to open. When given, gdb reads the core file
+            instead of attaching to the process.
+        sysroot_options: Options from :func:`get_sysroot_options`, telling gdb
+            where the container's libraries can be read from.
 
     Returns:
         gdb command string.
     """
-    options = [
-        "--nx",
-        f"-p {pid}",
+    options = ["--nx"]
+    executable = get_executable_argument(pid)
+    if executable:
+        options.append(executable)
+    if core_path:
+        options.append(f"-c {shlex.quote(core_path)}")
+    else:
+        options.append(f"-p {pid}")
+    options += [
         "-batch",
         "-iex 'set debuginfod enabled off'",
         "-iex 'set index-cache enabled off'",
     ]
-    executable = get_executable_argument(pid)
-    if executable:
-        options.insert(1, executable)
+    options += sysroot_options or []
     if not symbols:
         options += [
             "-iex 'set auto-solib-add off'",
@@ -1856,7 +1855,11 @@ def build_gdb_invocation(pid: int, commands: list, environment: str = "", symbol
         f"-ex 'echo {STARTUP_MARKER}\\n'",
     ]
     options += commands
-    options += ["-ex detach", "-ex quit"]
+    # nothing is attached in the core file case, where a detach only produces
+    # "The program is not being run." in the middle of the backtraces
+    if not core_path:
+        options.append("-ex detach")
+    options.append("-ex quit")
 
     return f"{environment}gdb {' '.join(options)}"
 
@@ -2148,6 +2151,26 @@ def has_attach_failure(output: str) -> bool:
     return any(signature in (output or "") for signature in ATTACH_FAILURE_SIGNATURES)
 
 
+def phase_failed(exit_code: int, output: str) -> bool:
+    """Return True if a gdb phase did not do what it was asked to do.
+
+    The exit code on its own is not enough, for the same reason that
+    :data:`STARTUP_MARKER` does not prove the attach succeeded: gdb in batch
+    mode carries on after an error and still exits 0. In production an
+    in-container phase B printed ``ptrace: Operation not permitted``, produced
+    no frames at all, exited 0, and the fallback that should have followed was
+    therefore never reached - the phase was logged as having finished in 1 s.
+
+    Args:
+        exit_code: Exit code reported by :func:`pilot.util.container.execute`.
+        output: Output the phase appended.
+
+    Returns:
+        True if the phase should be treated as failed.
+    """
+    return exit_code != 0 or has_attach_failure(output)
+
+
 def log_stall_diagnosis(output: str, label: str) -> None:
     """Say how far gdb got before it was stopped, using the stage markers.
 
@@ -2225,7 +2248,8 @@ def run_gdb_phase(cmd: str, output_path: str, timeout: int, scratch: str, label:
     if has_attach_failure(output):
         logger.warning(
             f"{LOG_PREFIX}: {label}: gdb could not attach to the process - it may have exited "
-            f"already, or ptrace may be restricted on this node"
+            f"already, or the tracer and the payload may be in different user namespaces, "
+            f"which is the case for any gdb started inside a second container"
         )
 
     if has_cvmfs_io_failure(output):
@@ -2289,76 +2313,33 @@ def run_core_dump_phase(pid: int, core_path: str, output_path: str, scratch: str
     return has_cvmfs_io_failure(output)
 
 
-def _try_backtraces_in_container(pid: int, invocation: str, output_path: str, scratch: str, *,
-                                 setup: str, timeout: int, job_workdir: str) -> tuple:
-    """Attempt the backtraces inside the payload's own container image.
+def _run_backtrace_attempt(pid: int, output_path: str, scratch: str, *, setup: str,
+                           deadline: float, header: str, label: str, core_path: str = "",
+                           sysroot_options: list = None) -> tuple:
+    """Run one attempt at the backtraces and return its result.
 
     Args:
-        pid: Process id to attach to.
-        invocation: gdb command to run inside the container.
-        output_path: File the phase appends its output to.
-        scratch: Working directory, bound into the container.
-        setup: Experiment setup, run inside the container.
-        timeout: Timeout in seconds.
-        job_workdir: Job work directory, bound into the container.
-
-    Returns:
-        Tuple of ``(exit_code, output, attempted)``. The exit code is -1 when
-        no attempt was made, so that the caller falls through to the host.
-    """
-    if not is_backtrace_in_container_wanted():
-        return -1, "", False
-
-    image = get_payload_container_image(pid)
-    if not image:
-        return -1, "", False
-
-    contained = build_container_invocation(f"{setup}{get_environment_prefix()}{invocation}",
-                                           image, job_workdir, scratch)
-    if not contained:
-        return -1, "", False
-
-    cmd = build_phase_command(
-        contained, output_path, "=== phase B: backtraces (in the payload's container) ==="
-    )
-    exit_code, output = run_gdb_phase(
-        cmd, output_path, timeout, scratch, "phase B (backtraces, in container)"
-    )
-
-    return exit_code, output, True
-
-
-def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, *, deadline: float,
-                        job_workdir: str = "") -> bool:
-    """Run phase B: collect the backtraces with the experiment setup.
-
-    This is the expensive phase, since every mapped object's symbol table has to
-    be read, several hundred of them over CVMFS for an athena process. It is
-    therefore run last and is allowed to fail: the same stacks are in the core
-    file that phase A already wrote.
-
-    ``py-bt`` is requested because for a looping transform the Python stack
-    usually identifies the algorithm directly; a gdb without the Python
-    extension ignores it.
-
-    Args:
-        pid: Process id to attach to.
+        pid: Process id the backtraces are wanted for.
         output_path: File the phase appends its output to.
         scratch: Working directory for the command.
         setup: Experiment setup prepended to the command.
         deadline: Diagnostics deadline as a :func:`time.monotonic` value.
-        job_workdir: Job work directory, bound into the diagnostic container.
+        header: Line marking this attempt in the output file.
+        label: Phase label used in the log messages.
+        core_path: Core file to read, if there is one.
+        sysroot_options: Options from :func:`get_sysroot_options`.
 
     Returns:
-        True if gdb reported a CVMFS path it could not read.
+        Tuple of ``(exit_code, output)``. The exit code is -1 when no attempt
+        was made because the budget is spent.
     """
     timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
     if timeout <= 0:
         logger.warning(
-            f"{LOG_PREFIX}: phase B (backtraces): skipped - the diagnostics budget is spent "
+            f"{LOG_PREFIX}: {label}: skipped - the diagnostics budget is spent "
             f"(the stacks are in the core file)"
         )
-        return False
+        return -1, ""
 
     commands = [
         f"-ex 'set backtrace limit {MAX_BACKTRACE_FRAMES}'",
@@ -2366,43 +2347,90 @@ def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, *,
         "-ex 'thread apply all bt'",
         "-ex 'py-bt'",
     ]
-    invocation = build_gdb_invocation(pid, commands)
+    invocation = build_gdb_invocation(pid, commands, core_path=core_path,
+                                      sysroot_options=sysroot_options)
+    cmd = build_phase_command(invocation, output_path, header, setup=setup)
 
-    exit_code, output, attempted_in_container = _try_backtraces_in_container(
-        pid, invocation, output_path, scratch,
-        setup=setup, timeout=timeout, job_workdir=job_workdir
+    return run_gdb_phase(cmd, output_path, timeout, scratch, label)
+
+
+def run_backtrace_phase(pid: int, output_path: str, scratch: str, setup: str, *,
+                        deadline: float, core_path: str = "") -> bool:
+    """Run phase B: collect the backtraces with the experiment setup.
+
+    This is the expensive phase, since every mapped object's symbol table has to
+    be read, several hundred of them over CVMFS for an athena process. It is
+    therefore run last and is allowed to fail: the same stacks are in the core
+    file that phase A already wrote.
+
+    It reads that core file rather than attaching a second time whenever phase A
+    produced one, which is the usual case. A live attach is kept as a fallback
+    for a payload with no core file, and for the unlikely case of a core file
+    gdb cannot open.
+
+    ``py-bt`` is requested because for a looping transform the Python stack
+    usually identifies the algorithm directly; a gdb without the Python
+    extension ignores it.
+
+    Args:
+        pid: Process id the backtraces are wanted for.
+        output_path: File the phase appends its output to.
+        scratch: Working directory for the command.
+        setup: Experiment setup prepended to the command.
+        deadline: Diagnostics deadline as a :func:`time.monotonic` value.
+        core_path: Core file written by phase A, if any.
+
+    Returns:
+        True if gdb reported a CVMFS path it could not read.
+    """
+    sysroot_options = get_sysroot_options(pid)
+    post_mortem = bool(core_path) and get_file_size(core_path) > 0
+
+    exit_code, last_output = _run_backtrace_attempt(
+        pid, output_path, scratch, setup=setup, deadline=deadline,
+        header=("=== phase B: backtraces (core file) ===" if post_mortem else
+                "=== phase B: backtraces (live process) ==="),
+        label=("phase B (backtraces, core file)" if post_mortem else "phase B (backtraces)"),
+        core_path=core_path if post_mortem else "", sysroot_options=sysroot_options
     )
+    output = last_output
 
-    if exit_code != 0:
-        if attempted_in_container:
-            logger.info(
-                f"{LOG_PREFIX}: phase B (backtraces): falling back to a gdb on the worker node - "
-                f"frames inside the container's own libraries will not resolve"
-            )
-        timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
-        if timeout <= 0:
-            return has_cvmfs_io_failure(output)
-        cmd = build_phase_command(
-            invocation, output_path, "=== phase B: backtraces (release setup) ===", setup=setup
+    if phase_failed(exit_code, last_output) and has_python_startup_failure(last_output):
+        logger.info(
+            f"{LOG_PREFIX}: phase B (backtraces): retrying without the release setup - "
+            f"the frames will be less well resolved, but the thread and Python stacks are "
+            f"worth more than nothing"
         )
-        exit_code, host_output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B (backtraces)")
-        output += host_output
+        exit_code, last_output = _run_backtrace_attempt(
+            pid, output_path, scratch, setup="", deadline=deadline,
+            header="=== phase B (retry): backtraces (no release setup) ===",
+            label="phase B retry (backtraces)",
+            core_path=core_path if post_mortem else "", sysroot_options=sysroot_options
+        )
+        output += last_output
 
-    if exit_code != 0 and has_python_startup_failure(output):
-        timeout = min(get_backtrace_timeout(), get_remaining_budget(deadline))
-        if timeout > 0:
-            logger.info(
-                f"{LOG_PREFIX}: phase B (backtraces): retrying without the release setup - "
-                f"the frames will be less well resolved, but the thread and Python stacks are "
-                f"worth more than nothing"
-            )
-            cmd = build_phase_command(
-                invocation, output_path, "=== phase B (retry): backtraces (no release setup) ==="
-            )
-            exit_code, retry_output = run_gdb_phase(cmd, output_path, timeout, scratch, "phase B retry (backtraces)")
-            output += retry_output
+    # a timeout means the core file was slow to read, not that it could not be
+    # read, and a live attach would be slower still - it has to read the same
+    # symbol tables and pays for the attach as well. -1 means nothing ran at
+    # all, the budget having been spent, in which case so is the fallback's
+    core_unreadable = (
+        post_mortem and
+        exit_code not in (-1, errors.COMMANDTIMEDOUT) and
+        phase_failed(exit_code, last_output)
+    )
+    if core_unreadable:
+        logger.info(
+            f"{LOG_PREFIX}: phase B (backtraces): the core file could not be read - "
+            f"attaching to the payload instead"
+        )
+        exit_code, last_output = _run_backtrace_attempt(
+            pid, output_path, scratch, setup=setup, deadline=deadline,
+            header="=== phase B: backtraces (live process) ===",
+            label="phase B (backtraces)", sysroot_options=sysroot_options
+        )
+        output += last_output
 
-    if exit_code != 0:
+    if phase_failed(exit_code, last_output):
         resume_process(pid)
 
     return has_cvmfs_io_failure(output)
@@ -2455,8 +2483,9 @@ def create_core_dump(job: Any) -> bool:
     Targets the best candidate from :func:`select_dump_candidates` rather than
     an arbitrary descendant, and runs in two phases with independent timeouts
     under one overall budget: phase A writes the core file with a bare gdb,
-    phase B collects the backtraces with the experiment setup and is allowed to
-    fail. Both redirect to a file next to the core file, so a timeout keeps
+    phase B reads that core file back with the experiment setup to collect the
+    backtraces and is allowed to fail. Both redirect to a file next to the core
+    file, so a timeout keeps
     whatever was produced. The executable identity, the container the payload
     ran in and the release setup are recorded in the pilot log and in a
     companion file, so that the core file can still be opened long after the
@@ -2504,7 +2533,7 @@ def create_core_dump(job: Any) -> bool:
             cvmfs_failure = run_core_dump_phase(pid, core_path, output_path, scratch, deadline)
             report_core_file(core_path)
         cvmfs_failure = run_backtrace_phase(pid, output_path, scratch, setup, deadline=deadline,
-                                            job_workdir=job.workdir) or cvmfs_failure
+                                            core_path=core_path) or cvmfs_failure
     finally:
         remove_scratch_directory(scratch)
 
