@@ -304,7 +304,38 @@ def update_alrb_setup(cmd: str, use_release_setup: str) -> str:
     return updated_cmd
 
 
-def update_for_user_proxy(setup_cmd: str, cmd: str, is_analysis: bool = False, queue_type: str = '') -> tuple[int, str, str, str]:
+def get_alrb_presetup(x509: str, workdir: str) -> str:
+    """Return the ALRB_CONT_PRESETUP export for a job proxy stored in the work directory.
+
+    A job proxy (payload proxy or unified dispatch user proxy) may be renewed by the pilot while
+    the payload is running. ALRB_CONT_PRESETUP points ALRB to the proxy as seen inside the
+    container, where the work directory is mounted as /srv, so that the running payload sees the
+    renewed proxy. It must be set before the container is started. The pilot's own proxy is never
+    stored in the work directory, so nothing is returned for it.
+
+    A site-level ALRB_CONT_PRESETUP is respected (but will prevent the payload from seeing a
+    renewed proxy).
+
+    Args:
+        x509: path to the proxy used by the payload.
+        workdir: job work directory.
+
+    Returns:
+        str: export command (ending with ';'), or an empty string.
+    """
+    if not x509 or not workdir or os.path.dirname(os.path.abspath(x509)) != os.path.abspath(workdir):
+        return ''
+
+    if os.environ.get('ALRB_CONT_PRESETUP'):
+        logger.warning(f"ALRB_CONT_PRESETUP is already set ({os.environ.get('ALRB_CONT_PRESETUP')}) - "
+                       f"the payload will not see a renewed proxy")
+        return ''
+
+    return f'export ALRB_CONT_PRESETUP="/srv/{os.path.basename(x509)}";'
+
+
+def update_for_user_proxy(setup_cmd: str, cmd: str, is_analysis: bool = False, queue_type: str = '',
+                          workdir: str = '') -> tuple[int, str, str, str]:
     """Add the X509 user proxy to the container sub command string if set, and remove it from the main container command.
 
     The payload proxy itself is no longer downloaded here. alrb_wrapper() is a command-string
@@ -319,6 +350,7 @@ def update_for_user_proxy(setup_cmd: str, cmd: str, is_analysis: bool = False, q
         cmd: command the container will execute.
         is_analysis: True for user job.
         queue_type: queue type (e.g. 'unified').
+        workdir: job work directory (used to point ALRB to a job proxy that may be renewed).
 
     Returns:
         tuple[int, str, str, str]: exit_code, diagnostics, updated setup_cmd, updated cmd.
@@ -338,8 +370,9 @@ def update_for_user_proxy(setup_cmd: str, cmd: str, is_analysis: bool = False, q
             x509 = pilot_cache.payload_proxy
             logger.debug(f'using payload proxy: {x509}')
 
-        # add X509_USER_PROXY setting to the container setup command
-        setup_cmd = f"export X509_USER_PROXY={x509};" + setup_cmd
+        # add X509_USER_PROXY setting to the container setup command, and ALRB_CONT_PRESETUP for a job proxy
+        # that may be renewed while the payload is running (both end up before setupATLAS)
+        setup_cmd = f"export X509_USER_PROXY={x509};" + get_alrb_presetup(x509, workdir) + setup_cmd
 
     return exit_code, diagnostics, setup_cmd, cmd
 
@@ -540,7 +573,9 @@ def alrb_wrapper(cmd: str, workdir: str, job: JobData = None) -> str:
         # -> if [ -z "$ATLAS_LOCAL_ROOT_BASE" ]; then export ATLAS_LOCAL_ROOT_BASE=/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase; fi;
 
         # add user proxy if necessary (actually it should also be removed from cmd)
-        exit_code, diagnostics, alrb_setup, cmd = update_for_user_proxy(alrb_setup, cmd, is_analysis=job.is_analysis(), queue_type=job.infosys.queuedata.type)
+        exit_code, diagnostics, alrb_setup, cmd = update_for_user_proxy(alrb_setup, cmd, is_analysis=job.is_analysis(),
+                                                                        queue_type=job.infosys.queuedata.type,
+                                                                        workdir=job.workdir)
         if exit_code:
             job.piloterrordiag = diagnostics
             job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(exit_code)

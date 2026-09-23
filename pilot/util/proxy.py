@@ -29,15 +29,25 @@ from time import sleep
 from typing import Any, Dict
 
 from pilot.common.exception import FileHandlingFailure
+from pilot.common.pilotcache import get_pilot_cache
 from pilot.util import https
 from pilot.util.config import config
 from pilot.util.container import (
     execute,
     execute_nothreads
 )
-from pilot.util.filehandling import write_file
+from pilot.util.filehandling import (
+    remove,
+    write_file
+)
 
 logger = logging.getLogger(__name__)
+pilot_cache = get_pilot_cache()
+
+# job proxy types, i.e. proxies that the pilot downloads per job in addition to its own proxy:
+# 'payload' - user proxy for the payload on non-unified analysis queues (see handle_payload_proxy())
+# 'unified' - user proxy replacing the production proxy for user jobs on unified dispatch queues
+JOB_PROXY_TYPES = ('payload', 'unified')
 
 
 def get_distinguished_name() -> str:
@@ -382,3 +392,89 @@ def create_cert_files(from_proxy: str, workdir: str) -> tuple[str, str]:
         counter += 1
 
     return _files[0], _files[1]
+
+
+def get_job_proxy_path(x509: str, proxy_type: str, workdir: str = '') -> str:
+    """Return the path of a job proxy (payload proxy or unified dispatch user proxy).
+
+    The name is derived from the pilot's own proxy and always ends with ``.proxy``, so that
+    it is also matched by the redundant file cleanup of the experiment plugins. The proxy is
+    placed in the job work directory when one is given, since that directory is visible as
+    ``/srv`` inside the payload container, which is required for a renewed proxy to be seen
+    by a running payload.
+
+    E.g. x509='/tmp/x509up_u12345', proxy_type='payload', workdir='/pilot/PanDA_Pilot-1'
+    -> '/pilot/PanDA_Pilot-1/x509up_u12345-payload.proxy'
+
+    Args:
+        x509: path to the pilot's own proxy (X509_USER_PROXY).
+        proxy_type: job proxy type, e.g. 'payload' or 'unified'.
+        workdir: job work directory (if empty, the proxy is placed next to the pilot's own proxy).
+
+    Returns:
+        str: path to the job proxy.
+    """
+    base = os.path.basename(x509)
+    if base.endswith('.proxy'):
+        base = base[:-len('.proxy')]
+    directory = workdir if workdir else os.path.dirname(x509)
+
+    return os.path.join(directory, f'{base}-{proxy_type}.proxy')
+
+
+def get_job_proxy_candidates(workdir: str) -> list[str]:
+    """Return all paths in the given work directory where a job proxy could be stored.
+
+    This includes the proxies known from the environment and the pilot cache, the names the
+    pilot generates for them (see get_job_proxy_path()), and the temporary files used while
+    a proxy is being renewed. Only paths located directly in the work directory are returned.
+
+    Args:
+        workdir: job work directory.
+
+    Returns:
+        list[str]: candidate paths (not necessarily existing).
+    """
+    known = [os.environ.get('X509_UNIFIED_DISPATCH', ''), pilot_cache.payload_proxy or '']
+    x509 = os.environ.get('X509_USER_PROXY', '')
+    if x509:
+        known += [get_job_proxy_path(x509, proxy_type, workdir=workdir) for proxy_type in JOB_PROXY_TYPES]
+
+    workdir = os.path.abspath(workdir)
+    candidates = []
+    for path in known:
+        if not path or os.path.dirname(os.path.abspath(path)) != workdir:
+            continue
+        for candidate in (path, f'{path}.tmp'):
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates
+
+
+def remove_job_proxies(workdir: str) -> list[str]:
+    """Remove any job proxy from the given work directory.
+
+    This must be done before the log tarball is created, since a proxy must never be included
+    in it. The environment and the pilot cache are reset as well, so that the removed proxies
+    are not used by any subsequent stage-out or job.
+
+    Args:
+        workdir: job work directory.
+
+    Returns:
+        list[str]: paths of the removed files.
+    """
+    removed = []
+    for path in get_job_proxy_candidates(workdir):
+        if os.path.exists(path) and remove(path) == 0:
+            removed.append(path)
+    if removed:
+        logger.info(f'removed job proxies from the work directory: {removed}')
+
+    if os.environ.get('X509_UNIFIED_DISPATCH'):
+        logger.info('resetting X509_UNIFIED_DISPATCH')
+        os.environ['X509_UNIFIED_DISPATCH'] = ''
+    pilot_cache.payload_proxy = None
+
+    return removed

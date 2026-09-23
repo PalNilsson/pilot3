@@ -192,6 +192,14 @@ pilot_cache = get_pilot_cache()
 # overhead, so a freshly-started job is not immediately killed.
 MIN_TIME_FOR_NEW_JOB = 1800
 
+# job monitor exit codes that kill the payload immediately (after the error code has been set)
+PAYLOAD_KILL_EXIT_CODES = frozenset({
+    errors.KILLPAYLOAD,
+    errors.NOVOMSPROXY,
+    errors.CERTIFICATEHASEXPIRED,
+    errors.PAYLOADPROXYDOWNLOADFAILURE,  # a job proxy could not be renewed before it expired
+})
+
 
 def control(queues: namedtuple, traces: Any, args: object) -> None:
     """Set up job control threads.
@@ -3350,7 +3358,7 @@ def handle_proxy(job: Any) -> tuple[int, str]:
     Returns:
         tuple[int, str]: exit code (0 on success), diagnostics.
     """
-    if job.is_analysis() and job.infosys.queuedata.type == 'unified' and not job.prodproxy:
+    if job.is_analysis() and job.infosys.queuedata.type == 'unified':
         logger.info('the production proxy will be replaced by a user proxy (to be downloaded)')
         ec = download_new_proxy(role='user', proxy_type='unified', workdir=job.workdir)
         if ec:
@@ -3359,7 +3367,7 @@ def handle_proxy(job: Any) -> tuple[int, str]:
             return ec, diagnostics
     else:
         logger.debug(f'will not download a new proxy since job.is_analysis()={job.is_analysis()}, '
-                     f'job.infosys.queuedata.type={job.infosys.queuedata.type}, job.prodproxy={job.prodproxy}')
+                     f'job.infosys.queuedata.type={job.infosys.queuedata.type}')
 
     # download the payload proxy if the experiment requires one for this job
     pilot_user = os.environ.get('PILOT_USER', 'generic').lower()
@@ -3597,11 +3605,6 @@ def has_job_completed(queues: namedtuple, args: object) -> bool:
 
         # reset any running real-time logger
         rtcleanup()
-
-        # reset proxy on unified queues for user jobs
-        if job.prodproxy:
-            os.environ['X509_USER_PROXY'] = job.prodproxy
-            job.prodproxy = ''
 
         # cleanup of any remaining processes
         if job.pid and job.pid not in job.zombies:
@@ -4415,7 +4418,7 @@ def job_monitor(queues: namedtuple, traces: Any, args: object) -> None:  # noqa:
                             # attempt to download a new proxy since it is about to expire
                             ec = download_new_proxy(role='production')
                             exit_code = ec if ec != 0 else 0  # reset the exit_code if success
-                        if exit_code in {errors.KILLPAYLOAD, errors.NOVOMSPROXY, errors.CERTIFICATEHASEXPIRED}:
+                        if exit_code in PAYLOAD_KILL_EXIT_CODES:
                             jobs[i].piloterrorcodes, jobs[i].piloterrordiags = errors.add_error_code(exit_code)
                             logger.debug('killing payload process')
                             kill_process(jobs[i].pid)
