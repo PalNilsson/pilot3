@@ -304,13 +304,62 @@ def update_alrb_setup(cmd: str, use_release_setup: str) -> str:
     return updated_cmd
 
 
+# name of the script (in the job work directory) that ALRB sources inside the payload container
+PROXY_PRESETUP_SCRIPT = 'pilot_proxy_presetup.sh'
+
+
+def write_proxy_presetup(x509: str, workdir: str) -> bool:
+    """Write the script that points the payload to the job proxy in /srv.
+
+    ALRB copies the proxy given by X509_USER_PROXY into the container home when the container is
+    started and points X509_USER_PROXY to that copy, so a proxy renewed by the pilot during the job
+    would not be seen by the payload. The script is sourced inside the container (via
+    ALRB_CONT_PRESETUP, before the ALRB setup) and points X509_USER_PROXY back to the proxy in the
+    work directory, which is mounted as /srv and renewed in place by the pilot.
+
+    The script only contains the path to the proxy, never the proxy itself. It is only (re)written
+    when its content changes, since it is requested once for the setup verification and once for
+    the payload.
+
+    Args:
+        x509: path to the job proxy (in the work directory).
+        workdir: job work directory.
+
+    Returns:
+        bool: True if the script is in place.
+    """
+    path = os.path.join(workdir, PROXY_PRESETUP_SCRIPT)
+    content = ("#!/bin/bash\n"
+               "# Created by the PanDA pilot. Sourced inside the payload container via ALRB_CONT_PRESETUP, so that\n"
+               "# the payload uses the job proxy in /srv (renewed by the pilot during the job) instead of ALRB's copy.\n"
+               f"export X509_USER_PROXY=/srv/{os.path.basename(x509)}\n")
+    try:
+        if os.path.exists(path):
+            with open(path, encoding='utf-8') as script:
+                if script.read() == content:
+                    return True
+        with open(path, 'w', encoding='utf-8') as script:
+            script.write(content)
+        os.chmod(path, 0o644)
+    except OSError as exc:
+        logger.warning(f'failed to write {path}: {exc} - the payload will not see a renewed proxy')
+        return False
+
+    logger.info(f'wrote {path} (X509_USER_PROXY=/srv/{os.path.basename(x509)} inside the container)')
+
+    return True
+
+
 def get_alrb_presetup(x509: str, workdir: str) -> str:
     """Return the ALRB_CONT_PRESETUP export for a job proxy stored in the work directory.
 
     A job proxy (payload proxy or unified dispatch user proxy) may be renewed by the pilot while
-    the payload is running. ALRB_CONT_PRESETUP points ALRB to the proxy as seen inside the
-    container, where the work directory is mounted as /srv, so that the running payload sees the
-    renewed proxy. It must be set before the container is started. The pilot's own proxy is never
+    the payload is running. ALRB evaluates ALRB_CONT_PRESETUP as a command inside the container,
+    before the ALRB setup. It is set to source a script written by the pilot (see
+    write_proxy_presetup()), which points X509_USER_PROXY to the proxy as seen inside the container
+    (the work directory is mounted as /srv), so that the running payload sees the renewed proxy.
+    The script is sourced rather than executed, since an export in a child process would be lost.
+    ALRB_CONT_PRESETUP must be set before the container is started. The pilot's own proxy is never
     stored in the work directory, so nothing is returned for it.
 
     A site-level ALRB_CONT_PRESETUP is respected (but will prevent the payload from seeing a
@@ -331,7 +380,10 @@ def get_alrb_presetup(x509: str, workdir: str) -> str:
                        f"the payload will not see a renewed proxy")
         return ''
 
-    return f'export ALRB_CONT_PRESETUP="/srv/{os.path.basename(x509)}";'
+    if not write_proxy_presetup(x509, workdir):
+        return ''
+
+    return f'export ALRB_CONT_PRESETUP="source /srv/{PROXY_PRESETUP_SCRIPT}";'
 
 
 def update_for_user_proxy(setup_cmd: str, cmd: str, is_analysis: bool = False, queue_type: str = '',

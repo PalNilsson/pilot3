@@ -40,6 +40,7 @@ The tests cover:
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -757,63 +758,126 @@ class TestRefreshBeforeStageout(unittest.TestCase):
 
 
 class TestAlrbPresetup(unittest.TestCase):
-    """ALRB_CONT_PRESETUP must point to a job proxy in the work directory as seen in the container."""
+    """ALRB_CONT_PRESETUP must source a pilot script pointing X509_USER_PROXY to the job proxy in /srv.
+
+    ALRB evaluates ALRB_CONT_PRESETUP as a command inside the container. Pointing it directly at the
+    proxy made ALRB try to execute the proxy ("/srv/x509up_u25606_prod-payload.proxy: Permission
+    denied"), and executing a script would lose its export in the child process, so the script is sourced.
+    """
+
+    EXPORT = 'export ALRB_CONT_PRESETUP="source /srv/pilot_proxy_presetup.sh";'
+
+    def setUp(self):
+        """Create a work directory with a job proxy."""
+        self.workdir = tempfile.mkdtemp()
+        self.proxy = os.path.join(self.workdir, 'x509up_u25606_prod-payload.proxy')
+        self.script = os.path.join(self.workdir, 'pilot_proxy_presetup.sh')
+
+    def tearDown(self):
+        """Remove the work directory and reset the cache."""
+        shutil.rmtree(self.workdir, ignore_errors=True)
+        pilot_cache.payload_proxy = None
+
+    def _read_script(self):
+        with open(self.script, encoding='utf-8') as script:
+            return script.read()
+
+    def test_script_content_and_mode(self):
+        """The script exports the proxy path as seen in the container, and contains no credential."""
+        self.assertTrue(container.write_proxy_presetup(self.proxy, self.workdir))
+        content = self._read_script()
+        self.assertTrue(content.startswith('#!/bin/bash\n'))
+        self.assertIn('\nexport X509_USER_PROXY=/srv/x509up_u25606_prod-payload.proxy\n', content)
+        self.assertNotIn(self.workdir, content)
+        self.assertEqual(os.stat(self.script).st_mode & 0o777, 0o644)
+
+    def test_script_only_rewritten_when_changed(self):
+        """Requested twice per job (setup verification, payload): the second request must not rewrite it."""
+        container.write_proxy_presetup(self.proxy, self.workdir)
+        os.utime(self.script, ns=(0, 0))
+        self.assertTrue(container.write_proxy_presetup(self.proxy, self.workdir))
+        self.assertEqual(os.stat(self.script).st_mtime_ns, 0)
+        other = os.path.join(self.workdir, 'x509up_u1-unified.proxy')
+        self.assertTrue(container.write_proxy_presetup(other, self.workdir))
+        self.assertIn('export X509_USER_PROXY=/srv/x509up_u1-unified.proxy\n', self._read_script())
+        self.assertNotEqual(os.stat(self.script).st_mtime_ns, 0)
+
+    def test_script_write_failure(self):
+        """A failure to write the script is reported (and logged), not raised."""
+        missing = os.path.join(self.workdir, 'missing')
+        with patch.object(container.logger, 'warning') as mock_warning:
+            self.assertFalse(container.write_proxy_presetup(os.path.join(missing, 'p.proxy'), missing))
+        mock_warning.assert_called_once()
 
     def test_job_proxy_in_workdir(self):
-        """A proxy in the work directory is exported as /srv/<name>."""
+        """A proxy in the work directory gets the export, and the script is written."""
         with patch.dict('os.environ', {'ALRB_CONT_PRESETUP': ''}, clear=False):
-            self.assertEqual(get_alrb_presetup('/w/x509up_u1-payload.proxy', '/w'),
-                             'export ALRB_CONT_PRESETUP="/srv/x509up_u1-payload.proxy";')
-            self.assertEqual(get_alrb_presetup('/w/x509up_u1-payload.proxy', '/w/'),
-                             'export ALRB_CONT_PRESETUP="/srv/x509up_u1-payload.proxy";')
+            self.assertEqual(get_alrb_presetup(self.proxy, self.workdir), self.EXPORT)
+            self.assertEqual(get_alrb_presetup(self.proxy, self.workdir + '/'), self.EXPORT)
+        self.assertTrue(os.path.exists(self.script))
+
+    def test_no_export_without_script(self):
+        """If the script cannot be written, nothing is exported (ALRB would fail to source it)."""
+        with patch.dict('os.environ', {'ALRB_CONT_PRESETUP': ''}, clear=False), \
+             patch.object(container, 'write_proxy_presetup', return_value=False):
+            self.assertEqual(get_alrb_presetup(self.proxy, self.workdir), '')
 
     def test_not_for_other_proxies(self):
         """The pilot's own proxy (outside the work directory) and missing inputs get nothing."""
-        with patch.dict('os.environ', {'ALRB_CONT_PRESETUP': ''}, clear=False):
-            self.assertEqual(get_alrb_presetup('/tmp/x509up_u1', '/w'), '')
-            self.assertEqual(get_alrb_presetup('/w/sub/x509up_u1-payload.proxy', '/w'), '')
-            self.assertEqual(get_alrb_presetup('/w/x509up_u1-payload.proxy', ''), '')
-            self.assertEqual(get_alrb_presetup('', '/w'), '')
+        with patch.dict('os.environ', {'ALRB_CONT_PRESETUP': ''}, clear=False), \
+             patch.object(container, 'write_proxy_presetup', return_value=True) as mock_write:
+            self.assertEqual(get_alrb_presetup('/tmp/x509up_u1', self.workdir), '')
+            self.assertEqual(get_alrb_presetup(os.path.join(self.workdir, 'sub', 'p.proxy'), self.workdir), '')
+            self.assertEqual(get_alrb_presetup(self.proxy, ''), '')
+            self.assertEqual(get_alrb_presetup('', self.workdir), '')
             # the pilot runs in its launch directory, where e.g. the read-only fallback writes proxies
             cwd = os.getcwd()
             self.assertEqual(get_alrb_presetup(os.path.join(cwd, 'x509up_u1-payload.proxy'), ''), '')
             self.assertEqual(get_alrb_presetup('', cwd), '')
             with patch('os.getcwd', return_value='/'):  # an empty path must never produce an export
                 self.assertEqual(get_alrb_presetup('', '/'), '')
+        mock_write.assert_not_called()
 
     def test_site_setting_is_respected(self):
-        """A site-level ALRB_CONT_PRESETUP is not overridden."""
+        """A site-level ALRB_CONT_PRESETUP is not overridden, and no script is written."""
         with patch.dict('os.environ', {'ALRB_CONT_PRESETUP': '/site/presetup.sh'}, clear=False), \
              patch.object(container.logger, 'warning') as mock_warning:
-            self.assertEqual(container.get_alrb_presetup('/w/x509up_u1-payload.proxy', '/w'), '')
+            self.assertEqual(container.get_alrb_presetup(self.proxy, self.workdir), '')
         mock_warning.assert_called_once()
+        self.assertFalse(os.path.exists(self.script))
 
     def test_update_for_user_proxy_adds_presetup_before_setup(self):
         """The export comes before the rest of the setup (i.e. before setupATLAS)."""
-        payload = '/w/x509up_u1-payload.proxy'
-        pilot_cache.payload_proxy = payload
+        pilot_cache.payload_proxy = self.proxy
         env = {'X509_USER_PROXY': '/tmp/x509up_u1', 'X509_UNIFIED_DISPATCH': '', 'ALRB_CONT_PRESETUP': ''}
-        try:
-            with patch.dict('os.environ', env, clear=False):
-                _, _, setup_cmd, _ = update_for_user_proxy('source atlasLocalSetup.sh', 'payload', is_analysis=True,
-                                                           queue_type='production', workdir='/w')
-                self.assertEqual(setup_cmd, f'export X509_USER_PROXY={payload};'
-                                            'export ALRB_CONT_PRESETUP="/srv/x509up_u1-payload.proxy";'
-                                            'source atlasLocalSetup.sh')
-                _, _, setup_cmd, _ = update_for_user_proxy('setup', 'payload', is_analysis=False,
-                                                           queue_type='production', workdir='/w')
-                self.assertNotIn('ALRB_CONT_PRESETUP', setup_cmd)
-        finally:
-            pilot_cache.payload_proxy = None
+        with patch.dict('os.environ', env, clear=False):
+            _, _, setup_cmd, _ = update_for_user_proxy('source atlasLocalSetup.sh', 'payload', is_analysis=True,
+                                                       queue_type='production', workdir=self.workdir)
+            self.assertEqual(setup_cmd, f'export X509_USER_PROXY={self.proxy};{self.EXPORT}source atlasLocalSetup.sh')
+            _, _, setup_cmd, _ = update_for_user_proxy('setup', 'payload', is_analysis=False,
+                                                       queue_type='production', workdir=self.workdir)
+            self.assertNotIn('ALRB_CONT_PRESETUP', setup_cmd)
 
     def test_update_for_user_proxy_unified(self):
         """On unified dispatch queues, the user proxy in the work directory gets the export."""
-        unified = '/w/x509up_u1-unified.proxy'
+        unified = os.path.join(self.workdir, 'x509up_u1-unified.proxy')
         env = {'X509_USER_PROXY': '/tmp/x509up_u1', 'X509_UNIFIED_DISPATCH': unified, 'ALRB_CONT_PRESETUP': ''}
         with patch.dict('os.environ', env, clear=False):
             _, _, setup_cmd, _ = update_for_user_proxy('setup', 'payload', is_analysis=True,
-                                                       queue_type='unified', workdir='/w')
-        self.assertIn('export ALRB_CONT_PRESETUP="/srv/x509up_u1-unified.proxy";', setup_cmd)
+                                                       queue_type='unified', workdir=self.workdir)
+        self.assertIn(self.EXPORT, setup_cmd)
+        self.assertIn('export X509_USER_PROXY=/srv/x509up_u1-unified.proxy\n', self._read_script())
+
+    def test_sourced_script_sets_proxy_in_shell(self):
+        """End to end: ALRB's eval of the export must leave X509_USER_PROXY pointing to the /srv proxy."""
+        container.write_proxy_presetup(self.proxy, self.workdir)
+        # emulate the container: /srv is the work directory; ALRB has pointed X509_USER_PROXY to its copy
+        presetup = f'source {self.script}'
+        bashrc = 'X509_USER_PROXY=/alrb/copy; eval $ALRB_CONT_PRESETUP; echo -n $X509_USER_PROXY'
+        env = dict(os.environ, ALRB_CONT_PRESETUP=presetup)
+        result = subprocess.run(['bash', '-c', bashrc], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(result.stdout, '/srv/x509up_u25606_prod-payload.proxy')
+        self.assertEqual(result.stderr, '')
 
 
 class TestProdproxyRemoved(unittest.TestCase):
