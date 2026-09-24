@@ -3366,8 +3366,8 @@ def handle_proxy(job: Any) -> tuple[int, str]:
             logger.warning(diagnostics)
             return ec, diagnostics
     else:
-        logger.debug(f'will not download a new proxy since job.is_analysis()={job.is_analysis()}, '
-                     f'job.infosys.queuedata.type={job.infosys.queuedata.type}')
+        logger.debug(f'no unified dispatch user proxy needed since job.is_analysis()={job.is_analysis()}, '
+                     f'job.infosys.queuedata.type={job.infosys.queuedata.type} (the payload proxy is handled next)')
 
     # download the payload proxy if the experiment requires one for this job
     pilot_user = os.environ.get('PILOT_USER', 'generic').lower()
