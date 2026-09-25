@@ -90,6 +90,7 @@ from pilot.util.processes import (
     get_trimmed_dictionary,
     is_child
 )
+from pilot.util.proxy import remove_container_proxies
 from pilot.util.timing import add_to_pilot_timing
 from pilot.util.tracereport import TraceReport
 from .container import (
@@ -286,21 +287,9 @@ def open_remote_files(indata: list, workdir: str, nthreads: int) -> tuple[int, s
         cmd = create_root_container_command(workdir, _cmd, script_content)
         path = os.path.join(workdir, 'open_remote_file_cmd.sh')
         logger.info(f'executing file open verification script (path={path}, timeout={timeout}):\n\n\'{cmd}\'\n\n')
-        try:
-            write_file(path, cmd)
-        except FileHandlingFailure as exc:
-            diagnostics = f'failed to write file: {exc}'
-            logger.warning(diagnostics)
-            return 11, diagnostics, not_opened, lsetup_time
-
-        # if execute_remote_file_open() returns exit code 1, it means general error.
-        # exit code 2 means that lsetup timed out, while 3 means that the python script (actual file open) timed out
-        try:
-            exitcode, stdout, lsetup_time = execute_remote_file_open(path, timeout)
-        except PilotException as exc:
-            logger.warning(f'caught pilot exception: {exc}')
-            exitcode = 11
-            stdout = str(exc)
+        exitcode, stdout, lsetup_time, diagnostics = run_file_open_command(path, cmd, timeout, workdir)
+        if diagnostics:
+            return exitcode, diagnostics, not_opened, lsetup_time
 
         # Log all captured container output so that apptainer startup lines, lsetup
         # trace (ALRB_CONT_VERBOSE=3), and any error messages are visible in the
@@ -350,6 +339,45 @@ def open_remote_files(indata: list, workdir: str, nthreads: int) -> tuple[int, s
         logger.warning(f'remote file open exit code: {exitcode}')
 
     return exitcode, diagnostics, not_opened, lsetup_time
+
+
+def run_file_open_command(path: str, cmd: str, timeout: int, workdir: str) -> tuple[int, str, int, str]:
+    """Write the file open container command to a script and execute it.
+
+    The file open container may have been given a copy of the pilot's own proxy in the work directory
+    (see create_root_container_command()), which is removed afterwards, whatever the outcome.
+
+    Exit code 1 from execute_remote_file_open() means general error, 2 that lsetup timed out, and 3 that
+    the python script (actual file open) timed out. Exit code 11 is returned if the script could not be
+    written or executed.
+
+    Args:
+        path: path of the script to write.
+        cmd: container command.
+        timeout: timeout (s).
+        workdir: job work directory.
+
+    Returns:
+        tuple[int, str, int, str]: exit code, stdout, lsetup time, diagnostics (only set if the script
+            could not be written).
+    """
+    try:
+        try:
+            write_file(path, cmd)
+        except FileHandlingFailure as exc:
+            diagnostics = f'failed to write file: {exc}'
+            logger.warning(diagnostics)
+            return 11, '', 0, diagnostics
+
+        try:
+            exitcode, stdout, lsetup_time = execute_remote_file_open(path, timeout)
+        except PilotException as exc:
+            logger.warning(f'caught pilot exception: {exc}')
+            return 11, str(exc), 0, ''
+
+        return exitcode, stdout, lsetup_time, ''
+    finally:
+        remove_container_proxies(workdir)
 
 
 def get_timeout_for_remoteio(indata: list) -> int:

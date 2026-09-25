@@ -34,6 +34,8 @@ The tests cover:
 - the arcproxy cache: one arcproxy execution per downloaded proxy, no stale entries across jobs
 - the periodic check, renewal (download to a temporary file, verify, then replace), retry on
   failure, and the hard floor below which a failed renewal fails the job
+- the renewal threshold, the backoff after a renewal that did not help (e.g. the server returned the
+  same proxy), and the check of the minimum remaining validity guaranteed by the PanDA server (72h)
 - the ALRB_CONT_PRESETUP export that lets a running payload see a renewed proxy
 - removal of job proxies from the work directory before the log tarball is created
 """
@@ -62,13 +64,14 @@ pilot_cache = get_pilot_cache()
 
 NOW = 1_800_000_000
 HOUR = 3600
-THRESHOLD = HOUR - 20 * 60  # renewal threshold used by check_time_left() for limit=1 (40 minutes)
+THRESHOLD = atlas_proxy.JOB_PROXY_RENEWAL_THRESHOLD
 
 
 def _clear_cache():
-    """Remove the job proxy entries from the arcproxy cache."""
+    """Remove the job proxy entries from the arcproxy cache, and any renewal backoff."""
     for proxy_id in ('payload', 'unified'):
         atlas_proxy.invalidate_proxy_cache(proxy_id)
+        atlas_proxy.clear_renewal_backoff(proxy_id)
 
 
 class _FakeQueuedata:
@@ -104,9 +107,18 @@ class _FakeJob:
 class TestReleaseGuards(unittest.TestCase):
     """The test-mode switches must be at their release defaults."""
 
-    def test_test_job_proxy_lifetime_is_disabled(self):
-        """_TEST_JOB_PROXY_LIFETIME in pilot/user/atlas/proxy.py must be 0 in a release."""
-        self.assertEqual(atlas_proxy._TEST_JOB_PROXY_LIFETIME, 0)
+    def test_test_job_proxy_renewal_is_disabled(self):
+        """_TEST_JOB_PROXY_RENEWAL in pilot/user/atlas/proxy.py must be False in a release."""
+        self.assertIs(atlas_proxy._TEST_JOB_PROXY_RENEWAL, False)
+
+    def test_renewal_constants_are_release_values(self):
+        """The agreed release values: renew below 24h, fail below 10 min, back off 1h, expect 72h from the server."""
+        self.assertEqual(atlas_proxy.JOB_PROXY_RENEWAL_THRESHOLD, 24 * HOUR)
+        self.assertEqual(atlas_proxy.JOB_PROXY_HARD_FLOOR, 600)
+        self.assertEqual(atlas_proxy.JOB_PROXY_RENEWAL_BACKOFF, HOUR)
+        self.assertEqual(atlas_proxy.JOB_PROXY_EXPECTED_LIFETIME, 72 * HOUR)
+        self.assertEqual(atlas_proxy.JOB_PROXY_LIFETIME_GRACE, 20 * 60)
+        self.assertEqual(atlas_proxy.TEST_JOB_PROXY_MARGIN, 300)
 
     def test_proxy_verification_time_is_default(self):
         """proxy_verification_time in pilot/util/default.cfg must be 600 in a release."""
@@ -343,19 +355,26 @@ class TestTestLifetime(unittest.TestCase):
         pilot_cache.proxy_validity_end = 0
 
     def test_disabled_by_default(self):
-        """With the switch at 0, nothing is clamped."""
+        """With the switch off, nothing is clamped."""
         with patch('pilot.user.atlas.proxy.time', return_value=NOW):
             self.assertEqual(atlas_proxy.apply_test_lifetime('payload', NOW + 96 * HOUR, NOW + 96 * HOUR),
                              (NOW + 96 * HOUR, NOW + 96 * HOUR))
 
+    def test_test_lifetime_is_relative_to_threshold(self):
+        """The clamp is the renewal threshold plus the margin, so a renewal follows each download after the margin."""
+        self.assertEqual(atlas_proxy.get_test_lifetime(), THRESHOLD + atlas_proxy.TEST_JOB_PROXY_MARGIN)
+        with patch.object(atlas_proxy, 'JOB_PROXY_RENEWAL_THRESHOLD', 12 * HOUR):
+            self.assertEqual(atlas_proxy.get_test_lifetime(), 12 * HOUR + atlas_proxy.TEST_JOB_PROXY_MARGIN)
+
     def test_clamps_job_proxies_only(self):
         """Job proxies are clamped, the pilot proxy never, and a shorter real validity is kept."""
-        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_LIFETIME', 2700), \
+        clamp = NOW + atlas_proxy.get_test_lifetime()
+        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_RENEWAL', True), \
              patch('pilot.user.atlas.proxy.time', return_value=NOW):
             self.assertEqual(atlas_proxy.apply_test_lifetime('unified', NOW + 96 * HOUR, NOW + 96 * HOUR),
-                             (NOW + 2700, NOW + 2700))
+                             (clamp, clamp))
             self.assertEqual(atlas_proxy.apply_test_lifetime('payload', NOW + 100, None), (NOW + 100, None))
-            self.assertEqual(atlas_proxy.apply_test_lifetime('payload', None, NOW + 96 * HOUR), (None, NOW + 2700))
+            self.assertEqual(atlas_proxy.apply_test_lifetime('payload', None, NOW + 96 * HOUR), (None, clamp))
             self.assertEqual(atlas_proxy.apply_test_lifetime('pilot', NOW + 96 * HOUR, NOW + 96 * HOUR),
                              (NOW + 96 * HOUR, NOW + 96 * HOUR))
             self.assertEqual(atlas_proxy.apply_test_lifetime(None, NOW + 96 * HOUR, NOW + 96 * HOUR),
@@ -364,13 +383,14 @@ class TestTestLifetime(unittest.TestCase):
     def test_verify_arcproxy_caches_clamped_validity(self):
         """The clamp must reach the cache (so the periodic check sees it) but not the pilot's validity."""
         end = NOW + 96 * HOUR
-        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_LIFETIME', 2700), \
+        clamp = NOW + atlas_proxy.get_test_lifetime()
+        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_RENEWAL', True), \
              patch('pilot.user.atlas.proxy.time', return_value=NOW), \
              patch('pilot.user.atlas.proxy.execute_nothreads', return_value=(0, 'a\nb', '')), \
              patch('pilot.user.atlas.proxy.interpret_proxy_info', return_value=(0, '', end, end)):
             exit_code, _ = atlas_proxy.verify_arcproxy('', 1, proxy_id='payload')
             self.assertEqual(exit_code, 0)
-            self.assertEqual(atlas_proxy.get_cache_entry('payload'), [NOW + 2700, NOW + 2700])
+            self.assertEqual(atlas_proxy.get_cache_entry('payload'), [clamp, clamp])
             atlas_proxy.verify_arcproxy('', 1, proxy_id='pilot')
             self.assertEqual(pilot_cache.proxy_validity_end, end)
             self.assertEqual(atlas_proxy.get_cache_entry('pilot'), [end, end])
@@ -608,6 +628,13 @@ class TestRenewJobProxy(unittest.TestCase):
                 result, _, _ = self._renew(self._fake_get_proxy(), self._fake_verify([-1, -1], verify_result))
                 self._assert_unchanged(result)
 
+    def test_diagnostics_only_failure_with_long_validity_is_discarded(self):
+        """A verification failing only through its diagnostics is a failure even if the cache claims a long validity."""
+        long_entry = [NOW + 96 * HOUR, NOW + 96 * HOUR]
+        result, _, _ = self._renew(self._fake_get_proxy(), self._fake_verify(long_entry, (0, 'all verifications failed')))
+        self._assert_unchanged(result)
+        self.assertIn('failed verification', result[1])
+
     def test_read_only_fallback_is_undone(self):
         """If get_proxy() wrote elsewhere and redirected X509_USER_PROXY, that must be undone."""
         stray = os.path.join(self.base, 'stray.proxy')
@@ -658,6 +685,299 @@ class TestRenewJobProxy(unittest.TestCase):
                     atlas_proxy.renew_job_proxy('payload', self.path)
             mock_check.assert_not_called()
             self.assertEqual(len(states), 3)
+
+
+class TestExpectedLifetime(unittest.TestCase):
+    """check_downloaded_lifetime(): the server guarantees at least 72h; a shorter proxy is reported but used."""
+
+    EXPECTED = atlas_proxy.JOB_PROXY_EXPECTED_LIFETIME - atlas_proxy.JOB_PROXY_LIFETIME_GRACE
+
+    def setUp(self):
+        """Start from an empty job proxy cache at a fixed time."""
+        _clear_cache()
+        self.time_patch = patch('pilot.user.atlas.proxy.time', return_value=NOW)
+        self.time_patch.start()
+
+    def tearDown(self):
+        """Stop the time patch and clear the cache."""
+        self.time_patch.stop()
+        _clear_cache()
+
+    def test_boundary(self):
+        """At the expected lifetime (with grace, inclusive) all is well; one second less is reported."""
+        atlas_proxy.set_cache_entry('payload', [NOW + 96 * HOUR, NOW + self.EXPECTED])
+        with patch.object(atlas_proxy.logger, 'warning') as mock_warning:
+            self.assertTrue(atlas_proxy.check_downloaded_lifetime('payload'))
+        mock_warning.assert_not_called()
+
+        atlas_proxy.set_cache_entry('payload', [NOW + self.EXPECTED - 1, NOW + 96 * HOUR])
+        with patch.object(atlas_proxy.logger, 'warning') as mock_warning:
+            self.assertFalse(atlas_proxy.check_downloaded_lifetime('payload'))
+        mock_warning.assert_called_once()
+        self.assertIn('payload', mock_warning.call_args.args[0])
+        self.assertIn('72h', mock_warning.call_args.args[0])
+
+    def test_unknown_validity_is_not_reported(self):
+        """No entry, or a failed verification, is not a lifetime problem."""
+        for entry in (None, [-1, -1]):
+            atlas_proxy.set_cache_entry('unified', entry)
+            with patch.object(atlas_proxy.logger, 'warning') as mock_warning:
+                self.assertTrue(atlas_proxy.check_downloaded_lifetime('unified'))
+            mock_warning.assert_not_called()
+
+    def test_skipped_in_test_mode(self):
+        """In test mode the validity is clamped, so it is not judged."""
+        atlas_proxy.set_cache_entry('payload', [NOW + 100, NOW + 100])
+        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_RENEWAL', True), \
+             patch.object(atlas_proxy.logger, 'warning') as mock_warning:
+            self.assertTrue(atlas_proxy.check_downloaded_lifetime('payload'))
+        mock_warning.assert_not_called()
+
+    def test_checked_after_job_proxy_download_only(self):
+        """get_and_verify_proxy() checks job proxies after a successful verification; never the pilot proxy."""
+        with patch('pilot.user.atlas.proxy.get_proxy', side_effect=lambda path, role: (True, path)), \
+             patch('pilot.user.atlas.proxy.verify_proxy', return_value=(0, '')), \
+             patch('pilot.user.atlas.proxy.check_downloaded_lifetime', return_value=False) as mock_check:
+            exit_code, _, _ = atlas_proxy.get_and_verify_proxy('/tmp/x509up_u1', voms_role='atlas',
+                                                               proxy_type='payload', workdir='/w')
+            self.assertEqual(exit_code, 0)  # a short proxy is still used
+            mock_check.assert_called_once_with('payload')
+            mock_check.reset_mock()
+            atlas_proxy.get_and_verify_proxy('/tmp/x509up_u1', voms_role='atlas')
+            mock_check.assert_not_called()
+        with patch('pilot.user.atlas.proxy.get_proxy', side_effect=lambda path, role: (True, path)), \
+             patch('pilot.user.atlas.proxy.verify_proxy', return_value=(errors.NOVOMSPROXY, 'bad')), \
+             patch('pilot.user.atlas.proxy.check_downloaded_lifetime') as mock_check:
+            atlas_proxy.get_and_verify_proxy('/tmp/x509up_u1', voms_role='atlas', proxy_type='unified', workdir='/w')
+        mock_check.assert_not_called()
+
+    def test_new_download_clears_backoff(self):
+        """A proxy downloaded at job start must not inherit a backoff from a previous job."""
+        atlas_proxy.set_renewal_backoff('payload')
+        with patch('pilot.user.atlas.proxy.get_proxy', side_effect=lambda path, role: (True, path)), \
+             patch('pilot.user.atlas.proxy.verify_proxy', return_value=(0, '')):
+            atlas_proxy.get_and_verify_proxy('/tmp/x509up_u1', voms_role='atlas', proxy_type='payload', workdir='/w')
+        self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 48 * HOUR))
+
+
+class TestRenewalBackoff(unittest.TestCase):
+    """is_renewal_backed_off(), set_renewal_backoff(), clear_renewal_backoff()."""
+
+    BACKOFF = atlas_proxy.JOB_PROXY_RENEWAL_BACKOFF
+    LAST_CHANCE = atlas_proxy.JOB_PROXY_HARD_FLOOR + atlas_proxy.JOB_PROXY_RENEWAL_BACKOFF
+
+    def setUp(self):
+        """Start without backoff."""
+        _clear_cache()
+
+    def tearDown(self):
+        """Leave without backoff."""
+        _clear_cache()
+
+    def test_not_backed_off_by_default(self):
+        """Without an earlier attempt, a renewal is never postponed."""
+        self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_backoff_expires(self):
+        """The backoff lasts exactly JOB_PROXY_RENEWAL_BACKOFF, and only for the given proxy."""
+        with patch('pilot.user.atlas.proxy.time', return_value=NOW):
+            atlas_proxy.set_renewal_backoff('payload')
+            self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+            self.assertFalse(atlas_proxy.is_renewal_backed_off('unified', 12 * HOUR))
+        with patch('pilot.user.atlas.proxy.time', return_value=NOW + self.BACKOFF - 1):
+            self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+        with patch('pilot.user.atlas.proxy.time', return_value=NOW + self.BACKOFF):
+            self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_no_backoff_close_to_the_floor(self):
+        """During the last backoff interval before the hard floor, every check attempts a renewal."""
+        with patch('pilot.user.atlas.proxy.time', return_value=NOW):
+            atlas_proxy.set_renewal_backoff('payload')
+            self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', self.LAST_CHANCE))
+            self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', self.LAST_CHANCE - 1))
+
+    def test_clear(self):
+        """Clearing the backoff allows the next attempt immediately (and is safe without backoff)."""
+        with patch('pilot.user.atlas.proxy.time', return_value=NOW):
+            atlas_proxy.set_renewal_backoff('payload')
+            atlas_proxy.clear_renewal_backoff('payload')
+            self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+            atlas_proxy.clear_renewal_backoff('payload')
+
+
+class TestCheckJobProxyBackoff(unittest.TestCase):
+    """check_job_proxy() and renew_job_proxy() respect the backoff."""
+
+    def setUp(self):
+        """Start from an empty cache at a fixed time, with a proxy below the threshold and a backoff in place."""
+        _clear_cache()
+        self.time_patch = patch('pilot.user.atlas.proxy.time', return_value=NOW)
+        self.time_patch.start()
+        atlas_proxy.set_renewal_backoff('payload')
+
+    def tearDown(self):
+        """Stop the time patch and clear the cache."""
+        self.time_patch.stop()
+        _clear_cache()
+
+    def test_backed_off_proxy_is_not_renewed(self):
+        """While backed off, the check neither renews nor fails."""
+        atlas_proxy.set_cache_entry('payload', [NOW + 12 * HOUR, NOW + 12 * HOUR])
+        with patch('pilot.user.atlas.proxy.renew_job_proxy') as mock_renew:
+            self.assertEqual(atlas_proxy.check_job_proxy('payload', '/w/p'), (0, ''))
+        mock_renew.assert_not_called()
+
+    def test_last_chance_ignores_backoff(self):
+        """Close to the floor the backoff is ignored, and a failure below the floor fails the job."""
+        failure = (errors.PAYLOADPROXYDOWNLOADFAILURE, 'same proxy')
+        atlas_proxy.set_cache_entry('payload', [NOW + 30 * 60, NOW + 30 * 60])
+        with patch('pilot.user.atlas.proxy.renew_job_proxy', return_value=failure) as mock_renew:
+            self.assertEqual(atlas_proxy.check_job_proxy('payload', '/w/p'), (0, ''))
+        mock_renew.assert_called_once()
+        atlas_proxy.set_cache_entry('payload', [NOW + 60, NOW + 60])
+        with patch('pilot.user.atlas.proxy.renew_job_proxy', return_value=failure):
+            self.assertEqual(atlas_proxy.check_job_proxy('payload', '/w/p')[0], errors.PAYLOADPROXYDOWNLOADFAILURE)
+
+    def test_renew_job_proxy_skips_when_backed_off(self):
+        """A renewal attempted by another thread while this one waited for the lock is not repeated."""
+        atlas_proxy.set_cache_entry('payload', [NOW + 12 * HOUR, NOW + 12 * HOUR])
+        with patch('pilot.user.atlas.proxy._renew_job_proxy') as mock_renew:
+            self.assertEqual(atlas_proxy.renew_job_proxy('payload', '/w/p'), (0, ''))
+        mock_renew.assert_not_called()
+        atlas_proxy.clear_renewal_backoff('payload')
+        with patch('pilot.user.atlas.proxy._renew_job_proxy', return_value=(0, '')) as mock_renew:
+            atlas_proxy.renew_job_proxy('payload', '/w/p')
+        mock_renew.assert_called_once_with('payload', '/w/p')
+
+
+class TestRenewalOutcome(unittest.TestCase):
+    """_renew_job_proxy(): a new proxy is only installed if it is valid longer; the backoff follows the outcome."""
+
+    OLD = 'old-proxy'
+    NEW = 'new-proxy'
+
+    def setUp(self):
+        """Create a work directory with a proxy in use that has 12h left."""
+        _clear_cache()
+        self.base = tempfile.mkdtemp()
+        self.path = os.path.join(self.base, 'x509up_u1-payload.proxy')
+        with open(self.path, 'w', encoding='utf-8') as _file:
+            _file.write(self.OLD)
+        pilot_cache.payload_proxy = self.path
+        self.old_end = NOW + 12 * HOUR
+        self.old_entry = [self.old_end, self.old_end]
+        atlas_proxy.set_cache_entry('payload', self.old_entry)
+        self.time_patch = patch('pilot.user.atlas.proxy.time', return_value=NOW)
+        self.time_patch.start()
+
+    def tearDown(self):
+        """Clean up."""
+        self.time_patch.stop()
+        shutil.rmtree(self.base, ignore_errors=True)
+        pilot_cache.payload_proxy = None
+        _clear_cache()
+
+    def _read(self):
+        with open(self.path, encoding='utf-8') as _file:
+            return _file.read()
+
+    def _renew(self, new_entry, get_result=True):
+        def fake_get_proxy(path, _role):
+            with open(path, 'w', encoding='utf-8') as _file:
+                _file.write(self.NEW)
+            return get_result, path
+
+        def fake_verify(proxy_id=None, **_kwargs):
+            if new_entry is not None:
+                atlas_proxy.set_cache_entry(proxy_id, new_entry)
+            return 0, ''
+
+        with patch('pilot.user.atlas.proxy.get_proxy', side_effect=fake_get_proxy), \
+             patch('pilot.user.atlas.proxy.verify_proxy', side_effect=fake_verify), \
+             patch('pilot.user.atlas.proxy.check_downloaded_lifetime') as mock_lifetime:
+            result = atlas_proxy._renew_job_proxy('payload', self.path)
+        return result, mock_lifetime
+
+    def _assert_kept(self, result):
+        self.assertEqual(result[0], errors.PAYLOADPROXYDOWNLOADFAILURE)
+        self.assertEqual(self._read(), self.OLD)
+        self.assertFalse(os.path.exists(self.path + '.tmp'))
+        self.assertEqual(atlas_proxy.get_cache_entry('payload'), self.old_entry)
+
+    def test_same_proxy_is_not_installed(self):
+        """The server returning the same proxy (same validity end) keeps the current one and backs off."""
+        result, mock_lifetime = self._renew([self.old_end, self.old_end])
+        self._assert_kept(result)
+        self.assertIn('not valid longer', result[1])
+        self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+        mock_lifetime.assert_called_once_with('payload')
+
+    def test_shorter_proxy_is_not_installed(self):
+        """A proxy ending earlier than the current one is discarded."""
+        result, _ = self._renew([self.old_end - 1, NOW + 96 * HOUR])
+        self._assert_kept(result)
+        self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_unknown_validity_is_not_installed(self):
+        """A new proxy without a cached validity would disable further renewals, so it is discarded."""
+        result, _ = self._renew(None)
+        self._assert_kept(result)
+        self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_longer_proxy_still_below_threshold_is_installed_with_backoff(self):
+        """A proxy valid one second longer is better and installed, but the next attempt is postponed."""
+        result, _ = self._renew([self.old_end + 1, self.old_end + 1])
+        self.assertEqual(result, (0, ''))
+        self.assertEqual(self._read(), self.NEW)
+        self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_proxy_at_threshold_clears_backoff(self):
+        """A proxy valid for at least the threshold solves the problem: any earlier backoff is cleared."""
+        atlas_proxy.set_renewal_backoff('payload')
+        result, _ = self._renew([NOW + THRESHOLD, NOW + THRESHOLD])
+        self.assertEqual(result, (0, ''))
+        self.assertEqual(self._read(), self.NEW)
+        self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+        # just below the threshold, the backoff is (re)set
+        atlas_proxy.set_cache_entry('payload', self.old_entry)
+        self._renew([NOW + THRESHOLD - 1, NOW + THRESHOLD - 1])
+        self.assertTrue(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+
+    def test_download_failure_is_retried_at_next_check(self):
+        """A failed download is not a reason to back off (e.g. a transient server problem)."""
+        result, mock_lifetime = self._renew([NOW + 96 * HOUR, NOW + 96 * HOUR], get_result=False)
+        self._assert_kept(result)
+        self.assertFalse(atlas_proxy.is_renewal_backed_off('payload', 12 * HOUR))
+        mock_lifetime.assert_not_called()
+
+
+class TestTestModeCadence(unittest.TestCase):
+    """In test mode, a renewal is due TEST_JOB_PROXY_MARGIN seconds after each download."""
+
+    def setUp(self):
+        """Start from an empty cache."""
+        _clear_cache()
+
+    def tearDown(self):
+        """Clear the cache."""
+        _clear_cache()
+
+    def test_renewal_follows_download_after_margin(self):
+        """The clamped validity is not due at the margin (inclusive) but one second later."""
+        end = NOW + 96 * HOUR
+        margin = atlas_proxy.TEST_JOB_PROXY_MARGIN
+        with patch.object(atlas_proxy, '_TEST_JOB_PROXY_RENEWAL', True), \
+             patch('pilot.user.atlas.proxy.execute_nothreads', return_value=(0, 'a\nb', '')), \
+             patch('pilot.user.atlas.proxy.interpret_proxy_info', return_value=(0, '', end, end)):
+            with patch('pilot.user.atlas.proxy.time', return_value=NOW):
+                self.assertEqual(atlas_proxy.verify_arcproxy('', 1, proxy_id='payload'), (0, ''))
+            with patch('pilot.user.atlas.proxy.renew_job_proxy', return_value=(0, '')) as mock_renew:
+                with patch('pilot.user.atlas.proxy.time', return_value=NOW + margin):
+                    atlas_proxy.check_job_proxy('payload', '/w/p')
+                mock_renew.assert_not_called()
+                with patch('pilot.user.atlas.proxy.time', return_value=NOW + margin + 1):
+                    atlas_proxy.check_job_proxy('payload', '/w/p')
+                mock_renew.assert_called_once()
 
 
 class TestMonitoringJobProxy(unittest.TestCase):
@@ -847,16 +1167,17 @@ class TestAlrbPresetup(unittest.TestCase):
         self.assertFalse(os.path.exists(self.script))
 
     def test_update_for_user_proxy_adds_presetup_before_setup(self):
-        """The export comes before the rest of the setup (i.e. before setupATLAS)."""
+        """A job proxy: X509_USER_PROXY is unset (ALRB copies nothing) and the presetup comes before setupATLAS."""
         pilot_cache.payload_proxy = self.proxy
         env = {'X509_USER_PROXY': '/tmp/x509up_u1', 'X509_UNIFIED_DISPATCH': '', 'ALRB_CONT_PRESETUP': ''}
         with patch.dict('os.environ', env, clear=False):
             _, _, setup_cmd, _ = update_for_user_proxy('source atlasLocalSetup.sh', 'payload', is_analysis=True,
                                                        queue_type='production', workdir=self.workdir)
-            self.assertEqual(setup_cmd, f'export X509_USER_PROXY={self.proxy};{self.EXPORT}source atlasLocalSetup.sh')
+            self.assertEqual(setup_cmd, f'unset X509_USER_PROXY;{self.EXPORT}source atlasLocalSetup.sh')
+            # production job: the pilot's own proxy is still exported (and copied by ALRB)
             _, _, setup_cmd, _ = update_for_user_proxy('setup', 'payload', is_analysis=False,
                                                        queue_type='production', workdir=self.workdir)
-            self.assertNotIn('ALRB_CONT_PRESETUP', setup_cmd)
+            self.assertEqual(setup_cmd, 'export X509_USER_PROXY=/tmp/x509up_u1;setup')
 
     def test_update_for_user_proxy_unified(self):
         """On unified dispatch queues, the user proxy in the work directory gets the export."""
