@@ -98,6 +98,8 @@ from pilot.util.constants import (
     PILOT_MULTIJOB_START_TIME,
     PILOT_PRE_GETJOB,
     PILOT_POST_GETJOB,
+    PILOT_PRE_FINAL_UPDATE,
+    PILOT_POST_FINAL_UPDATE,
     PILOT_KILL_SIGNAL,
     LOG_TRANSFER_NOT_DONE,
     LOG_TRANSFER_IN_PROGRESS,
@@ -159,6 +161,7 @@ from pilot.util.queuehandling import (
     scan_for_jobs,
 )
 from pilot.util.realtimelogger import cleanup as rtcleanup
+from pilot.util.telemetry import handle_pilot_telemetry
 from pilot.util.timing import (
     add_to_pilot_timing,
     get_postgetjob_time,
@@ -4063,10 +4066,16 @@ def update_server(job: Any, args: Any) -> None:
             if new_metadata is not None:
                 metadata = new_metadata
 
+    add_to_pilot_timing(job.jobid, PILOT_PRE_FINAL_UPDATE, time.time(), args)
     if job.fileinfo:
-        send_state(job, args, job.state, xml=dumps(job.fileinfo), metadata=metadata)
+        accepted = send_state(job, args, job.state, xml=dumps(job.fileinfo), metadata=metadata)
     else:
-        send_state(job, args, job.state, metadata=metadata)
+        accepted = send_state(job, args, job.state, metadata=metadata)
+    add_to_pilot_timing(job.jobid, PILOT_POST_FINAL_UPDATE, time.time(), args)
+
+    # job.completed was False on entry (see above), so it being set now means that this call was the accepted final
+    # update. The telemetry is therefore sent at most once per job
+    handle_pilot_telemetry(job, args, accepted)
 
 
 def pause_queue_monitor(delay: int) -> None:
