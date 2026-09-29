@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-# import time  # uncomment together with the server call in send_pilot_telemetry()
+import time
 from typing import Any
 
 from pilot.util.constants import (
@@ -77,7 +77,7 @@ from pilot.util.constants import (
     PILOT_START_TIME,
     get_pilot_version,
 )
-# from pilot.util.https import send_update  # uncomment together with the server call in send_pilot_telemetry()
+from pilot.util.https import send_update
 
 logger = logging.getLogger(__name__)
 
@@ -384,11 +384,11 @@ def send_pilot_telemetry(job: Any, args: Any) -> None:
 
         # To be enabled once the server endpoint is available (also uncomment the two imports at the top).
         # send_update() gzips the body (with Content-Encoding: gzip) via request2(), with a curl fallback.
-        # time_before = time.time()
-        # result = send_update(PILOT_ATTRIBUTES_ENDPOINT, body, args.url, args.port, job=None,
-        #                      ipv=args.internet_protocol_version, max_attempts=1)
-        # logger.info(f'pilot telemetry sent to {PILOT_ATTRIBUTES_ENDPOINT} in {time.time() - time_before:.1f} s: '
-        #             f'ok={result.ok}, message={result.message!r}')
+        time_before = time.time()
+        result = send_update(PILOT_ATTRIBUTES_ENDPOINT, body, args.url, args.port, job=None,
+                             ipv=args.internet_protocol_version, max_attempts=1)
+        logger.info(f'pilot telemetry sent to {PILOT_ATTRIBUTES_ENDPOINT} in {time.time() - time_before:.1f} s: '
+                    f'ok={result.ok}, message={result.message!r}')
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.warning(f'failed to send pilot telemetry: {exc}')
 
