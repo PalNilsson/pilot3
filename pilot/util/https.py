@@ -87,6 +87,7 @@ from typing import (
 )
 
 from pilot.common.errorcodes import ErrorCodes
+from pilot.common.pilotcache import get_pilot_cache
 
 # JobData is only referenced in type annotations. The TYPE_CHECKING guard means
 # this import is evaluated by static analysis tools and Sphinx but never executed
@@ -111,6 +112,17 @@ from .filehandling import (  # pylint: disable=wrong-import-position
 
 logger = logging.getLogger(__name__)
 errors = ErrorCodes()
+pilot_cache = get_pilot_cache()
+
+# Appended to the error string returned by request2() when the PanDA server rejected the
+# authentication (and no X.509 failover rescued the request). Callers use is_token_rejection()
+# to recognise it, e.g. to skip the curl fallback, which would only resend the same token.
+TOKEN_REJECTED = "authentication rejected by server"
+
+# >>> X509-PROBE-TEMPORARY: remove once X.509 acceptance has been verified
+# Installed by pilot.util.x509probe.install_update_job_probe() (a hook, so that this module does not import the probe)
+UPDATE_JOB_PROBE = {"function": None}
+# <<< X509-PROBE-TEMPORARY
 
 _ctx = namedtuple('_ctx', 'ssl_context user_agent capath cacert')
 _ctx.ssl_context = None
@@ -396,7 +408,6 @@ def request(url: str,
             logger.debug("request(): cacert is a GSI proxy - suppressing --cert/--key in curl call")
 
         _, _auth_origin = get_local_oidc_token_info()
-
         res = send_request_with_token_via_curl_config(
             url=url,
             payload=data,
@@ -1356,6 +1367,32 @@ def make_cacert_with_server_cert(host: str, port: int, orig_cacert: str, out_dir
     return new_cacert
 
 
+def _send_request2(path: str, update_function: str, data: dict) -> Any:
+    """Send a PanDA server request with request2(), catching any exception.
+
+    Args:
+        path: Full server URL of the endpoint.
+        update_function: Endpoint path, e.g. ``'api/v1/pilot/update_job'``.
+        data: Payload dict.
+
+    Returns:
+        The return value of :func:`request2`, or ``None`` on an exception.
+    """
+    # >>> X509-PROBE-TEMPORARY: remove this block (and pilot/util/x509probe.py) once X.509 acceptance has been verified
+    probe = UPDATE_JOB_PROBE["function"]
+    if callable(probe):
+        res = probe(path, update_function, data)  # pylint: disable=not-callable
+        if res is not None:
+            return res
+    # <<< X509-PROBE-TEMPORARY
+
+    try:
+        return request2(f'{path}', json_body=data, panda=True)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f'exception caught in https.request2(): {exc}')
+        return None
+
+
 def send_request(pandaserver: str, update_function: str, data: dict, job: JobData, ipv: str) -> dict | None:
     """Send a single request to the PanDA server and return the response.
 
@@ -1384,11 +1421,15 @@ def send_request(pandaserver: str, update_function: str, data: dict, job: JobDat
         path = f'{pandaserver}/server/panda/{update_function}'
 
     logger.debug(f"update_function = {update_function}, path = {path}")
+
     # first try the new request2 method based on urllib. If that fails, revert to the old request method using curl
-    try:
-        res = request2(f'{path}', json_body=data, panda=True)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.warning(f'exception caught in https.request2(): {exc}')
+    res = _send_request2(path, update_function, data)
+
+    # The server rejected the authentication (and any X.509 failover failed). The curl fallback
+    # would only resend the same token, so it is skipped.
+    if is_token_rejection(res):
+        logger.warning(f'request2() failed since the server rejected the authentication (curl fallback skipped): {res}')
+        return None
 
     # A non-empty error string from request2() is a transport failure, not a
     # successful response.  Treat it the same as None so the curl fallback fires.
@@ -1988,10 +2029,9 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
         logger.debug('calling https_setup to ensure SSL context is configured')
         https_setup(None, get_pilot_version())
 
-    # Determine OIDC usage
-    auth_token_name, auth_origin = get_local_oidc_token_info()
-    use_oidc_token = bool(auth_token_name and auth_origin and panda)
-    logger.info("will use OIDC token authentication" if use_oidc_token else "will not use OIDC token authentication")
+    # Determine OIDC usage (x509_mode: the token is configured but X.509 is used instead, see _select_auth())
+    auth_token_name, auth_origin, use_oidc_token, x509_mode = _select_auth(panda)
+    token_configured = use_oidc_token or x509_mode
 
     auth_token_content = ""
     if use_oidc_token:
@@ -2083,6 +2123,11 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
         except Exception:  # pylint: disable=broad-exception-caught
             code_int = 0
 
+        # the server rejected the authentication of a PanDA server request
+        if token_configured and is_token_auth_failure(code_int, body):
+            failure = f"failed to send request: HTTP Error {code}: {reason} ({TOKEN_REJECTED})"
+            return _handle_auth_rejection(req, data_bytes, x509_mode, failure, secure)
+
         if 500 <= code_int < 600 and json_body is not None and compressed:
             logger.info("server returned 5xx -> retrying once without gzip compression")
             try:
@@ -2106,11 +2151,205 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
         logger.warning(ret)
         return ret
 
+    # any response means that the server accepted the authentication
+    if token_configured:
+        pilot_cache.token_rejected = False
+
     # Parse textual response into dict when possible
     if secure and isinstance(ret_text, str):
         return _parse_response_text(ret_text)
 
     return ret_text
+
+
+def _select_auth(panda: bool) -> tuple[str | None, str | None, bool, bool]:
+    """Select the authentication for a request and log the choice.
+
+    The OIDC token is used for PanDA server requests when a token and origin are configured.
+    Once the server has rejected the token and an X.509 retry succeeded, X.509 is used instead
+    until a newer token has been downloaded (see :func:`_retry_with_x509`).
+
+    Args:
+        panda: ``True`` for PanDA server requests.
+
+    Returns:
+        A tuple ``(auth_token_name, auth_origin, use_oidc_token, x509_mode)`` where *x509_mode*
+        is ``True`` when X.509 replaces a configured token.
+    """
+    auth_token_name, auth_origin = get_local_oidc_token_info()
+    use_oidc_token = bool(auth_token_name and auth_origin and panda)
+    x509_mode = use_oidc_token and pilot_cache.token_x509_mode and x509_failover_available()
+    if x509_mode:
+        use_oidc_token = False
+        logger.info("will use X.509 authentication (the OIDC token was rejected by the server earlier)")
+    else:
+        logger.info("will use OIDC token authentication" if use_oidc_token else "will not use OIDC token authentication")
+
+    return auth_token_name, auth_origin, use_oidc_token, x509_mode
+
+
+def _handle_auth_rejection(req: urllib.request.Request, data_bytes: bytes | None, x509_mode: bool,
+                           failure: str, secure: bool) -> str | dict[str, Any]:
+    """Handle a PanDA server request whose authentication was rejected.
+
+    A rejected token is followed by an X.509 retry. A rejected X.509 request (in X.509 mode)
+    ends X.509 mode, so that the next request tries the token again.
+
+    Args:
+        req: The rejected request.
+        data_bytes: The request body that was sent.
+        x509_mode: ``True`` if the request used X.509 in place of a configured token.
+        failure: Error string to return when the request cannot be rescued.
+        secure: If ``True``, parse a successful response text into a dict where possible.
+
+    Returns:
+        The response of a successful X.509 retry, otherwise *failure*.
+    """
+    if x509_mode:
+        logger.warning("the server rejected the X.509 authentication - will try the OIDC token again for the next request")
+        pilot_cache.token_x509_mode = False
+        pilot_cache.token_rejected = True
+        return failure
+
+    return _retry_with_x509(req, data_bytes, failure, secure)
+
+
+def is_token_auth_failure(code: int, body: str) -> bool:
+    """Return ``True`` if an HTTP error means that the server rejected the request's authentication.
+
+    A 401 is always an authentication failure. A 403 is only treated as one when the response
+    body refers to the token, e.g. ``ERROR : Token authentication failed. Invalid token.
+    Signature has expired`` (PanDA ID 7367714395), so that a 403 for an unrelated reason does
+    not trigger an authentication failover.
+
+    Args:
+        code: HTTP status code.
+        body: Response body (may be empty).
+
+    Returns:
+        ``True`` for an authentication failure, ``False`` otherwise.
+    """
+    if code == 401:
+        return True
+    return code == 403 and "token" in (body or "").lower()
+
+
+def is_token_rejection(res: Any) -> bool:
+    """Return ``True`` if *res* is the error string request2() returns for a rejected authentication.
+
+    Args:
+        res: Return value from :func:`request2`.
+
+    Returns:
+        ``True`` if the server rejected the authentication, ``False`` otherwise.
+    """
+    return isinstance(res, str) and TOKEN_REJECTED in res
+
+
+def x509_failover_available(min_lifetime: int = 0) -> bool:
+    """Return ``True`` if the pilot's X.509 proxy can be used instead of the OIDC token.
+
+    The proxy is the one resolved at pilot startup (``_ctx.cacert``), which is the pilot's own
+    proxy also when a payload proxy is used. Its lifetime is taken from the proxy verification
+    cache when available; if the proxy has not been verified, an existing proxy file is assumed
+    to be usable.
+
+    Args:
+        min_lifetime: Minimum remaining proxy lifetime in seconds.
+
+    Returns:
+        ``True`` if the proxy exists and (if known) outlasts *min_lifetime*, ``False`` otherwise.
+    """
+    proxy = getattr(_ctx, "cacert", None)
+    if not proxy or not os.path.isfile(proxy):
+        return False
+
+    if pilot_cache.proxy_validity_end:
+        return pilot_cache.proxy_validity_end - int(time()) >= min_lifetime
+
+    return True
+
+
+def send_x509_request(url: str, data_bytes: bytes | None = None, headers: dict[str, str] | None = None,
+                      method: str = "GET") -> tuple[bool, str]:
+    """Send a request authenticated with the pilot's X.509 proxy (mutual TLS) and no token.
+
+    Any ``Authorization`` and ``Origin`` headers are removed, since the PanDA server
+    authenticates with the token whenever an ``Authorization`` header is present.
+
+    Args:
+        url: Full URL, including query parameters.
+        data_bytes: Request body (already encoded, possibly gzipped), or ``None``.
+        headers: Request headers; ``Content-Encoding`` must match *data_bytes*.
+        method: HTTP method.
+
+    Returns:
+        A tuple ``(ok, text)`` where *text* is the response body when *ok* is ``True``,
+        and an error description otherwise.
+    """
+    proxy = getattr(_ctx, "cacert", None)
+    if not proxy or not os.path.isfile(proxy):
+        return False, "no X.509 proxy available"
+
+    # header names are compared case-insensitively since urllib normalises them (e.g. 'User-agent')
+    _headers = {key: value for key, value in (headers or {}).items() if key.lower() not in {"authorization", "origin"}}
+    if not any(key.lower() == "user-agent" for key in _headers):
+        _headers["User-Agent"] = _ctx.user_agent
+
+    ssl_context = _get_ssl_context(False)
+    try:
+        ssl_context.load_cert_chain(certfile=proxy, keyfile=proxy)
+    except (ssl.SSLError, OSError) as exc:
+        return False, f"failed to load X.509 proxy {proxy}: {exc}"
+
+    req = urllib.request.Request(url, data=data_bytes, headers=_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=config.Pilot.http_maxtime) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # pylint: disable=broad-exception-caught
+            body = "<no body available>"
+        return False, f"HTTP Error {exc.code}: {exc.reason}. Server response body: {body[:512]}"
+    except OSError as exc:  # includes URLError, RemoteDisconnected, TimeoutError and SSLError
+        return False, f"{exc}"
+
+    return True, text
+
+
+def _retry_with_x509(req: urllib.request.Request, data_bytes: bytes | None, failure: str, secure: bool) -> str | dict[str, Any]:
+    """Resend a PanDA server request with X.509 authentication after the server rejected the token.
+
+    On success, X.509 is used directly for subsequent PanDA server requests until a newer token
+    has been downloaded (see :mod:`pilot.util.tokenlifetime`).
+
+    Args:
+        req: The request that was rejected (URL, method and headers are reused).
+        data_bytes: The request body that was sent.
+        failure: Error string to return if the failover is not possible or fails.
+        secure: If ``True``, parse the response text into a dict where possible.
+
+    Returns:
+        The parsed response on success, otherwise *failure*.
+    """
+    if not x509_failover_available():
+        logger.warning("the server rejected the OIDC token and no X.509 proxy is available for a failover")
+        pilot_cache.token_rejected = True
+        return failure
+
+    logger.warning("the server rejected the OIDC token - will retry the request with X.509 authentication")
+    ok, text = send_x509_request(req.full_url, data_bytes, dict(req.header_items()), req.get_method())
+    if not ok:
+        logger.warning(f"X.509 failover failed: {text}")
+        pilot_cache.token_rejected = True
+        return failure
+
+    logger.info("X.509 failover succeeded - will use X.509 for PanDA server requests until a newer token has been downloaded")
+    pilot_cache.token_x509_mode = True
+    pilot_cache.token_rejected = False
+
+    return _parse_response_text(text) if secure else text
 
 
 def install_ipv4_opener() -> None:
@@ -2301,12 +2540,69 @@ def download_file(url: str, timeout: int = 20, headers: dict = None) -> str:
     return content
 
 
+def get_token_refresh_command(url: str, port: int) -> str:
+    """Return the server command used to download a new OIDC token.
+
+    The token key is read from the file named by the ``PANDA_AUTH_TOKEN_KEY`` environment
+    variable and added to the URL together with the client name.
+
+    Args:
+        url: PanDA server base URL.
+        port: PanDA server port.
+
+    Returns:
+        The full ``api/v1/creds/get_access_token`` URL, or an empty string if the token key is
+        not available.
+    """
+    token_key = os.environ.get("PANDA_AUTH_TOKEN_KEY")
+    if not token_key:
+        logger.warning("PANDA_AUTH_TOKEN_KEY is not set - will not be able to download a new token")
+        return ""
+
+    panda_token_key = get_auth_token_content(token_key, key=True)
+    if not panda_token_key:
+        logger.warning("failed to get panda_token_key - will not be able to download a new token")
+        return ""
+
+    logger.info(f"read token key: {token_key}")
+    server_command = get_server_command(url, port, cmd="api/v1/creds/get_access_token")
+
+    # the client name and token key should be added to the URL as parameters
+    return f"{server_command}?client_name=pilot_server&token_key={panda_token_key}"
+
+
+def download_token_with_x509(server_command: str) -> str:
+    """Download a new OIDC token authenticating with the pilot's X.509 proxy instead of the token.
+
+    Used when the token itself can no longer authenticate the refresh request, e.g. once it has
+    expired (the refresh request is otherwise rejected with 403, as for PanDA ID 7367714395).
+
+    Args:
+        server_command: Full ``get_access_token`` URL (see :func:`get_token_refresh_command`).
+
+    Returns:
+        The response text, or an empty string on failure.
+    """
+    if not x509_failover_available():
+        logger.warning("no X.509 proxy available - cannot download a new token with X.509 authentication")
+        return ""
+
+    logger.info("will download a new token with X.509 authentication")
+    ok, text = send_x509_request(server_command, headers=get_headers(False, content_type=None))
+    if not ok:
+        logger.warning(f"failed to download a new token with X.509 authentication: {text}")
+        return ""
+
+    return text
+
+
 def refresh_oidc_token(auth_token: str, auth_origin: str, url: str, port: int) -> bool:
     """Refresh the OIDC access token by downloading a replacement from the PanDA server.
 
-    Reads the token key from the ``PANDA_AUTH_TOKEN_KEY`` environment variable,
-    authenticates the refresh request with the current token content, and
-    overwrites the existing token file via :func:`handle_file_content`.
+    The refresh request is authenticated with the current token. If that fails (e.g. because
+    the token has expired, or the token cannot be read), the request is repeated with X.509
+    authentication. The downloaded token overwrites the existing token file via
+    :func:`handle_file_content`.
 
     Args:
         auth_token: Path or filename of the local token file to overwrite.
@@ -2318,34 +2614,26 @@ def refresh_oidc_token(auth_token: str, auth_origin: str, url: str, port: int) -
         ``True`` if a new token was downloaded and stored successfully,
         ``False`` otherwise.
     """
-    # first get the token key
-    token_key = os.environ.get("PANDA_AUTH_TOKEN_KEY")
-    if not token_key:
-        logger.warning("PANDA_AUTH_TOKEN_KEY is not set - will not be able to download a new token")
+    server_command = get_token_refresh_command(url, port)
+    if not server_command:
         return False
-
-    panda_token_key = get_auth_token_content(token_key, key=True)
-    if not panda_token_key:
-        logger.warning("failed to get panda_token_key - will not be able to download a new token")
-        return False
-
-    logger.info(f"read token key: {token_key}")
+    logger.info(f"server_command: {server_command}")
 
     # now get the actual token content (used to authenticate the refresh call)
+    content = ""
     auth_token_content = get_auth_token_content(auth_token)
-    if not auth_token_content:
+    if auth_token_content:
+        headers = get_headers(True, auth_token_content, auth_origin, content_type=None)
+        content = download_file(server_command, headers=headers)
+        if not content:
+            logger.warning(f'failed to download data from "{url}" resource')
+    else:
         logger.warning(f"failed to get auth token content for {auth_token}")
-        return False
 
-    headers = get_headers(True, auth_token_content, auth_origin, content_type=None)
-    server_command = get_server_command(url, port, cmd="api/v1/creds/get_access_token")
-
-    # the client name and token key should be added to the URL as parameters
-    server_command += f"?client_name=pilot_server&token_key={panda_token_key}"
-    logger.info(f"server_command: {server_command}")
-    content = download_file(server_command, headers=headers)
+    # the token could not authenticate the refresh (e.g. it has expired) - try X.509 instead
     if not content:
-        logger.warning(f'failed to download data from "{url}" resource')
+        content = download_token_with_x509(server_command)
+    if not content:
         return False
 
     return handle_file_content(content, auth_token)
@@ -2523,7 +2811,7 @@ def handle_file_content(content: bytes | str, auth_token: str) -> bool:
     return _atomic_write_token(token, auth_token)
 
 
-def update_local_oidc_token_info(url: str, port: int) -> None:
+def update_local_oidc_token_info(url: str, port: int) -> bool:
     """Refresh the local OIDC token if one is configured.
 
     Reads the current token info via :func:`get_local_oidc_token_info` and,
@@ -2532,27 +2820,60 @@ def update_local_oidc_token_info(url: str, port: int) -> None:
     token's subject, claims and validity window are logged via
     :func:`decode_jwt_payload`.
 
+    Note: the refresh schedule is handled by :func:`pilot.util.tokenlifetime.refresh_token`,
+    which wraps this function.
+
     Args:
         url: PanDA server base URL.
         port: PanDA server port.
+
+    Returns:
+        ``True`` if the token was refreshed, ``False`` otherwise (including when no token is configured).
     """
     auth_token, auth_origin = get_local_oidc_token_info()
-    if auth_token and auth_origin:
-        logger.debug('updating OIDC token info')
-        status = refresh_oidc_token(auth_token, auth_origin, url, port)
-        if not status:
-            logger.warning('failed to refresh OIDC token')
-        else:
-            logger.info('OIDC token has been refreshed')
-
-            # print out the token expiry time and issue time
-            path = locate_token(auth_token)
-            try:
-                _ = decode_jwt_payload(path, return_times=True)
-            except ValueError as exc:
-                logger.warning(f'failed to decode JWT payload: {exc}')
-    else:
+    if not (auth_token and auth_origin):
         logger.debug('no OIDC token info to update')
+        return False
+
+    logger.debug('updating OIDC token info')
+    status = refresh_oidc_token(auth_token, auth_origin, url, port)
+    if not status:
+        logger.warning('failed to refresh OIDC token')
+        return False
+
+    logger.info('OIDC token has been refreshed')
+
+    # print out the token expiry time and issue time
+    path = locate_token(auth_token)
+    try:
+        _ = decode_jwt_payload(path, return_times=True)
+    except ValueError as exc:
+        logger.warning(f'failed to decode JWT payload: {exc}')
+
+    return True
+
+
+def get_token_expiry() -> int | None:
+    """Return the expiry time of the local OIDC token, without logging its claims.
+
+    Returns:
+        The ``exp`` claim as epoch seconds, or ``None`` if no token is configured, the token
+        cannot be found or decoded, or it carries no usable ``exp`` claim.
+    """
+    auth_token, _ = get_local_oidc_token_info()
+    if not auth_token:
+        return None
+
+    path = locate_token(auth_token)
+    if not path:
+        return None
+
+    try:
+        payload = decode_jwt_payload(path, return_times=False)
+        return int(float(payload["exp"]))
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        logger.debug(f'token expiry not available: {exc}')
+        return None
 
 
 # Claims inspected to establish the token's subject, in the order in which they are tried.
