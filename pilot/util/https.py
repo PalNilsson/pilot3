@@ -119,11 +119,6 @@ pilot_cache = get_pilot_cache()
 # to recognise it, e.g. to skip the curl fallback, which would only resend the same token.
 TOKEN_REJECTED = "authentication rejected by server"
 
-# >>> X509-PROBE-TEMPORARY: remove once X.509 acceptance has been verified
-# Installed by pilot.util.x509probe.install_update_job_probe() (a hook, so that this module does not import the probe)
-UPDATE_JOB_PROBE = {"function": None}
-# <<< X509-PROBE-TEMPORARY
-
 _ctx = namedtuple('_ctx', 'ssl_context user_agent capath cacert')
 _ctx.ssl_context = None
 _ctx.user_agent = "Pilot3"  # default value (must be string not None)
@@ -1367,25 +1362,16 @@ def make_cacert_with_server_cert(host: str, port: int, orig_cacert: str, out_dir
     return new_cacert
 
 
-def _send_request2(path: str, update_function: str, data: dict) -> Any:
+def _send_request2(path: str, data: dict) -> Any:
     """Send a PanDA server request with request2(), catching any exception.
 
     Args:
         path: Full server URL of the endpoint.
-        update_function: Endpoint path, e.g. ``'api/v1/pilot/update_job'``.
         data: Payload dict.
 
     Returns:
         The return value of :func:`request2`, or ``None`` on an exception.
     """
-    # >>> X509-PROBE-TEMPORARY: remove this block (and pilot/util/x509probe.py) once X.509 acceptance has been verified
-    probe = UPDATE_JOB_PROBE["function"]
-    if callable(probe):
-        res = probe(path, update_function, data)  # pylint: disable=not-callable
-        if res is not None:
-            return res
-    # <<< X509-PROBE-TEMPORARY
-
     try:
         return request2(f'{path}', json_body=data, panda=True)
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -1423,7 +1409,7 @@ def send_request(pandaserver: str, update_function: str, data: dict, job: JobDat
     logger.debug(f"update_function = {update_function}, path = {path}")
 
     # first try the new request2 method based on urllib. If that fails, revert to the old request method using curl
-    res = _send_request2(path, update_function, data)
+    res = _send_request2(path, data)
 
     # The server rejected the authentication (and any X.509 failover failed). The curl fallback
     # would only resend the same token, so it is skipped.

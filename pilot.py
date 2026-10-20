@@ -94,10 +94,6 @@ from pilot.util.tokenlifetime import (  # pylint: disable=wrong-import-position
     apply_token_exit_code,
     refresh_token,
 )
-from pilot.util.x509probe import (  # noqa: E402  # pylint: disable=wrong-import-position  # X509-PROBE-TEMPORARY
-    install_update_job_probe,
-    probe_token_download,
-)
 from pilot.util.workernode import (
     get_node_name,
     get_workernode_map,
@@ -198,11 +194,6 @@ def main() -> int:  # noqa: C901
     else:
         # also schedules the next refresh from the token's expiry (exceptions are handled inside)
         refresh_token(args.url, args.port)
-
-    # >>> X509-PROBE-TEMPORARY: remove these calls once X.509 acceptance has been verified
-    probe_token_download(args.url, args.port)
-    install_update_job_probe()
-    # <<< X509-PROBE-TEMPORARY
 
     # create and report the worker node map
     # note: the worker node map will always be created, but only sent to the server
