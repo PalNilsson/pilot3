@@ -18,7 +18,7 @@
 # Authors:
 # - Alexey Anisenkov, alexey.anisenkov@cern.ch, 2017
 # - Pavlo Svirin, pavlo.svirin@cern.ch, 2018
-# - Paul Nilsson, paul.nilsson@cern.ch, 2018-25
+# - Paul Nilsson, paul.nilsson@cern.ch, 2018-26
 
 """Rucio tracing report.
 
@@ -79,7 +79,44 @@ from pilot.util.https import (
     extract_protocol,
     request2
 )
+from pilot.util.networking import (
+    get_host_ip,
+    get_local_ip
+)
+
 logger = logging.getLogger(__name__)
+
+
+def get_host_identity(hostname: str) -> tuple[str, str]:
+    """Return the full host name and IP address to put in the trace report.
+
+    The host name is looked up with ``socket.gethostbyaddr()``; if that fails,
+    the given name is reported as is. The IP address is resolved for both IPv4
+    and IPv6 (IPv4 preferred); if the name does not resolve, e.g. a Kubernetes
+    pod name without a DNS entry, the address of the outgoing network
+    interface is used instead, and ``0.0.0.0`` only if there is none.
+
+    These values are informative only: they do not affect any transfer.
+
+    Args:
+        hostname: Local host name (``PANDA_HOSTNAME`` or ``socket.gethostname()``).
+
+    Returns:
+        tuple[str, str]: (host name, IP address).
+    """
+    try:
+        fqdn = socket.gethostbyaddr(hostname)[0]
+    except (OSError, UnicodeError) as exc:
+        fqdn = hostname or 'unknown'
+        logger.info(f'could not look up the full name of host {hostname!r} ({exc}) - using {fqdn!r} in the trace report')
+
+    try:
+        ip = get_host_ip(hostname)
+    except (OSError, UnicodeError) as exc:
+        ip = get_local_ip() or '0.0.0.0'
+        logger.info(f'could not resolve host {hostname!r} ({exc}) - using the outgoing interface address {ip} in the trace report')
+
+    return fqdn, ip
 
 
 class TraceReport(dict):
@@ -162,9 +199,8 @@ class TraceReport(dict):
 
         Sets ``clientState``, ``usr`` (an anonymised MD5 hash of the producer
         user ID), ``appid``, ``usrdn``, ``taskid``, ``timeStart``,
-        ``hostname``, ``ip``, and ``uuid`` from the supplied *job*.  All DNS
-        look-ups are performed with a 10-second socket timeout to prevent
-        hanging when a DNS server is unreachable.
+        ``hostname``, ``ip``, and ``uuid`` from the supplied *job*. See
+        :func:`get_host_identity` for how ``hostname`` and ``ip`` are found.
 
         Args:
             job: Job object whose metadata should be recorded in the report.
@@ -189,17 +225,7 @@ class TraceReport(dict):
             logger.warning(f'unable to detect hostname for trace report: {exc}')
             hostname = os.environ.get('PANDA_HOSTNAME', 'unknown')
 
-        try:
-            self['hostname'] = socket.gethostbyaddr(hostname)[0]
-        except (socket.gaierror, socket.herror) as exc:
-            logger.warning(f'unable to detect hostname by address for trace report: {exc}')
-            self['hostname'] = 'unknown'
-
-        try:
-            self['ip'] = socket.gethostbyname(hostname)
-        except (socket.gaierror, socket.herror) as exc:
-            logger.debug(f"unable to detect host IP for trace report: {exc}")
-            self['ip'] = '0.0.0.0'
+        self['hostname'], self['ip'] = get_host_identity(hostname)
 
         if job.jobdefinitionid:
             s = f'ppilot_{job.jobdefinitionid}'
