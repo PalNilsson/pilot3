@@ -32,6 +32,9 @@ Usage (after setupATLAS; lsetup rucio; voms-proxy-init -voms atlas):
 
 Use files with replicas at sites on several continents, otherwise the comparison shows little.
 Exit code: 0 if the order is identical for all IPs, 1 if it differs, 2 on usage or setup errors.
+
+Test confirmed to work:
+    python3 verify_geoip_sorting.py mc15_13TeV:HITS.06828093._000096.pool.root.1
 """
 
 import sys
