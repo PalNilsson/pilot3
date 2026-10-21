@@ -1789,7 +1789,7 @@ def _merge_query(url: str, params: dict[str, Any]) -> str:
 
 # --- small helpers to reduce complexity in request2() ---
 
-def _decide_method(json_body: dict[str, Any | None], method: str | None) -> str:
+def _decide_method(json_body: dict[str, Any | None] | list[dict[str, Any]], method: str | None) -> str:
     """Return the HTTP method to use for a request.
 
     Args:
@@ -1836,7 +1836,7 @@ def _get_auth_and_headers(url: str, panda: bool) -> tuple[dict[str, str], bool]:
     return headers, use_oidc_token
 
 
-def _prepare_body_and_headers(url: str, json_body: dict[str, Any | None], compressed: bool, headers: dict[str, str]) -> bytes | None:
+def _prepare_body_and_headers(url: str, json_body: dict[str, Any | None] | list[dict[str, Any]], compressed: bool, headers: dict[str, str]) -> bytes | None:
     """Prepare request body bytes and adjust headers for the outgoing request.
 
     Behaviour:
@@ -1980,7 +1980,7 @@ def _ensure_numeric_fields(payload: dict[str, Any | None]) -> None:
                     pass
 
 
-def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: dict[str, Any | None] = None, secure: bool = True, compressed: bool = True, panda: bool = False, method: str | None = None) -> str | dict[str, Any]:  # noqa  # pylint: disable=too-many-locals
+def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: dict[str, Any | None] | list[dict[str, Any]] = None, secure: bool = True, compressed: bool = True, panda: bool = False, method: str | None = None, timeout: int | None = None) -> str | dict[str, Any]:  # noqa  # pylint: disable=too-many-locals
     """Send an HTTPS request supporting both OIDC token and X.509 client-certificate auth.
 
     The method is inferred from *json_body* (``POST`` when present, ``GET``
@@ -1992,12 +1992,14 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
     Args:
         url: Target URL.
         params: Query-string parameters merged into *url*.
-        json_body: Dict to JSON-serialise as the request body; implies
-            ``POST`` when present.
+        json_body: Dict (or list, e.g. bulk Rucio traces) to JSON-serialise
+            as the request body; implies ``POST`` when present.
         secure: If ``False``, TLS certificate verification is disabled.
         compressed: If ``True``, gzip JSON bodies for API endpoints.
         panda: If ``True``, use OIDC token authentication when available.
         method: Explicit HTTP method override (case-insensitive).
+        timeout: Request time-out in seconds; ``None`` means
+            ``config.Pilot.http_maxtime``.
 
     Returns:
         Parsed :class:`dict` when the response is valid JSON, otherwise the
@@ -2006,6 +2008,7 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
     """
     params = params or {}
     method = _decide_method(json_body, method)
+    request_timeout = timeout if timeout is not None else config.Pilot.http_maxtime
 
     ipv = os.environ.get("PILOT_IP_VERSION")
     logger.info(f"url = {url}, secure = {secure}, compressed = {compressed}, ipv = {ipv}, method = {method}")
@@ -2088,7 +2091,7 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
     ret_text: str | None = None
     try:
         logger.debug("sending request to server")
-        with urllib.request.urlopen(req, context=ssl_context, timeout=config.Pilot.http_maxtime) as response:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=request_timeout) as response:
             logger.info(f"response.status={response.status}, response.reason={response.reason}")
             ret_text = response.read().decode("utf-8")
         logger.debug("sent request to server")
@@ -2122,7 +2125,7 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
                 payload_retry = json.dumps(json_body).encode("utf-8")
                 logger.debug(f"retry JSON payload preview: {payload_retry.decode('utf-8', errors='replace')[:1024]}")
                 req_retry = urllib.request.Request(url, data=payload_retry, headers=headers_retry, method=method)
-                with urllib.request.urlopen(req_retry, context=ssl_context, timeout=config.Pilot.http_maxtime) as response:
+                with urllib.request.urlopen(req_retry, context=ssl_context, timeout=request_timeout) as response:
                     logger.info(f"[retry no-gzip] response.status={response.status}, response.reason={response.reason}")
                     ret_text = response.read().decode("utf-8")
                 logger.debug("sent retry (no-gzip) to server")

@@ -175,6 +175,10 @@ from pilot.util.tokenlifetime import (
     check_token_for_new_job,
     record_final_update,
 )
+from pilot.util.tracesender import (
+    finish_traces,
+    remove_sender,
+)
 from pilot.util.workernode import (
     collect_workernode_info,
     extract_site_and_schedd,
@@ -4111,12 +4115,18 @@ def update_server(job: Any, args: Any) -> None:
             if new_metadata is not None:
                 metadata = new_metadata
 
+    # the rucio traces sent in the background must be done before the final update, since the job metrics are built
+    # there (this is done before the timing measurement, so that the final update timing is not inflated by the wait)
+    finish_traces(job, args)
+
     add_to_pilot_timing(job.jobid, PILOT_PRE_FINAL_UPDATE, time.time(), args)
     if job.fileinfo:
         accepted = send_state(job, args, job.state, xml=dumps(job.fileinfo), metadata=metadata)
     else:
         accepted = send_state(job, args, job.state, metadata=metadata)
     add_to_pilot_timing(job.jobid, PILOT_POST_FINAL_UPDATE, time.time(), args)
+    if job.completed:
+        remove_sender(job.jobid)  # otherwise keep it, so that a repeated final update reports the same lost traces
 
     # job.completed was False on entry (see above), so it being set now means that this call was the accepted final
     # update. The telemetry is therefore sent at most once per job

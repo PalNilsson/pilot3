@@ -549,14 +549,25 @@ class TestResolveRemoteOpenResult(_WorkdirTestCase):
 
 
 class _SentTraces(list):
-    """Collects the trace reports that would have been sent."""
+    """Collects the trace reports that would have been sent.
+
+    The traces are handed to the job's background trace sender, so they are recorded when they
+    are queued there.
+    """
 
     def factory(self, **fields):
-        """Return a fake TraceReport that records itself when sent."""
+        """Return a fake TraceReport that remembers its fields."""
         report = MagicMock()
         report.__bool__ = lambda _self: True
-        report.send.side_effect = lambda: self.append(fields)
+        report.fields = fields
+        report.send.side_effect = AssertionError('remote i/o traces must not be sent in the foreground')
         return report
+
+    def sender(self, _job):
+        """Return a fake trace sender that records the fields of the queued traces."""
+        sender = MagicMock()
+        sender.enqueue.side_effect = lambda traces: self.extend(trace.fields for trace in traces)
+        return sender
 
 
 class TestProcessRemoteFileTraces(_WorkdirTestCase):
@@ -572,7 +583,8 @@ class TestProcessRemoteFileTraces(_WorkdirTestCase):
     def _process(self, indata: list, outcomes: dict) -> list:
         """Run process_remote_file_traces() and return the sent traces."""
         job = MagicMock(indata=indata, workdir=self.workdir)
-        with patch.object(common, 'TraceReport', side_effect=self.sent.factory):
+        with patch.object(common, 'TraceReport', side_effect=self.sent.factory), \
+                patch.object(common, 'get_or_create_sender', side_effect=self.sent.sender):
             process_remote_file_traces(self.path, job, outcomes)
         return self.sent
 

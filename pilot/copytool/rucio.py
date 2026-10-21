@@ -47,6 +47,10 @@ from pilot.util.timer import (
 )
 from pilot.util.config import config
 from pilot.util.filehandling import rename_xrdlog
+from pilot.util.tracereport import (
+    TraceReport,
+    send_bulk
+)
 from .common import (
     resolve_common_transfer_errors,
     verify_catalog_checksum,
@@ -60,6 +64,7 @@ logger.setLevel(logging.DEBUG)
 require_replicas = True    ## indicates if given copytool requires input replicas to be resolved
 require_protocols = False  ## indicates if given copytool requires protocols to be resolved first for stage-out
 tracing_rucio = False      ## should Rucio send the trace?
+FAILED_ATTEMPT_STATES = ('FAILED', 'FAIL_VALIDATE')  # Rucio client states of a failed download attempt
 
 
 def is_valid_for_copy_in(files: list) -> bool:
@@ -149,6 +154,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
         dst = fspec.workdir or kwargs.get('workdir') or '.'
 
         trace_report_out = []
+        attempts = []  # failed download attempts inside rucio (rucio retries internally)
         transfer_timeout = get_timeout(fspec.filesize)
         ctimeout = transfer_timeout + 10  # give the API a chance to do the time-out first
         logger.info(f'overall transfer timeout={ctimeout}')
@@ -158,7 +164,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
         try:
             ec, trace_report_out = timeout(ctimeout, timer=TimedThread)(_stage_in_api)(dst, fspec, trace_report,
                                                                                        trace_report_out, transfer_timeout,
-                                                                                       use_pcache, rucio_host)
+                                                                                       use_pcache, rucio_host, attempts=attempts)
         except Exception as error:
             error_msg = str(error)
             logger.warning(f"exception caught during stage-in: {error_msg}")
@@ -166,13 +172,14 @@ def copy_in(files: list, **kwargs: dict) -> list:
             protocol = get_protocol(trace_report_out)
             trace_report.update(protocol=protocol)
             if not ignore_errors:
-                trace_report.send()
+                send_stagein_traces(trace_report, attempts, rucio_failed=True)
                 msg = f"{fspec.scope}:{fspec.lfn} from {fspec.ddmendpoint}, {error_details.get('error')}"
                 raise PilotException(msg, code=error_details.get('rcode'), state=error_details.get('state')) from error
         else:
             protocol = get_protocol(trace_report_out)
             trace_report.update(protocol=protocol)
             rename_xrdlog(fspec.lfn)
+        rucio_failed = bool(error_msg or ec)  # the download failed inside rucio (after its own retries)
 
         # make sure there was no missed failure (only way to deal with this until rucio API has been fixed)
         # (using the timeout decorator prevents the trace_report_out from being updated - rucio API should return
@@ -182,7 +189,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
             error_details = handle_rucio_error(state_reason, trace_report, trace_report_out, fspec, stagein=True)
 
             if not ignore_errors:
-                trace_report.send()
+                send_stagein_traces(trace_report, attempts, rucio_failed)
                 msg = f"{fspec.scope}:{fspec.lfn} from {fspec.ddmendpoint}, {error_details.get('error')}"
                 raise PilotException(msg, code=error_details.get('rcode'), state=error_details.get('state'))
 
@@ -193,7 +200,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
             if diagnostics != "" and not ignore_errors:
                 trace_report.update(clientState=state or 'STAGEIN_ATTEMPT_FAILED', stateReason=diagnostics,
                                     timeEnd=time())
-                trace_report.send()
+                send_stagein_traces(trace_report, attempts, rucio_failed)
                 raise PilotException(diagnostics, code=fspec.status_code, state=state)
         else:
             diagnostics = f'file does not exist: {destination} (cannot verify catalog checksum)'
@@ -202,7 +209,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
             fspec.status_code = ErrorCodes.STAGEINFAILED
             trace_report.update(clientState=state, stateReason=diagnostics,
                                 timeEnd=time())
-            trace_report.send()
+            send_stagein_traces(trace_report, attempts, rucio_failed)
             raise PilotException(diagnostics, code=fspec.status_code, state=state)
 
         if not fspec.status_code:
@@ -210,7 +217,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
             fspec.status = 'transferred'
             trace_report.update(clientState='DONE', stateReason='OK', timeEnd=time())
 
-        trace_report.send()
+        send_stagein_traces(trace_report, attempts, rucio_failed)
 
     return files
 
@@ -232,6 +239,123 @@ def get_protocol(trace_report_out: dict) -> str:
         protocol = ''
 
     return protocol
+
+
+def capture_failed_attempts(download_client: Any, attempts: list | None) -> bool:
+    """Record the failed download attempts made inside the Rucio download client.
+
+    The Rucio download client retries a failed download internally, and only the outcome of the
+    last attempt reaches the pilot. After each failed attempt, the client calls its private
+    ``_send_trace()`` method, which does nothing since Rucio's own tracing is turned off. The
+    method is wrapped on this client instance to keep a copy of each failed attempt (see
+    :func:`get_attempt_snapshot`); the original method is still called.
+
+    ``_send_trace()`` is present in the Rucio clients checked (1.29 to 41.5). If it is missing,
+    nothing is recorded and only the final trace is sent, as before.
+
+    Args:
+        download_client: Rucio download client.
+        attempts: List to append the failed attempts to (nothing is recorded if None).
+
+    Returns:
+        True if the failed attempts will be recorded.
+    """
+    if attempts is None:
+        return False
+
+    original = getattr(download_client, '_send_trace', None)
+    if not callable(original):
+        logger.info('rucio download client has no _send_trace() method - failed download attempts will not be reported')
+        return False
+
+    def _send_trace(trace: dict, *args: Any, **kwargs: Any) -> Any:
+        """Keep a copy of a failed attempt, then call the original method."""
+        try:
+            snapshot = get_attempt_snapshot(trace)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(f'failed to record download attempt: {exc}')
+        else:
+            if snapshot:
+                attempts.append(snapshot)
+
+        return original(trace, *args, **kwargs)
+
+    download_client._send_trace = _send_trace  # pylint: disable=protected-access
+
+    return True
+
+
+def get_attempt_snapshot(trace: dict) -> dict | None:
+    """Return a copy of the relevant fields of a Rucio trace for a failed download attempt.
+
+    The Rucio trace dictionary is changed in place by later attempts, so the fields are copied.
+
+    Args:
+        trace: Rucio trace dictionary.
+
+    Returns:
+        The copied fields with the time of the failure, or None if the trace is not for a failed attempt.
+    """
+    state = trace.get('clientState')
+    state = getattr(state, 'value', state)  # an enum in recent Rucio clients
+    if state not in FAILED_ATTEMPT_STATES:
+        return None
+
+    return {'clientState': state, 'stateReason': trace.get('stateReason'), 'protocol': trace.get('protocol'),
+            'remoteSite': trace.get('remoteSite'), 'timeEnd': time()}
+
+
+def get_attempt_traces(trace_report: Any, attempts: list, rucio_failed: bool) -> list:
+    """Return one trace report per failed download attempt.
+
+    Each trace is a copy of the file's trace report, with ``clientState=STAGEIN_ATTEMPT_FAILED`` and the
+    reason, protocol and remote site of the attempt. If the download failed overall, the last failed
+    attempt is the failure that the file's own trace reports, so it gets no extra trace.
+
+    Args:
+        trace_report: The file's trace report.
+        attempts: Failed attempts (see :func:`get_attempt_snapshot`).
+        rucio_failed: True if the download failed inside Rucio.
+
+    Returns:
+        List of trace reports.
+    """
+    snapshots = list(attempts)
+    if rucio_failed and snapshots:
+        snapshots = snapshots[:-1]
+
+    traces = []
+    for snapshot in snapshots:
+        trace = TraceReport(trace_report, ipv=getattr(trace_report, 'ipv', 'IPv6'),
+                            workdir=getattr(trace_report, 'workdir', ''))
+        trace.update(clientState='STAGEIN_ATTEMPT_FAILED', stateReason=snapshot.get('stateReason'),
+                     timeEnd=snapshot.get('timeEnd'))
+        for key in ('protocol', 'remoteSite'):
+            if snapshot.get(key):
+                trace[key] = snapshot[key]
+        traces.append(trace)
+
+    return traces
+
+
+def send_stagein_traces(trace_report: Any, attempts: list, rucio_failed: bool) -> None:
+    """Send the file's trace, together with the traces of its failed download attempts.
+
+    Without failed attempts, the file's trace is sent on its own, as before. Otherwise all traces are
+    sent in one request.
+
+    Args:
+        trace_report: The file's trace report.
+        attempts: Failed attempts (see :func:`get_attempt_snapshot`).
+        rucio_failed: True if the download failed inside Rucio.
+    """
+    attempt_traces = get_attempt_traces(trace_report, attempts, rucio_failed)
+    if not attempt_traces:
+        trace_report.send()
+        return
+
+    logger.info(f'sending the trace of {trace_report.get("filename")} with {len(attempt_traces)} trace(s) for failed download attempts')
+    send_bulk(attempt_traces + [trace_report], workdir=getattr(trace_report, 'workdir', ''))
 
 
 def handle_rucio_error(error_msg: str, trace_report: dict, trace_report_out: list, fspec: Any,
@@ -556,7 +680,7 @@ def copy_out(files: list, **kwargs: dict) -> list:  # noqa: C901
 
 
 def _stage_in_api(dst: str, fspec: Any, trace_report: dict, trace_report_out: list, transfer_timeout: int,
-                  use_pcache: bool, rucio_host: str) -> tuple[int, list]:
+                  use_pcache: bool, rucio_host: str, *, attempts: list | None = None) -> tuple[int, list]:
     """
     Stage-in files using the Rucio API.
 
@@ -568,6 +692,7 @@ def _stage_in_api(dst: str, fspec: Any, trace_report: dict, trace_report_out: li
         transfer_timeout: transfer timeout in seconds.
         use_pcache: True if pcache should be used, False otherwise.
         rucio_host: Rucio host URL.
+        attempts: list to record the failed download attempts in (see capture_failed_attempts()).
 
     Returns:
         Tuple of (exit_code, trace_report_out).
@@ -590,6 +715,9 @@ def _stage_in_api(dst: str, fspec: Any, trace_report: dict, trace_report_out: li
     # traces are switched off
     if hasattr(download_client, 'tracing'):
         download_client.tracing = tracing_rucio
+
+    # keep the failed download attempts (rucio retries internally), to report them in the traces
+    capture_failed_attempts(download_client, attempts)
 
     # file specifications before the actual download
     _file = {}

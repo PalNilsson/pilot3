@@ -35,14 +35,22 @@ complete.
 Two special keys — ``ipv`` and ``workdir`` — are accepted at construction
 time but are stored as instance attributes rather than dict entries so they
 are never serialised into the payload sent to the server.
+
+Several traces can be sent in one request with :func:`send_bulk` (the Rucio
+trace server accepts a list of traces since Rucio 37). See also
+:mod:`pilot.util.tracesender` for sending traces in the background.
 """
 
 from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import socket
 import time
+
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from io import TextIOWrapper
 from json import (
@@ -85,6 +93,101 @@ from pilot.util.networking import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_TRACE_BATCH_SIZE = 100
+DEFAULT_TRACE_TIMEOUT = 30
+TRACE_ACCEPTED_REPLY = 'Created'  # reply text of the Rucio trace server (HTTP 201) for an accepted request
+GENERIC_TRACE_ERROR = 1  # stored when a failed trace request has no HTTP status code
+
+
+def traces_disabled() -> bool:
+    """Return True if sending of Rucio traces has been turned off.
+
+    Traces can be turned off with ``PILOT_USE_RUCIO_TRACES=False``.
+
+    Returns:
+        ``True`` if traces should not be sent.
+    """
+    return environ.get('PILOT_USE_RUCIO_TRACES', 'True') == 'False'
+
+
+def get_trace_setting(name: str, default: int) -> int:
+    """Return a positive integer trace setting from the ``[Rucio]`` config section.
+
+    The default is used if the setting is missing (e.g. in a custom config file) or invalid.
+
+    Args:
+        name: Setting name.
+        default: Value used if the setting is missing or not a positive integer.
+
+    Returns:
+        The setting value.
+    """
+    try:
+        value = int(getattr(config.Rucio, name))
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+    return value if value > 0 else default
+
+
+def is_trace_accepted(reply: Any) -> bool:
+    """Return True if the reply from the trace server means that the request was accepted.
+
+    The Rucio trace server replies ``Created`` (HTTP 201). A dictionary (a JSON reply) is also
+    accepted. Anything else, including the ``failed to send request`` messages from
+    :func:`~pilot.util.https.request2`, is a failure.
+
+    Args:
+        reply: Return value of :func:`~pilot.util.https.request2`.
+
+    Returns:
+        ``True`` if the request was accepted.
+    """
+    if isinstance(reply, dict):
+        return True
+
+    return isinstance(reply, str) and reply.strip() == TRACE_ACCEPTED_REPLY
+
+
+def get_trace_error_code(reply: Any) -> int:
+    """Return the error code to store for a failed trace request.
+
+    The HTTP status code is used when the reply contains one (e.g. 502), otherwise
+    :data:`GENERIC_TRACE_ERROR`. HTTP status codes cannot be confused with curl exit codes,
+    which are below 100.
+
+    Args:
+        reply: Return value of :func:`~pilot.util.https.request2`.
+
+    Returns:
+        Error code.
+    """
+    match = re.search(r'HTTP Error (\d{3})', reply) if isinstance(reply, str) else None
+
+    return int(match.group(1)) if match else GENERIC_TRACE_ERROR
+
+
+def store_trace_error(workdir: str, exit_code: int) -> None:
+    """Store a trace sending error, to be reported with the job metrics as ``rucioTraceError``.
+
+    The error is written to a file in the work directory, since an environment variable is not
+    seen outside a middleware container, and is also set as ``RUCIO_TRACE_ERROR``.
+
+    Args:
+        workdir: Job work directory.
+        exit_code: curl exit code or HTTP status code.
+    """
+    path = os.path.join(workdir, config.Rucio.rucio_trace_error_file)
+    try:
+        write_file(path, str(exit_code))
+    except FileHandlingFailure as exc:
+        logger.warning(f'failed to store rucio trace error code to file: {exc}')
+    else:
+        logger.info(f'wrote rucio trace error code {exit_code} to file {path}')
+    logger.debug(f"setting env var RUCIO_TRACE_ERROR to \'{exit_code}\' to be sent with job metrics")
+    os.environ['RUCIO_TRACE_ERROR'] = str(exit_code)
 
 
 def get_host_identity(hostname: str) -> tuple[str, str]:
@@ -272,69 +375,102 @@ class TraceReport(dict):
 
         return True
 
-    def send(self) -> bool:  # noqa: C901
+    def prepare(self) -> dict[str, Any] | None:
+        """Prepare the report for sending and return a JSON-safe copy of it.
+
+        Sets ``protocol`` from ``url`` when it is missing, verifies the report
+        (see :meth:`verify_trace`, which also applies ``RUCIO_LOCAL_SITE_ID``)
+        and returns a plain copy in which the strings ``'None'`` and
+        ``'null'`` are sent as null values. The copy is independent of the
+        report, so it can be queued while the report itself is reused.
+
+        Returns:
+            The prepared report, or ``None`` if the report could not be
+            verified or serialised.
+        """
+        # determine protocol in case it is not set (to prevent None values sent to server)
+        if not self.get('protocol') and self.get('url'):
+            self['protocol'] = extract_protocol(self['url'])
+            logger.debug(f'setting protocol to {self["protocol"]}')
+
+        if not self.verify_trace():
+            logger.warning(f'cannot send trace since not all fields are set (filename={self.get("filename")})')
+            return None
+
+        try:
+            data = loads(dumps(self))
+        except (TypeError, ValueError) as exc:
+            logger.warning(f'cannot send trace since it cannot be serialised: {exc}')
+            return None
+
+        return correct_none_types(data)
+
+    def send(self) -> bool:
         """Send the trace report to the Rucio tracing server.
 
-        First attempts delivery via :func:`~pilot.util.https.request2`
-        (urllib-based).  If that call returns a falsy value, the method falls
-        back to a ``curl`` subprocess, streaming its stdout and stderr to
-        files under :attr:`workdir` to avoid overwhelming
-        ``subprocess.communicate()``.  Any unhandled exception is caught and
-        logged so that a tracing failure never aborts the calling code.
+        The report is delivered via :func:`~pilot.util.https.request2`. A
+        failed request is logged and not retried. The ``curl`` fallback is
+        only used if the request returns neither a reply nor an error message.
+        Any unhandled exception is caught and logged so that a tracing
+        failure never aborts the calling code.
 
         Sending can be disabled globally by setting the environment variable
         ``PILOT_USE_RUCIO_TRACES`` to ``'False'``.
 
         Returns:
             ``True`` if the trace was sent successfully or if sending was
-            disabled; ``False`` if :meth:`verify_trace` failed or the server
-            returned an unexpected response type.
+            disabled; ``False`` if :meth:`prepare` failed or the server did
+            not accept the trace.
         """
         # only send trace if it is actually required (can be turned off with pilot option)
-        if environ.get('PILOT_USE_RUCIO_TRACES', 'True') == 'False':
+        if traces_disabled():
             logger.debug('rucio trace does not need to be sent')
             return True
 
         url = config.Rucio.url
         logger.info(f"tracing server: {url}")
-
-        # determine protocol in case it is not set (to prevent None values sent to server)
-        if not self['protocol'] and self['url']:
-            self['protocol'] = extract_protocol(self['url'])
-            logger.debug(f'setting protocol to {self["protocol"]}')
         logger.info(f"sending tracing report: {self}")
 
-        if not self.verify_trace():
-            logger.warning('cannot send trace since not all fields are set')
+        data_dict = self.prepare()
+        if data_dict is None:
             return False
 
-        out = None
-        err = None
+        try:
+            logger.debug(f'data_dict={data_dict}')
+            ret = request2(url=url, json_body=data_dict, secure=False, compressed=False,
+                           timeout=get_trace_setting('trace_timeout', DEFAULT_TRACE_TIMEOUT))
+        except Exception:  # pylint: disable=broad-exception-caught
+            # if something fails, log it but ignore
+            logger.error(f'tracing failed: {exc_info()}')
+            return True
+
+        if is_trace_accepted(ret):
+            logger.info(f'tracing report sent (server reply: {ret})')
+            return True
+
+        if isinstance(ret, str):
+            logger.warning(f'failed to send tracing report: {ret}')
+            return False
+
+        logger.warning("failed to send tracing report - using old curl command")
+        self.send_with_curl(url)
+
+        return True
+
+    def send_with_curl(self, url: str) -> None:
+        """Send the trace report with ``curl`` (legacy fallback).
+
+        The curl output is streamed to files under :attr:`workdir` to avoid
+        overwhelming ``subprocess.communicate()``. A curl error is stored with
+        :func:`store_trace_error` so that it can be reported with the job
+        metrics, also when a middleware container is used.
+
+        Args:
+            url: Tracing server URL.
+        """
         try:
             # take care of the encoding (ipv/workdir are instance attrs, not in the dict)
             data = dumps(self).replace('"', '\\"')  # for curl
-            data_urllib = dumps(self)  # for urllib
-
-            # must convert data to a dictionary and make sure None values are kept
-            data_str_urllib = data_urllib.replace('None', '\"None\"')
-            data_str_urllib = data_str_urllib.replace('null', '\"None\"')
-
-            data_dict = loads(data_str_urllib)  # None values will now be 'None'-strings
-            data_dict = correct_none_types(data_dict)
-            logger.debug(f'data_dict={data_dict}')
-            ret = request2(url=url, json_body=data_dict, secure=False, compressed=False)
-            if isinstance(ret, str):
-                logger.warning(f"tracing server returned a string instead of a dictionary: {ret}")
-                return False
-
-            logger.info(f'received: {ret}')
-
-            if ret:
-                logger.info("tracing report sent")
-                return True
-
-            logger.warning("failed to send tracing report - using old curl command")
-
             ssl_certificate = self.get_ssl_certificate()
 
             # create the command
@@ -348,48 +484,51 @@ class TraceReport(dict):
             logger.debug(f'using {outname} and {errname} to store curl output')
             if out is None or err is None:
                 logger.warning('failed to open curl output files; curl fallback cannot run')
+                return
+
+            cmd = f'{command} --connect-timeout 100 --max-time 120 --cacert {ssl_certificate} -v -k -d \"{data}\" {url}'
+            exit_code = execute2(cmd, out, err, 300)
+            logger.debug(f'exit_code={exit_code}')
+
+            # always append the output to trace_curl.std{out|err}
+            outname_final, errname_final = self.get_trace_curl_filenames(name='trace_curl')
+            _ = append_to_file(outname, outname_final)
+            _ = append_to_file(errname, errname_final)
+            self.close(out, err)
+
+            # handle errors that only appear in stdout/err (curl)
+            if not exit_code:
+                exit_code = self.get_curl_output_error(outname, errname)
+            if not exit_code:
+                logger.info('no errors were detected from curl operation')
             else:
-                cmd = f'{command} --connect-timeout 100 --max-time 120 --cacert {ssl_certificate} -v -k -d \"{data}\" {url}'
-                exit_code = execute2(cmd, out, err, 300)
-                logger.debug(f'exit_code={exit_code}')
-
-                # always append the output to trace_curl.std{out|err}
-                outname_final, errname_final = self.get_trace_curl_filenames(name='trace_curl')
-                _ = append_to_file(outname, outname_final)
-                _ = append_to_file(errname, errname_final)
-                self.close(out, err)
-
-                # handle errors that only appear in stdout/err (curl)
-                if not exit_code:
-                    out, err = self.get_trace_curl_files(outname, errname, mode='r')
-                    if out:
-                        exit_code = self.assign_error(out)
-                        if not exit_code and err:
-                            exit_code = self.assign_error(err)
-                        logger.debug(f'curl exit_code from stdout/err={exit_code}')
-                        self.close(out, err)
-                    else:
-                        logger.warning(f'failed to open curl stdout file: {outname}')
-                if not exit_code:
-                    logger.info('no errors were detected from curl operation')
-                else:
-                    # better to store exit code in file since env var will not be seen outside container in case middleware
-                    # container is used
-                    path = os.path.join(self.workdir, config.Rucio.rucio_trace_error_file)
-                    try:
-                        write_file(path, str(exit_code))
-                    except FileHandlingFailure as exc:
-                        logger.warning(f'failed to store curl exit code to file: {exc}')
-                    else:
-                        logger.info(f'wrote rucio trace exit code {exit_code} to file {path}')
-                    logger.debug(f"setting env var RUCIO_TRACE_ERROR to \'{exit_code}\' to be sent with job metrics")
-                    os.environ['RUCIO_TRACE_ERROR'] = str(exit_code)
-
-        except Exception:
+                store_trace_error(self.workdir, exit_code)
+        except Exception:  # pylint: disable=broad-exception-caught
             # if something fails, log it but ignore
             logger.error(f'tracing failed: {exc_info()}')
 
-        return True
+    def get_curl_output_error(self, outname: str, errname: str) -> int:
+        """Return the error found in the curl stdout or stderr files.
+
+        Args:
+            outname: Path of the curl stdout file.
+            errname: Path of the curl stderr file.
+
+        Returns:
+            ``1`` if a server-side error was found; ``0`` otherwise.
+        """
+        exit_code = 0
+        out, err = self.get_trace_curl_files(outname, errname, mode='r')
+        if out:
+            exit_code = self.assign_error(out)
+            if not exit_code and err:
+                exit_code = self.assign_error(err)
+            logger.debug(f'curl exit_code from stdout/err={exit_code}')
+            self.close(out, err)
+        else:
+            logger.warning(f'failed to open curl stdout file: {outname}')
+
+        return exit_code
 
     def close(self, out: Optional[TextIOWrapper], err: Optional[TextIOWrapper]) -> None:
         """Close open file streams, ignoring ``None`` handles.
@@ -491,3 +630,106 @@ class TraceReport(dict):
             Absolute path to the SSL certificate file.
         """
         return environ.get('X509_USER_PROXY', f'/tmp/x509up_u{getuid()}')
+
+
+@dataclass
+class BulkResult:
+    """Outcome of :func:`send_bulk`.
+
+    Attributes:
+        sent: Number of traces in accepted requests.
+        failed: Number of traces in failed requests.
+        invalid: Number of traces dropped since they could not be verified.
+        requests: Number of requests sent.
+        elapsed: Total time in seconds.
+    """
+
+    sent: int = 0
+    failed: int = 0
+    invalid: int = 0
+    requests: int = 0
+    elapsed: float = 0.0
+
+
+def prepare_traces(traces: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Prepare traces for sending, dropping the ones that cannot be verified.
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+
+    Returns:
+        A tuple ``(prepared, invalid)`` with the prepared traces and the number of dropped traces.
+    """
+    prepared = []
+    invalid = 0
+    for trace in traces:
+        report = trace if isinstance(trace, TraceReport) else TraceReport(trace)
+        data = report.prepare()
+        if data is None:
+            invalid += 1
+        else:
+            prepared.append(data)
+    if invalid:
+        logger.warning(f'dropped {invalid} trace(s) that could not be verified')
+
+    return prepared, invalid
+
+
+def post_traces(batch: list[dict[str, Any]], timeout: int) -> tuple[bool, Any]:
+    """Send one request with a list of prepared traces to the Rucio trace server.
+
+    The server accepts a list of traces since Rucio 37. This function never raises.
+
+    Args:
+        batch: Prepared traces (see :func:`prepare_traces`).
+        timeout: Request time-out in seconds.
+
+    Returns:
+        A tuple ``(accepted, reply)``.
+    """
+    try:
+        reply = request2(url=config.Rucio.url, json_body=batch, secure=False, compressed=False, timeout=timeout)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        reply = f'failed to send request: {exc}'
+
+    return is_trace_accepted(reply), reply
+
+
+def send_bulk(traces: Iterable[dict[str, Any]], workdir: str = '') -> BulkResult:
+    """Send traces in as few requests as possible, in the calling thread.
+
+    The traces are sent in requests of at most ``[Rucio] trace_batch_size`` traces. A failed
+    request is not retried, and the error is stored for the job metrics (see
+    :func:`store_trace_error`).
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+        workdir: Job work directory (for the trace error file).
+
+    Returns:
+        The outcome.
+    """
+    result = BulkResult()
+    if traces_disabled():
+        logger.debug('rucio traces do not need to be sent')
+        return result
+
+    t0 = time.time()
+    prepared, result.invalid = prepare_traces(traces)
+    batch_size = get_trace_setting('trace_batch_size', DEFAULT_TRACE_BATCH_SIZE)
+    timeout = get_trace_setting('trace_timeout', DEFAULT_TRACE_TIMEOUT)
+    for start in range(0, len(prepared), batch_size):
+        batch = prepared[start:start + batch_size]
+        accepted, reply = post_traces(batch, timeout)
+        result.requests += 1
+        if accepted:
+            result.sent += len(batch)
+        else:
+            result.failed += len(batch)
+            logger.warning(f'failed to send {len(batch)} trace(s): {reply}')
+            store_trace_error(workdir, get_trace_error_code(reply))
+    result.elapsed = time.time() - t0
+    logger.info(f'sent traces in {result.requests} request(s): sent={result.sent}, failed={result.failed}, '
+                f'invalid={result.invalid}, time={result.elapsed:.1f} s')
+
+    return result

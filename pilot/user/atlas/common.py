@@ -94,6 +94,7 @@ from pilot.util.processes import (
 from pilot.util.proxy import remove_container_proxies
 from pilot.util.timing import add_to_pilot_timing
 from pilot.util.tracereport import TraceReport
+from pilot.util.tracesender import get_or_create_sender
 from .container import (
     create_root_container_command,
     execute_remote_file_open
@@ -873,7 +874,10 @@ def process_remote_file_traces(path: str, job: JobData, outcomes: dict) -> None:
     """Report traces for remote files.
 
     The function reads back the base trace report (common part of all traces)
-    and updates a copy of it per file before reporting it to the Rucio server.
+    and updates a copy of it per file. The traces are handed to the job's
+    background trace sender, so that sending them does not delay the payload
+    (production incident: PanDA job 7372130338, where 41 traces failed one at
+    a time before the payload could start).
 
     A trace is only sent for a file whose outcome is known (see REMOTEIO_CLIENT_STATES).
     If the outcome of the verification is unknown (e.g. the container could not be
@@ -900,6 +904,23 @@ def process_remote_file_traces(path: str, job: JobData, outcomes: dict) -> None:
 
     if 'workdir' not in base_trace_report:
         base_trace_report['workdir'] = job.workdir
+    traces = get_remote_file_traces(base_trace_report, job, outcomes)
+    if traces:
+        get_or_create_sender(job).enqueue(traces)
+
+
+def get_remote_file_traces(base_trace_report: dict, job: JobData, outcomes: dict) -> list:
+    """Return the trace reports for the remote i/o files with a known outcome.
+
+    Args:
+        base_trace_report: base trace report (common part of all traces).
+        job: job object.
+        outcomes: per-file outcomes of the remote file open verification ({turl: outcome}).
+
+    Returns:
+        list: trace reports.
+    """
+    traces = []
     for fspec in job.indata:
         if fspec.status != 'remote_io':
             continue
@@ -911,9 +932,11 @@ def process_remote_file_traces(path: str, job: JobData, outcomes: dict) -> None:
         # copy the base trace report (only a dictionary) into a real trace report object
         trace_report = TraceReport(**get_remote_file_trace_fields(base_trace_report, fspec, outcome))
         if trace_report:
-            trace_report.send()
+            traces.append(trace_report)
         else:
             logger.warning(f'failed to create trace report for turl={fspec.turl}')
+
+    return traces
 
 
 def get_remote_file_trace_fields(base_trace_report: dict, fspec: FileSpec, outcome: str) -> dict:
