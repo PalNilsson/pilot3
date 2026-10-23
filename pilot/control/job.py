@@ -3831,6 +3831,12 @@ def order_log_transfer(queues: namedtuple, job: object) -> None:
 def wait_for_aborted_job_stageout(args: object, queues: namedtuple, job: object) -> None:
     """Wait for stage-out to finish for aborted job.
 
+    Stage-out has finished when the log transfer has been attempted (DONE or FAILED), or when the
+    job is in one of the data_out queues. The job usually reaches the queue monitor via the
+    failed_jobs queue, i.e. after it has left the data_out queues, so the log transfer status is
+    the reliable check (PanDA job 7379005140 waited the full time although its log was already
+    transferred).
+
     Args:
         args: Pilot arguments object.
         queues: Pilot queues object.
@@ -3856,7 +3862,8 @@ def wait_for_aborted_job_stageout(args: object, queues: namedtuple, job: object)
     logger.debug(f'using max_wait_time = {max_wait_time} s')
     t0 = time.time()
     while time.time() - t0 < max_wait_time:
-        if job in queues.finished_data_out.queue or job in queues.failed_data_out.queue:
+        if get_job_status(job, 'LOG_TRANSFER') in {LOG_TRANSFER_DONE, LOG_TRANSFER_FAILED} or \
+                job in queues.finished_data_out.queue or job in queues.failed_data_out.queue:
             logger.info('stage-out has finished, proceed with final server update')
             break
 
