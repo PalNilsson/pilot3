@@ -37,14 +37,23 @@ Number of requests sent at the same time:
 
 The traces must be sent before the final server update, since the job
 metrics are built there. :func:`finish_traces` is therefore called just
-before the final update:
+before the final update, and the remaining traces are sent first, bounded by:
 
-- degraded sender: the traces that have not been sent are abandoned;
-- healthy sender: the remaining traces are sent first, bounded by
-  ``[Rucio] trace_final_wait`` seconds and by graceful stop;
-- graceful stop already set: no wait.
+- ``[Rucio] trace_final_wait`` seconds if sending is healthy;
+- ``[Rucio] trace_timeout`` seconds if it is degraded (also when it degrades
+  during the wait), so that the traces queued at the end of the job, e.g. by
+  stage-out, still get one chance;
+- graceful stop (no wait if it is already set).
 
-Abandoned traces, and traces in failed requests, are counted as lost.
+The traces that have not been sent then are abandoned. Abandoned traces, and
+traces in failed requests, are counted as lost.
+
+Copytools send their traces with :meth:`TraceReport.send`, which hands them
+to the job's sender when there is one (this module registers itself with
+:func:`~pilot.util.tracereport.set_background_sender`). The stage-in and
+stage-out entry points create the sender with :func:`get_or_create_sender`.
+Traces that a middleware container script wrote to the spool file are sent
+with :func:`collect_spooled_traces` after the container has finished.
 """
 
 from __future__ import annotations
@@ -68,6 +77,9 @@ from pilot.util.tracereport import (
     get_trace_setting,
     post_traces,
     prepare_traces,
+    read_trace_spool,
+    send_traces,
+    set_background_sender,
     store_trace_error,
     traces_disabled
 )
@@ -95,7 +107,8 @@ class TraceSettings:
     Attributes:
         batch_size: Maximum number of traces per request.
         max_parallel: Maximum number of requests sent at the same time.
-        timeout: Request time-out in seconds.
+        timeout: Request time-out in seconds; also the maximum time to wait for the remaining traces
+            before the final update when the sender is degraded.
         slow_threshold: A request taking longer than this (seconds) degrades the sender.
         final_wait: Maximum time in seconds to wait for the remaining traces before the final update.
     """
@@ -284,18 +297,66 @@ class TraceSender:
             if self._state != RUNNING:
                 logger.warning(f'{len(prepared)} trace(s) arrived after the trace sender was stopped (final update) and will not be sent')
                 return 0
-            if not prepared:
-                return 0
-            self._pending.extend(prepared)
-            waiting = len(self._pending)
-            self._start_worker()
-            self._cond.notify_all()
-        logger.info(f'queued {len(prepared)} trace(s) for sending in the background ({waiting} waiting, job {self.job_id})')
+            waiting = self._add(prepared)
+        self._log_queued(len(prepared), waiting)
 
         return len(prepared)
 
+    def try_enqueue(self, traces: Iterable[dict[str, Any]]) -> bool:
+        """Prepare traces and queue them for sending, if the sender still takes traces.
+
+        Unlike :meth:`enqueue`, nothing is dropped when the sender has been stopped: the caller is
+        told to send the traces itself.
+
+        Args:
+            traces: Trace reports, or plain dictionaries with trace report fields.
+
+        Returns:
+            True if the traces were taken care of (queued, or dropped as invalid), False if the
+            sender has been stopped.
+        """
+        if traces_disabled():
+            logger.debug('rucio traces do not need to be sent')
+            return True
+
+        prepared, invalid = prepare_traces(traces)
+        with self._cond:
+            if self._state != RUNNING:
+                return False
+            self._summary.invalid += invalid
+            waiting = self._add(prepared)
+        self._log_queued(len(prepared), waiting)
+
+        return True
+
+    def _add(self, prepared: list[dict[str, Any]]) -> int:
+        """Queue prepared traces and wake up the worker. Must be called with the lock held.
+
+        Args:
+            prepared: Prepared traces.
+
+        Returns:
+            Number of traces waiting to be sent.
+        """
+        if prepared:
+            self._pending.extend(prepared)
+            self._start_worker()
+            self._cond.notify_all()
+
+        return len(self._pending)
+
+    def _log_queued(self, queued: int, waiting: int) -> None:
+        """Log the number of queued traces.
+
+        Args:
+            queued: Number of traces just queued.
+            waiting: Number of traces waiting to be sent.
+        """
+        if queued:
+            logger.info(f'queued {queued} trace(s) for sending in the background ({waiting} waiting, job {self.job_id})')
+
     def finish(self, graceful_stop: threading.Event | None = None) -> TraceSummary:
-        """Stop sending, after the remaining traces have been sent if sending is healthy.
+        """Stop sending, after the remaining traces have been sent (bounded, see :meth:`_wait_for_remaining`).
 
         Calling it again returns the same counts.
 
@@ -308,7 +369,7 @@ class TraceSender:
         with self._cond:
             if self._state == FINISHED:
                 return replace(self._summary)
-            self._wait_for_remaining(graceful_stop)  # returns at once if degraded or if graceful stop has been set
+            self._wait_for_remaining(graceful_stop)  # returns at once if graceful stop has been set
             # traces of a request still in flight are counted as abandoned, since the outcome is unknown
             self._summary.abandoned += len(self._pending) + self._in_flight
             self._pending.clear()
@@ -334,19 +395,34 @@ class TraceSender:
                 self._state = STOPPED
             self._cond.notify_all()
 
-    def _wait_for_remaining(self, graceful_stop: threading.Event | None) -> None:
-        """Wait until all traces are sent, the sender degrades, the time is up, or graceful stop is set.
+    def _wait_limit(self) -> float:
+        """Return the maximum time to wait for the remaining traces.
 
-        Must be called with the lock held.
+        Returns:
+            ``final_wait`` seconds while healthy, at most ``timeout`` seconds once degraded.
+        """
+        if self._summary.degraded:
+            return min(self.settings.timeout, self.settings.final_wait)
+
+        return self.settings.final_wait
+
+    def _wait_for_remaining(self, graceful_stop: threading.Event | None) -> None:
+        """Wait until all traces are sent, the time is up, or graceful stop is set.
+
+        The time limit is ``final_wait`` seconds while the sender is healthy, and ``timeout`` seconds
+        (counted from the start of the wait) once it is degraded. Must be called with the lock held.
 
         Args:
             graceful_stop: Graceful stop event.
         """
-        deadline = time.time() + self.settings.final_wait
-        while (self._pending or self._in_flight) and not self._summary.degraded:
-            remaining = deadline - time.time()
+        t0 = time.time()
+        if self._summary.degraded and (self._pending or self._in_flight):
+            logger.info(f'trace sending is degraded - will wait at most {self._wait_limit()} s for the remaining traces')
+        while self._pending or self._in_flight:
+            limit = self._wait_limit()
+            remaining = t0 + limit - time.time()
             if remaining <= 0:
-                logger.warning(f'traces were not sent within {self.settings.final_wait} s')
+                logger.warning(f'traces were not sent within {limit} s')
                 return
             if _is_set(graceful_stop):
                 logger.warning('graceful stop has been set - will not wait for the remaining traces')
@@ -465,7 +541,8 @@ class TraceSender:
         """
         if not self._summary.degraded:
             self._summary.degraded = True
-            logger.warning(f'{reason} - will send one trace request at a time, and not wait for the remaining traces at the end of the job')
+            logger.warning(f'{reason} - will send one trace request at a time, and wait at most {self._wait_limit()} s for the '
+                           f'remaining traces at the end of the job')
 
 
 _registry: dict[str, TraceSender] = {}
@@ -576,3 +653,44 @@ def reset_registry() -> None:
         _registry.clear()
     for sender in senders:
         sender.stop()
+
+
+def _enqueue_for_job(traces: list[dict[str, Any]], job_id: Any) -> bool:
+    """Queue traces in the background sender of a job (see :func:`~pilot.util.tracereport.defer_traces`).
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+        job_id: PanDA job id.
+
+    Returns:
+        True if the sender took the traces, False if the job has no sender or it has been stopped.
+    """
+    sender = get_sender(job_id)
+
+    return sender is not None and sender.try_enqueue(traces)
+
+
+def collect_spooled_traces(job: Any) -> int:
+    """Send the traces written to the spool file by a middleware container script.
+
+    The traces go to the job's background sender, or are sent at once if there is none. This
+    function never raises, so that it can be called however the container run ended.
+
+    Args:
+        job: Job object.
+
+    Returns:
+        Number of traces read from the spool file.
+    """
+    try:
+        traces = read_trace_spool(job.workdir)
+        if traces:
+            send_traces(traces, job_id=job.jobid, workdir=job.workdir)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f'failed to send the rucio traces of the middleware container: {exc}')
+        return 0
+
+    return len(traces)
+
+
+set_background_sender(_enqueue_for_job)

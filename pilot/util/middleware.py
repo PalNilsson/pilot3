@@ -46,6 +46,7 @@ from pilot.util.filehandling import (
     write_file,
 )
 from pilot.util.proxy import remove_container_proxies
+from pilot.util.tracesender import collect_spooled_traces
 
 logger = logging.getLogger(__name__)
 errors = ErrorCodes()
@@ -203,6 +204,8 @@ def containerise_middleware(
     finally:
         # the container may have been given a copy of the pilot's own proxy in the work directory
         remove_container_proxies(job.workdir)
+        # send the rucio traces written by the script, also if it failed (this never raises)
+        collect_spooled_traces(job)
 
     # handle errors, file statuses, etc (the stage-in/out scripts write errors and file status to a json file)
     try:

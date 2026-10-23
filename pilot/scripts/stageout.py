@@ -41,7 +41,10 @@ from pilot.util.config import config
 from pilot.util.https import https_setup
 from pilot.util.filehandling import write_json
 from pilot.util.loggingsupport import establish_logging
-from pilot.util.tracereport import TraceReport
+from pilot.util.tracereport import (
+    TraceReport,
+    enable_trace_spool
+)
 
 errors = ErrorCodes()
 
@@ -306,6 +309,9 @@ if __name__ == '__main__':  # noqa: C901
 
     establish_logging(debug=args.debug, nopilotlog=args.nopilotlog, filename=config.Pilot.stageoutlog)
     logger = logging.getLogger(__name__)
+
+    # the pilot sends the rucio traces after this script has finished, so that they do not delay the transfers
+    enable_trace_spool(args.workdir)
 
     # get the file info
     lfns, scopes, ddmendpoints, datasets, guids = get_file_lists(args.lfns, args.scopes, args.ddmendpoints, args.datasets, args.guids)

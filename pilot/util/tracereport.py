@@ -39,6 +39,15 @@ are never serialised into the payload sent to the server.
 Several traces can be sent in one request with :func:`send_bulk` (the Rucio
 trace server accepts a list of traces since Rucio 37). See also
 :mod:`pilot.util.tracesender` for sending traces in the background.
+
+Where a trace goes (:meth:`TraceReport.send` and :func:`send_traces`):
+
+1. to the spool file, in a middleware container script (see
+   :func:`enable_trace_spool`); the pilot sends these traces after the
+   container has finished;
+2. to the background sender of the job, if there is one (it registers
+   itself with :func:`set_background_sender`);
+3. otherwise, the traces are sent at once, as before.
 """
 
 from __future__ import annotations
@@ -47,9 +56,13 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 
-from collections.abc import Iterable
+from collections.abc import (
+    Callable,
+    Iterable
+)
 from dataclasses import dataclass
 
 from io import TextIOWrapper
@@ -99,6 +112,7 @@ DEFAULT_TRACE_BATCH_SIZE = 100
 DEFAULT_TRACE_TIMEOUT = 30
 TRACE_ACCEPTED_REPLY = 'Created'  # reply text of the Rucio trace server (HTTP 201) for an accepted request
 GENERIC_TRACE_ERROR = 1  # stored when a failed trace request has no HTTP status code
+DEFAULT_TRACE_SPOOL_FILE = 'rucio_traces.jsonl'
 
 
 def traces_disabled() -> bool:
@@ -414,27 +428,34 @@ class TraceReport(dict):
         Any unhandled exception is caught and logged so that a tracing
         failure never aborts the calling code.
 
+        Inside a middleware container script, the report is written to the
+        spool file instead, and if the job has a background sender, the
+        report is queued there (see :func:`defer_traces`). In both cases the
+        call returns at once.
+
         Sending can be disabled globally by setting the environment variable
         ``PILOT_USE_RUCIO_TRACES`` to ``'False'``.
 
         Returns:
-            ``True`` if the trace was sent successfully or if sending was
-            disabled; ``False`` if :meth:`prepare` failed or the server did
-            not accept the trace.
+            ``True`` if the trace was sent successfully, spooled or queued, or
+            if sending was disabled; ``False`` if :meth:`prepare` failed or the
+            server did not accept the trace.
         """
         # only send trace if it is actually required (can be turned off with pilot option)
         if traces_disabled():
             logger.debug('rucio trace does not need to be sent')
             return True
 
-        url = config.Rucio.url
-        logger.info(f"tracing server: {url}")
         logger.info(f"sending tracing report: {self}")
-
         data_dict = self.prepare()
         if data_dict is None:
             return False
 
+        if defer_traces([data_dict], self.get('appid')):
+            return True
+
+        url = config.Rucio.url
+        logger.info(f"tracing server: {url}")
         try:
             logger.debug(f'data_dict={data_dict}')
             ret = request2(url=url, json_body=data_dict, secure=False, compressed=False,
@@ -733,3 +754,205 @@ def send_bulk(traces: Iterable[dict[str, Any]], workdir: str = '') -> BulkResult
                 f'invalid={result.invalid}, time={result.elapsed:.1f} s')
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# routing: spool file (middleware containers), background sender, or at once
+# ---------------------------------------------------------------------------
+
+
+class _TraceRouting:  # pylint: disable=too-few-public-methods
+    """Where traces go instead of being sent at once (module state, see :func:`reset_trace_routing`)."""
+
+    def __init__(self) -> None:
+        """Start with no spool file and no background sender."""
+        self.spool_path = ''  # set in middleware container scripts
+        self.background: Callable[[list, Any], bool] | None = None  # set by pilot.util.tracesender
+        self.lock = threading.Lock()  # serialises the spool file writes
+
+
+_routing = _TraceRouting()
+
+
+def get_trace_spool_path(workdir: str) -> str:
+    """Return the path of the trace spool file in a work directory.
+
+    Args:
+        workdir: Job work directory.
+
+    Returns:
+        Path of the spool file (``[Rucio] trace_spool_file``, or its default if the setting is missing).
+    """
+    name = getattr(config.Rucio, 'trace_spool_file', '') or DEFAULT_TRACE_SPOOL_FILE
+
+    return os.path.join(workdir, name)
+
+
+def enable_trace_spool(workdir: str) -> str:
+    """Write traces to the spool file in the work directory instead of sending them.
+
+    This is used by the middleware container scripts: the pilot sends the traces after the
+    container has finished (see :func:`read_trace_spool`), so that they do not delay stage-in
+    or stage-out.
+
+    Args:
+        workdir: Job work directory (as seen by the script).
+
+    Returns:
+        Path of the spool file.
+    """
+    _routing.spool_path = get_trace_spool_path(workdir)
+    logger.info(f'rucio traces will be written to {_routing.spool_path} and sent by the pilot')
+
+    return _routing.spool_path
+
+
+def set_background_sender(handler: Callable[[list, Any], bool] | None) -> None:
+    """Register the function that hands traces to the background sender of a job.
+
+    The function is called with the traces and the job id, and returns True if it took the
+    traces. It is registered by :mod:`pilot.util.tracesender`, which imports this module.
+
+    Args:
+        handler: The function, or None to remove it.
+    """
+    _routing.background = handler
+
+
+def reset_trace_routing() -> None:
+    """Turn the spool file off (for tests). The background sender function is kept."""
+    _routing.spool_path = ''
+
+
+def spool_traces(traces: Iterable[dict[str, Any]]) -> bool:
+    """Append traces to the spool file, one JSON line per trace.
+
+    Traces that cannot be verified are dropped (see :func:`prepare_traces`).
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+
+    Returns:
+        True if the traces were written (or there was nothing to write), False if the file could not be written.
+    """
+    prepared, _ = prepare_traces(traces)
+    if not prepared:
+        return True
+
+    path = _routing.spool_path
+    lines = ''.join(dumps(trace) + '\n' for trace in prepared)
+    try:
+        with _routing.lock, open(path, 'a', encoding='utf-8') as spool:
+            spool.write(lines)
+    except OSError as exc:
+        logger.warning(f'failed to write {len(prepared)} trace(s) to {path}: {exc} - will send them now')
+        return False
+    logger.info(f'wrote {len(prepared)} trace(s) to {path}')
+
+    return True
+
+
+def read_trace_spool(workdir: str) -> list[dict[str, Any]]:
+    """Read the traces written to the spool file by a middleware container script, and remove the file.
+
+    Damaged lines, e.g. a last line cut short when the container was killed, are skipped.
+
+    Args:
+        workdir: Job work directory.
+
+    Returns:
+        The traces (empty if there is no spool file).
+    """
+    path = get_trace_spool_path(workdir)
+    if not os.path.exists(path):
+        return []
+
+    try:
+        with open(path, encoding='utf-8', errors='replace') as spool:
+            lines = spool.read().splitlines()
+    except OSError as exc:
+        logger.warning(f'failed to read {path}: {exc}')
+        return []
+
+    traces, damaged = parse_spool_lines(lines)
+    if damaged:
+        logger.warning(f'skipped {damaged} damaged line(s) in {path}')
+
+    try:
+        os.remove(path)
+    except OSError as exc:
+        logger.warning(f'failed to remove {path}: {exc}')
+    logger.info(f'read {len(traces)} trace(s) from {path}')
+
+    return traces
+
+
+def parse_spool_lines(lines: Iterable[str]) -> tuple[list[dict[str, Any]], int]:
+    """Return the traces in the lines of a spool file.
+
+    Blank lines are ignored. A line that is not a JSON object is damaged.
+
+    Args:
+        lines: Lines of the spool file.
+
+    Returns:
+        A tuple ``(traces, damaged)`` with the traces and the number of damaged lines.
+    """
+    traces = []
+    damaged = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            trace = loads(line)
+        except ValueError:
+            trace = None
+        if isinstance(trace, dict):
+            traces.append(trace)
+        else:
+            damaged += 1
+
+    return traces, damaged
+
+
+def defer_traces(traces: list[dict[str, Any]], job_id: Any = None) -> bool:
+    """Write traces to the spool file, or queue them in the job's background sender, instead of sending them now.
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+        job_id: PanDA job id (``appid`` of the traces).
+
+    Returns:
+        True if the traces were taken care of, False if the caller should send them now.
+    """
+    if _routing.spool_path:
+        return spool_traces(traces)
+
+    handler = _routing.background
+    if handler is None:
+        return False
+
+    try:
+        return bool(handler(traces, job_id))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(f'failed to queue {len(traces)} trace(s) for sending in the background: {exc}')
+        return False
+
+
+def send_traces(traces: Iterable[dict[str, Any]], job_id: Any = None, workdir: str = '') -> None:
+    """Send several traces: to the spool file or the job's background sender if possible, otherwise at once.
+
+    Sending at once uses :func:`send_bulk`.
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+        job_id: PanDA job id (``appid`` of the traces).
+        workdir: Job work directory (for the trace error file).
+    """
+    traces = list(traces)  # the traces are used twice if they cannot be deferred
+    if traces_disabled():
+        logger.debug('rucio traces do not need to be sent')
+        return
+
+    if not defer_traces(traces, job_id):
+        send_bulk(traces, workdir=workdir)

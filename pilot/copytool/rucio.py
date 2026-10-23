@@ -49,7 +49,7 @@ from pilot.util.config import config
 from pilot.util.filehandling import rename_xrdlog
 from pilot.util.tracereport import (
     TraceReport,
-    send_bulk
+    send_traces
 )
 from .common import (
     resolve_common_transfer_errors,
@@ -342,7 +342,8 @@ def send_stagein_traces(trace_report: Any, attempts: list, rucio_failed: bool) -
     """Send the file's trace, together with the traces of its failed download attempts.
 
     Without failed attempts, the file's trace is sent on its own, as before. Otherwise all traces are
-    sent in one request.
+    sent together (see :func:`~pilot.util.tracereport.send_traces`): in one request, or through the
+    spool file or the job's background sender like any other trace.
 
     Args:
         trace_report: The file's trace report.
@@ -355,7 +356,7 @@ def send_stagein_traces(trace_report: Any, attempts: list, rucio_failed: bool) -
         return
 
     logger.info(f'sending the trace of {trace_report.get("filename")} with {len(attempt_traces)} trace(s) for failed download attempts')
-    send_bulk(attempt_traces + [trace_report], workdir=getattr(trace_report, 'workdir', ''))
+    send_traces(attempt_traces + [trace_report], job_id=trace_report.get('appid'), workdir=getattr(trace_report, 'workdir', ''))
 
 
 def handle_rucio_error(error_msg: str, trace_report: dict, trace_report_out: list, fspec: Any,

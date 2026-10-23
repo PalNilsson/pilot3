@@ -503,7 +503,7 @@ class TestTraceSender(_StubServerTestCase):
         self.assertEqual(self.state.max_active, 1)
 
     def test_failure_degrades(self):
-        """After a failed request, one request at a time, and the rest is abandoned at the end."""
+        """After a failed request, one request at a time, and every trace is lost."""
         self.state.mode = 'fail'
         self.state.delay = 0.1
         sender = self.sender(parallel=2)
@@ -526,29 +526,55 @@ class TestTraceSender(_StubServerTestCase):
         self.assertEqual(sender.summary.sent, 100)
         self.assertEqual(self.stored_error(), '')
 
-    def test_degraded_finish_does_not_wait(self):
-        """A degraded sender abandons the queued traces at once."""
+    def test_degraded_finish_waits_at_most_the_timeout(self):
+        """A degraded sender waits at most trace_timeout seconds, then abandons the rest."""
         self.state.mode = 'fail'
-        sender = self.sender()
+        sender = self.sender(timeout=1, final_wait=10)
         sender.enqueue(self.traces(100))
         self.wait_for(lambda: sender.degraded)
-        self.state.delay = 2.0
+        self.state.delay = 0.6
         sender.enqueue(self.traces(300))
         t0 = time.time()
         summary = sender.finish()
-        self.assertLess(time.time() - t0, 1.0)
+        elapsed = time.time() - t0
+        self.assertGreater(elapsed, 0.9)
+        self.assertLess(elapsed, 1.6)
         self.assertEqual(summary.lost, 400)
+        self.assertGreater(summary.abandoned, 0)
+
+    def test_degraded_finish_sends_late_traces(self):
+        """Traces queued at the end of the job (stage-out) are still sent by a degraded sender."""
+        self.state.delay = 0.2
+        sender = self.sender(slow_threshold=0.1, timeout=5, final_wait=10)
+        sender.enqueue(self.traces(10))
+        self.wait_for(lambda: sender.degraded)
+        sender.enqueue(self.traces(30))  # e.g. the output and log traces
+        summary = sender.finish()
+        self.assertTrue(summary.degraded)
+        self.assertEqual((summary.sent, summary.lost), (40, 0))
+
+    def test_degraded_wait_is_not_longer_than_the_final_wait(self):
+        """A degraded sender never waits longer than trace_final_wait."""
+        self.state.mode = 'fail'
+        sender = self.sender(timeout=5, final_wait=0.5)
+        sender.enqueue(self.traces(100))
+        self.wait_for(lambda: sender.degraded)
+        self.state.delay = 2.0
+        sender.enqueue(self.traces(100))
+        t0 = time.time()
+        sender.finish()
+        self.assertLess(time.time() - t0, 1.2)
 
     def test_degradation_during_final_wait(self):
-        """When the first request fails during the final wait, the remaining traces are abandoned (job 7372130338)."""
+        """When requests fail during the final wait, the wait ends after trace_timeout seconds (job 7372130338)."""
         self.state.mode = 'fail'
         self.state.delay = 0.5
-        sender = self.sender()
+        sender = self.sender(timeout=1, final_wait=30)
         sender.enqueue(self.traces(500))
         t0 = time.time()
         summary = sender.finish()
-        self.assertLess(time.time() - t0, 1.5)
-        self.assertLessEqual(len(self.state.requests), 2)
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertLessEqual(len(self.state.requests), 3)
         self.assertEqual(summary.lost, 500)
 
     def test_counts_are_final_after_finish(self):
@@ -736,7 +762,7 @@ class TestJob7372130338(_StubServerTestCase):
 
         t0 = time.time()
         summary = finish_traces(self.job, self.args)
-        self.assertLess(time.time() - t0, 5.0)  # stops waiting once the first request has failed
+        self.assertLess(time.time() - t0, 5.0)  # degraded after the first failure: the wait is bounded by trace_timeout
         self.assertEqual(summary.lost, 200)
         self.assertEqual(get_lost_traces(self.job.jobid), 200)
         self.assertLessEqual(len(self.state.requests), 2)  # bulk: at most two requests, not 200
@@ -937,7 +963,8 @@ class TestRetriedDownloads(unittest.TestCase):
         self.sent_bulk = []
         self.patches = [
             patch.object(TraceReport, 'send', autospec=True, side_effect=lambda report: self.sent_single.append(dict(report))),
-            patch.object(rucio_copytool, 'send_bulk', side_effect=lambda traces, workdir='': self.sent_bulk.append([dict(t) for t in traces])),
+            patch.object(rucio_copytool, 'send_traces',
+                         side_effect=lambda traces, job_id=None, workdir='': self.sent_bulk.append([dict(t) for t in traces])),
             patch.object(rucio_copytool, 'verify_catalog_checksum', return_value=('', '')),
             patch.object(rucio_copytool, 'rename_xrdlog'),
         ]
