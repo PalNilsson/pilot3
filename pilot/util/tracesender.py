@@ -46,7 +46,9 @@ before the final update, and the remaining traces are sent first, bounded by:
 - graceful stop (no wait if it is already set).
 
 The traces that have not been sent then are abandoned. Abandoned traces, and
-traces in failed requests, are counted as lost.
+traces in failed requests, are counted as lost. ``finish()`` then logs the
+job's trace report, which lists every trace and what happened to it (see
+:mod:`pilot.util.tracesummary`).
 
 Copytools send their traces with :meth:`TraceReport.send`, which hands them
 to the job's sender when there is one (this module registers itself with
@@ -76,12 +78,21 @@ from pilot.util.tracereport import (
     get_trace_error_code,
     get_trace_setting,
     post_traces,
-    prepare_traces,
     read_trace_spool,
     send_traces,
     set_background_sender,
+    split_traces,
     store_trace_error,
     traces_disabled
+)
+from pilot.util.tracesummary import (
+    ABANDONED,
+    FAILED,
+    INVALID,
+    SENT,
+    TraceRecord,
+    TraceStats,
+    format_trace_report
 )
 
 logger = logging.getLogger(__name__)
@@ -229,14 +240,14 @@ class TraceSender:
         self.job_id = job_id
         self.workdir = workdir
         self.settings = settings or TraceSettings.from_config()
-        self._parallel = max(parallel, 1)
-        self._pending: deque = deque()
-        self._in_flight = 0
+        self._pending: deque = deque()  # (prepared trace, record) pairs
+        self._in_flight: list[tuple[dict[str, Any], TraceRecord]] = []
+        self._records: list[TraceRecord] = []  # one per trace, for the trace report
+        self._stats = TraceStats(parallel=max(parallel, 1), started=time.time())  # request statistics and start time
         self._cond = threading.Condition()
         self._thread: threading.Thread | None = None
         self._state = RUNNING
         self._summary = TraceSummary()  # summary.degraded is also the live degraded flag
-        self._t0 = time.time()
 
     @property
     def parallel(self) -> int:
@@ -245,7 +256,7 @@ class TraceSender:
         Returns:
             1 if degraded, otherwise the number set at creation.
         """
-        return 1 if self._summary.degraded else self._parallel
+        return 1 if self._summary.degraded else self._stats.parallel
 
     @property
     def degraded(self) -> bool:
@@ -291,13 +302,13 @@ class TraceSender:
             logger.debug('rucio traces do not need to be sent')
             return 0
 
-        prepared, invalid = prepare_traces(traces)
+        prepared, rejected = split_traces(traces)
         with self._cond:
-            self._summary.invalid += invalid
+            self._summary.invalid += len(rejected)
             if self._state != RUNNING:
                 logger.warning(f'{len(prepared)} trace(s) arrived after the trace sender was stopped (final update) and will not be sent')
                 return 0
-            waiting = self._add(prepared)
+            waiting = self._add(prepared, rejected)
         self._log_queued(len(prepared), waiting)
 
         return len(prepared)
@@ -319,27 +330,34 @@ class TraceSender:
             logger.debug('rucio traces do not need to be sent')
             return True
 
-        prepared, invalid = prepare_traces(traces)
+        prepared, rejected = split_traces(traces)
         with self._cond:
             if self._state != RUNNING:
                 return False
-            self._summary.invalid += invalid
-            waiting = self._add(prepared)
+            self._summary.invalid += len(rejected)
+            waiting = self._add(prepared, rejected)
         self._log_queued(len(prepared), waiting)
 
         return True
 
-    def _add(self, prepared: list[dict[str, Any]]) -> int:
-        """Queue prepared traces and wake up the worker. Must be called with the lock held.
+    def _add(self, prepared: list[dict[str, Any]], rejected: list[dict[str, Any]]) -> int:
+        """Queue prepared traces, record all traces for the report, and wake up the worker.
+
+        Must be called with the lock held.
 
         Args:
             prepared: Prepared traces.
+            rejected: Traces that could not be verified (recorded as invalid).
 
         Returns:
             Number of traces waiting to be sent.
         """
+        self._records.extend(TraceRecord.from_trace(trace, INVALID) for trace in rejected)
+        for trace in prepared:
+            record = TraceRecord.from_trace(trace)
+            self._records.append(record)
+            self._pending.append((trace, record))
         if prepared:
-            self._pending.extend(prepared)
             self._start_worker()
             self._cond.notify_all()
 
@@ -369,23 +387,44 @@ class TraceSender:
         with self._cond:
             if self._state == FINISHED:
                 return replace(self._summary)
+            t0 = time.time()
             self._wait_for_remaining(graceful_stop)  # returns at once if graceful stop has been set
+            self._stats.final_wait = time.time() - t0
             # traces of a request still in flight are counted as abandoned, since the outcome is unknown
-            self._summary.abandoned += len(self._pending) + self._in_flight
+            unsent = list(self._pending) + self._in_flight
+            self._summary.abandoned += len(unsent)
+            for _, record in unsent:
+                record.result = ABANDONED
             self._pending.clear()
             self._state = FINISHED
-            self._summary.elapsed = time.time() - self._t0
+            self._summary.elapsed = time.time() - self._stats.started
+            self._stats.degraded = self._summary.degraded
             self._cond.notify_all()
             summary = replace(self._summary)
+            records = list(self._records)
+            stats = replace(self._stats)
 
-        msg = (f'rucio traces of job {self.job_id}: sent={summary.sent}, failed={summary.failed}, '
-               f'abandoned={summary.abandoned}, invalid={summary.invalid}, time={summary.elapsed:.1f} s')
-        if summary.lost:
-            logger.warning(msg)
-        else:
-            logger.info(msg)
+        self._log_report(summary, records, stats)
 
         return summary
+
+    def _log_report(self, summary: TraceSummary, records: list[TraceRecord], stats: TraceStats) -> None:
+        """Log the trace report of the job (see :mod:`pilot.util.tracesummary`).
+
+        The one-line summary in the report is logged as a warning if traces were lost.
+
+        Args:
+            summary: Final counts.
+            records: One record per trace.
+            stats: Request statistics.
+        """
+        counts = (f'rucio traces of job {self.job_id}: sent={summary.sent}, failed={summary.failed}, '
+                  f'abandoned={summary.abandoned}, invalid={summary.invalid}, time={summary.elapsed:.1f} s')
+        for line in format_trace_report(self.job_id, counts, records, stats, disabled=traces_disabled()):
+            if summary.lost and line.endswith(counts):
+                logger.warning(line)
+            else:
+                logger.info(line)
 
     def stop(self) -> None:
         """Stop the worker without sending the remaining traces or counting them."""
@@ -444,21 +483,21 @@ class TraceSender:
                 if self._state != RUNNING:
                     return
                 batches = self._next_batches()
-                self._in_flight = sum(len(batch) for batch in batches)
+                self._in_flight = [item for batch in batches for item in batch]
 
             results = self._send_batches(batches)
 
             with self._cond:
-                self._in_flight = 0
+                self._in_flight = []
                 if self._state == RUNNING:  # otherwise finish() has already counted these traces
-                    self._record(results)
+                    self._record(results, batches)
                 self._cond.notify_all()
 
-    def _next_batches(self) -> list[list[dict[str, Any]]]:
+    def _next_batches(self) -> list[list[tuple[dict[str, Any], TraceRecord]]]:
         """Take the traces for the next round of requests off the queue. Must be called with the lock held.
 
         Returns:
-            One list of traces per request.
+            One list of (trace, record) pairs per request.
         """
         batches = []
         while self._pending and len(batches) < self.parallel:
@@ -467,11 +506,11 @@ class TraceSender:
 
         return batches
 
-    def _send_batches(self, batches: list[list[dict[str, Any]]]) -> list[BatchResult]:
+    def _send_batches(self, batches: list[list[tuple[dict[str, Any], TraceRecord]]]) -> list[BatchResult]:
         """Send one request per batch, at the same time if there is more than one.
 
         Args:
-            batches: One list of traces per request.
+            batches: One list of (trace, record) pairs per request.
 
         Returns:
             One result per request.
@@ -492,44 +531,52 @@ class TraceSender:
         return [result if result is not None else BatchResult(len(batch), False, float(self.settings.timeout), 'no reply')
                 for result, batch in zip(results, batches)]
 
-    def _post(self, batch: list[dict[str, Any]]) -> BatchResult:
+    def _post(self, batch: list[tuple[dict[str, Any], TraceRecord]]) -> BatchResult:
         """Send one request.
 
         Args:
-            batch: Prepared traces.
+            batch: (prepared trace, record) pairs.
 
         Returns:
             The outcome.
         """
         t0 = time.time()
-        accepted, reply = post_traces(batch, self.settings.timeout)
+        accepted, reply = post_traces([trace for trace, _ in batch], self.settings.timeout)
 
         return BatchResult(len(batch), accepted, time.time() - t0, reply)
 
-    def _post_into(self, batch: list[dict[str, Any]], results: list[BatchResult | None], index: int) -> None:
+    def _post_into(self, batch: list[tuple[dict[str, Any], TraceRecord]], results: list[BatchResult | None], index: int) -> None:
         """Send one request and store the outcome (target of a request thread).
 
         Args:
-            batch: Prepared traces.
+            batch: (prepared trace, record) pairs.
             results: Result list.
             index: Position of this request in the result list.
         """
         results[index] = self._post(batch)
 
-    def _record(self, results: list[BatchResult]) -> None:
+    def _record(self, results: list[BatchResult], batches: list[list[tuple[dict[str, Any], TraceRecord]]]) -> None:
         """Count the outcome of a round of requests and degrade on failure or slowness. Must be called with the lock held.
 
         Args:
-            results: Outcomes.
+            results: Outcomes, one per request.
+            batches: The (trace, record) pairs of each request.
         """
-        for result in results:
+        for result, batch in zip(results, batches):
+            self._stats.requests += 1
+            self._stats.sending_time += result.elapsed
             if result.accepted:
                 self._summary.sent += result.size
+                outcome = SENT
             else:
                 self._summary.failed += result.size
                 logger.warning(f'failed to send {result.size} trace(s): {result.reply}')
-                store_trace_error(self.workdir, get_trace_error_code(result.reply))
+                code = get_trace_error_code(result.reply)
+                store_trace_error(self.workdir, code)
+                outcome = f'{FAILED} (HTTP {code})' if code >= 100 else FAILED
                 self._degrade('a trace request failed')
+            for _, record in batch:
+                record.result = outcome
             if result.elapsed > self.settings.slow_threshold:
                 self._degrade(f'a trace request took {result.elapsed:.1f} s')
 

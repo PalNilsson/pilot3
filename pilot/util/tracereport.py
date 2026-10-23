@@ -681,19 +681,33 @@ def prepare_traces(traces: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any
     Returns:
         A tuple ``(prepared, invalid)`` with the prepared traces and the number of dropped traces.
     """
+    prepared, rejected = split_traces(traces)
+
+    return prepared, len(rejected)
+
+
+def split_traces(traces: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prepare traces for sending, and return the ones that cannot be verified separately.
+
+    Args:
+        traces: Trace reports, or plain dictionaries with trace report fields.
+
+    Returns:
+        A tuple ``(prepared, rejected)`` with the prepared traces and the traces that could not be verified.
+    """
     prepared = []
-    invalid = 0
+    rejected = []
     for trace in traces:
         report = trace if isinstance(trace, TraceReport) else TraceReport(trace)
         data = report.prepare()
         if data is None:
-            invalid += 1
+            rejected.append(report)
         else:
             prepared.append(data)
-    if invalid:
-        logger.warning(f'dropped {invalid} trace(s) that could not be verified')
+    if rejected:
+        logger.warning(f'dropped {len(rejected)} trace(s) that could not be verified')
 
-    return prepared, invalid
+    return prepared, rejected
 
 
 def post_traces(batch: list[dict[str, Any]], timeout: int) -> tuple[bool, Any]:

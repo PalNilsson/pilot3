@@ -2135,7 +2135,9 @@ def request2(url: str = "", *, params: dict[str, Any | None] = None, json_body: 
         else:
             return f"failed to send request: HTTP Error {code}: {reason}"
 
-    except (urllib.error.URLError, http_client.RemoteDisconnected, TimeoutError, ssl.SSLError) as exc:
+    # a read time-out raises socket.timeout, which only became an alias of TimeoutError in Python 3.10
+    except (urllib.error.URLError, http_client.RemoteDisconnected, TimeoutError, socket.timeout,  # pylint: disable=overlapping-except
+            ssl.SSLError) as exc:
         ret = f"failed to send request: {exc}"
         logger.warning(ret)
         return ret
