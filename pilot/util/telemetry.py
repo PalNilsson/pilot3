@@ -397,7 +397,7 @@ def handle_pilot_telemetry(job: Any, args: Any, final_update_accepted: bool) -> 
 
     The telemetry is sent when the pilot updates the server itself and the final update was accepted, i.e. the
     job was marked as completed. The caller only calls this function once per job, since update_server() refuses
-    to run for a completed job.
+    to run for a completed job and serialises concurrent callers.
 
     Args:
         job: Job object.

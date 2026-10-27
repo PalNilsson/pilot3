@@ -711,7 +711,12 @@ def _parse_update_response(res: dict[str, Any]) -> tuple[bool, int | None, str |
     """
     success = res.get("success")
     message = res.get("message") or ""
-    data = res.get("data", {})
+    data = res.get("data")
+    if data is None:
+        # the api/v1 envelope sends 'data': None when there is nothing to return, e.g.
+        # {'success': False, 'message': 'Pilot attributes for PandaID=.. were already inserted ..', 'data': None},
+        # which is the same as a missing data field (and must not hide the server message as a malformed response)
+        data = {}
 
     if success and not data:
         logger.debug(f"Server response success=True, message={message!r} (data not returned)")

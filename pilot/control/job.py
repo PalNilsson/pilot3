@@ -212,6 +212,13 @@ PAYLOAD_KILL_EXIT_CODES = frozenset({
     errors.PAYLOADPROXYDOWNLOADFAILURE,  # a job proxy could not be renewed before it expired
 })
 
+# Serialises update_server(). Several threads can send the final update for the same job (e.g. job_monitor after an
+# abort and queue_monitor once the failed job reaches it), and the job.completed guard is only set at the end of a
+# successful final update, so without the lock both could pass the guard (job 7378803325: two final updates and the
+# pilot telemetry sent twice, while the first thread was handling a 'tobekilled' command in the server response).
+# Reentrant, so that a nested call from the same thread cannot deadlock.
+FINAL_UPDATE_LOCK = threading.RLock()
+
 
 def control(queues: namedtuple, traces: Any, args: object) -> None:
     """Set up job control threads.
@@ -4078,6 +4085,25 @@ def merge_worker_maps(
 def update_server(job: Any, args: Any) -> None:
     """Update the server (wrapper for send_state() that also prepares the metadata).
 
+    Only one thread at a time can update the server for a job: a second caller waits until the first one has
+    finished, and then returns without sending anything if the first one completed the job.
+
+    Args:
+        job: job object.
+        args: Pilot arguments object.
+    """
+    if not FINAL_UPDATE_LOCK.acquire(blocking=False):  # pylint: disable=consider-using-with
+        logger.info(f'another thread is updating the server for job {job.jobid} - waiting for it to finish')
+        FINAL_UPDATE_LOCK.acquire()  # pylint: disable=consider-using-with
+    try:
+        _update_server(job, args)
+    finally:
+        FINAL_UPDATE_LOCK.release()
+
+
+def _update_server(job: Any, args: Any) -> None:
+    """Update the server (see update_server(), which must be the only caller since it holds the lock).
+
     Args:
         job: job object.
         args: Pilot arguments object.
@@ -4136,7 +4162,8 @@ def update_server(job: Any, args: Any) -> None:
         remove_sender(job.jobid)  # otherwise keep it, so that a repeated final update reports the same lost traces
 
     # job.completed was False on entry (see above), so it being set now means that this call was the accepted final
-    # update. The telemetry is therefore sent at most once per job
+    # update. Since update_server() holds FINAL_UPDATE_LOCK, no other thread can have passed the same check, and the
+    # telemetry is therefore sent at most once per job
     handle_pilot_telemetry(job, args, accepted)
 
 
