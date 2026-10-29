@@ -126,14 +126,15 @@ def traces_disabled() -> bool:
     return environ.get('PILOT_USE_RUCIO_TRACES', 'True') == 'False'
 
 
-def get_trace_setting(name: str, default: int) -> int:
-    """Return a positive integer trace setting from the ``[Rucio]`` config section.
+def get_trace_setting(name: str, default: int, minimum: int = 1) -> int:
+    """Return an integer trace setting from the ``[Rucio]`` config section.
 
     The default is used if the setting is missing (e.g. in a custom config file) or invalid.
 
     Args:
         name: Setting name.
-        default: Value used if the setting is missing or not a positive integer.
+        default: Value used if the setting is missing, not an integer, or below ``minimum``.
+        minimum: Smallest valid value (default 1, i.e. the setting must be positive).
 
     Returns:
         The setting value.
@@ -143,7 +144,7 @@ def get_trace_setting(name: str, default: int) -> int:
     except (AttributeError, TypeError, ValueError):
         return default
 
-    return value if value > 0 else default
+    return value if value >= minimum else default
 
 
 def is_trace_accepted(reply: Any) -> bool:

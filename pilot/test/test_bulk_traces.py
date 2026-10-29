@@ -167,8 +167,9 @@ class _StubServerTestCase(unittest.TestCase):
                             filename=f'file{i}', workdir=self.workdir) for i in range(n)]
 
     def sender(self, parallel: int = 1, **settings) -> TraceSender:
-        """Return a trace sender with test settings."""
-        defaults = {'batch_size': 100, 'max_parallel': 2, 'timeout': 10, 'slow_threshold': 5, 'final_wait': 10}
+        """Return a trace sender with test settings (traces sent at once unless batch_wait is given)."""
+        defaults = {'batch_size': 100, 'max_parallel': 2, 'timeout': 10, 'slow_threshold': 5, 'final_wait': 10,
+                    'batch_wait': 0}
         defaults.update(settings)
         return TraceSender('1234', self.workdir, parallel=parallel, settings=TraceSettings(**defaults))
 
@@ -245,11 +246,30 @@ class TestTraceSetting(unittest.TestCase):
         with patch.object(config.Rucio, 'trace_batch_size', 25):
             self.assertEqual(get_trace_setting('trace_batch_size', 100), 25)
 
+    def test_minimum(self):
+        """With minimum 0, zero is valid but a negative value is not."""
+        with patch.object(config.Rucio, 'trace_batch_wait', 0):
+            self.assertEqual(get_trace_setting('trace_batch_wait', 60, minimum=0), 0)
+        with patch.object(config.Rucio, 'trace_batch_wait', -1):
+            self.assertEqual(get_trace_setting('trace_batch_wait', 60, minimum=0), 60)
+        with patch.object(config.Rucio, 'trace_batch_wait', 5):
+            self.assertEqual(get_trace_setting('trace_batch_wait', 60, minimum=6), 60)
+            self.assertEqual(get_trace_setting('trace_batch_wait', 60, minimum=5), 5)
+
+    def test_batch_wait(self):
+        """trace_batch_wait may be 0 (send at once); missing or invalid values give the default."""
+        with patch.object(config.Rucio, 'trace_batch_wait', 0):
+            self.assertEqual(TraceSettings.from_config().batch_wait, 0)
+        with patch.object(config.Rucio, 'trace_batch_wait', 'abc'):
+            self.assertEqual(TraceSettings.from_config().batch_wait, 60)
+        with patch.object(config.Rucio, 'trace_batch_wait', 15):
+            self.assertEqual(TraceSettings.from_config().batch_wait, 15)
+
     def test_default_config(self):
         """The values in default.cfg."""
         settings = TraceSettings.from_config()
         self.assertEqual((settings.batch_size, settings.max_parallel, settings.timeout, settings.slow_threshold,
-                          settings.final_wait), (100, 2, 30, 20, 600))
+                          settings.final_wait, settings.batch_wait), (100, 2, 30, 20, 600, 60))
 
 
 class TestPrepare(unittest.TestCase):
@@ -653,6 +673,139 @@ class TestTraceSender(_StubServerTestCase):
         self.assertEqual(sender.finish().sent, 0)
 
 
+class TestHeldTraces(_StubServerTestCase):
+    """Traces are held so that several go in one request (``[Rucio] trace_batch_wait``).
+
+    Production job 7386436637 (pilot 3.14.6.12, MWT2_TEST) downloaded its 10 input files one at a time. Each
+    trace was queued 3-10 s after the previous one, and the worker sent it before the next one arrived, so the
+    job's 12 traces went in 12 requests. The tests use a hold time of 1 s and gaps of 0.1 s to mimic this.
+    """
+
+    def requests(self) -> list:
+        """Return the number of traces in each request received so far."""
+        with self.state.lock:
+            return [len(request) for request in self.state.requests]
+
+    def test_job_7386436637(self):
+        """Traces queued a little apart go in one request after the hold time."""
+        sender = self.sender(batch_wait=1)
+        t0 = time.time()
+        for trace in self.traces(5):
+            sender.enqueue([trace])
+            time.sleep(0.15)
+        self.assertEqual(self.requests(), [])  # still held
+        self.wait_for(lambda: self.requests() == [5])
+        self.assertLess(time.time() - t0, 1.4)  # the hold time counts from the first trace, not the last
+        self.assertEqual(sender.finish().sent, 5)
+
+    def test_held_for_at_most_the_batch_wait(self):
+        """A single trace is sent after the hold time, not before and not much later."""
+        sender = self.sender(batch_wait=1)
+        t0 = time.time()
+        sender.enqueue(self.traces(1))
+        self.wait_for(lambda: self.requests() == [1])
+        self.assertGreaterEqual(time.time() - t0, 0.9)
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_full_request_is_sent_at_once(self):
+        """Enough traces for a full request are not held."""
+        sender = self.sender(batch_wait=60, batch_size=3)
+        sender.enqueue(self.traces(2))
+        time.sleep(0.3)
+        self.assertEqual(self.requests(), [])
+        sender.enqueue(self.traces(1))
+        self.wait_for(lambda: self.requests() == [3], timeout=2.0)
+
+    def test_full_round_of_parallel_requests(self):
+        """With parallel requests, the traces are held until all requests of a round are full."""
+        self.state.delay = 0.3
+        sender = self.sender(parallel=2, batch_wait=60, batch_size=2)
+        sender.enqueue(self.traces(3))
+        time.sleep(0.3)
+        self.assertEqual(self.requests(), [])
+        sender.enqueue(self.traces(1))
+        self.wait_for(lambda: self.requests() == [2, 2], timeout=2.0)
+        self.assertEqual(self.state.max_active, 2)
+
+    def test_remaining_traces_keep_the_hold_time(self):
+        """A trace left over after a full request is sent when the oldest trace's hold time is up."""
+        sender = self.sender(batch_wait=1, batch_size=2)
+        t0 = time.time()
+        sender.enqueue(self.traces(3))
+        self.wait_for(lambda: self.requests() == [2], timeout=0.5)
+        self.wait_for(lambda: self.requests() == [2, 1], timeout=3.0)
+        self.assertGreaterEqual(time.time() - t0, 0.9)
+        self.assertLess(time.time() - t0, 1.6)
+
+    def test_new_hold_after_sending(self):
+        """A trace queued after the waiting traces were sent is held again."""
+        sender = self.sender(batch_wait=1)
+        sender.enqueue(self.traces(1))
+        self.wait_for(lambda: self.requests() == [1])
+        sender.enqueue(self.traces(1))
+        time.sleep(0.5)
+        self.assertEqual(self.requests(), [1])
+        self.wait_for(lambda: self.requests() == [1, 1])
+
+    def test_finish_sends_held_traces(self):
+        """Held traces are sent at once at the end of the job."""
+        sender = self.sender(batch_wait=60)
+        sender.enqueue(self.traces(2))
+        t0 = time.time()
+        summary = sender.finish()
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertEqual((summary.sent, summary.abandoned), (2, 0))
+        self.assertEqual(self.requests(), [2])
+
+    def test_graceful_stop_abandons_held_traces(self):
+        """Held traces are abandoned when graceful stop has been set."""
+        sender = self.sender(batch_wait=60)
+        sender.enqueue(self.traces(2))
+        event = threading.Event()
+        event.set()
+        summary = sender.finish(event)
+        self.assertEqual((summary.sent, summary.abandoned, summary.lost), (0, 2, 2))
+        self.assertEqual(self.requests(), [])
+
+    def test_stop_drops_held_traces(self):
+        """A stopped sender does not send held traces."""
+        sender = self.sender(batch_wait=1)
+        sender.enqueue(self.traces(2))
+        sender.stop()
+        time.sleep(1.3)
+        self.assertEqual(self.requests(), [])
+
+    def test_zero_sends_at_once(self):
+        """With batch_wait 0, each trace is sent as soon as it is queued."""
+        sender = self.sender(batch_wait=0)
+        sender.enqueue(self.traces(1))
+        self.wait_for(lambda: self.requests() == [1], timeout=0.5)
+
+    def test_send_reason_is_logged(self):
+        """The reason for sending held traces is logged."""
+        sender = self.sender(batch_wait=60, batch_size=2)
+        with self.assertLogs('pilot.util.tracesender', level='INFO') as logs:
+            sender.enqueue(self.traces(2))
+            self.wait_for(lambda: self.requests() == [2], timeout=2.0)
+            sender.enqueue(self.traces(1))
+            sender.finish()
+        output = '\n'.join(logs.output)
+        self.assertIn('sending 2 trace(s) in 1 request(s) (requests full)', output)
+        self.assertIn('sending 1 trace(s) in 1 request(s) (end of job)', output)
+
+    def test_creation_log(self):
+        """The log line for a new sender says how traces are sent."""
+        job = MagicMock(jobid='11', workdir=self.workdir)
+        job.infosys.queuedata.catchall = ''
+        with self.assertLogs('pilot.util.tracesender', level='INFO') as logs:
+            get_or_create_sender(job)
+        self.assertIn('traces held for at most 60 s', '\n'.join(logs.output))
+        job.jobid = '12'
+        with patch.object(config.Rucio, 'trace_batch_wait', 0), self.assertLogs('pilot.util.tracesender', level='INFO') as logs:
+            get_or_create_sender(job)
+        self.assertIn('traces sent at once', '\n'.join(logs.output))
+
+
 class TestRegistry(_StubServerTestCase):
     """One sender per job."""
 
@@ -700,7 +853,8 @@ class TestRegistry(_StubServerTestCase):
     def test_lost_traces_only_after_finish(self):
         """The lost count is only known once the sender has finished."""
         self.state.mode = 'fail'
-        sender = get_or_create_sender(self.job('6', workdir=self.workdir))
+        with patch.object(config.Rucio, 'trace_batch_wait', 0):  # send at once
+            sender = get_or_create_sender(self.job('6', workdir=self.workdir))
         sender.enqueue(self.traces(2))
         self.wait_for(lambda: sender.summary.failed == 2)
         self.assertEqual(get_lost_traces('6'), 0)

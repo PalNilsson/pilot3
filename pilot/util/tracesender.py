@@ -26,6 +26,19 @@ requests of at most ``[Rucio] trace_batch_size`` traces, so that sending them
 never delays the payload. There is one sender per job, kept in a registry
 keyed by the job id (see :func:`get_or_create_sender`).
 
+Traces are held for a while so that several can go in one request, since
+copytools that download one file at a time queue one trace every few seconds.
+The waiting traces are sent when the first of them:
+
+- has waited ``[Rucio] trace_batch_wait`` seconds;
+- is joined by enough traces to fill one round of requests
+  (``trace_batch_size`` traces per request);
+- is still waiting when the job's traces are finished (:meth:`TraceSender.finish`).
+
+With ``trace_batch_wait: 0`` the traces are sent as soon as they are queued, so
+that a request only carries several traces when they were queued together, or
+piled up while a request was in flight.
+
 Number of requests sent at the same time:
 
 - ``PARALLEL_TRACES=<n>`` in the queue's catchall field asks for ``n``
@@ -101,6 +114,7 @@ DEFAULT_PARALLEL_TRACES = 1
 DEFAULT_TRACE_MAX_PARALLEL = 2
 DEFAULT_TRACE_SLOW_THRESHOLD = 20
 DEFAULT_TRACE_FINAL_WAIT = 600
+DEFAULT_TRACE_BATCH_WAIT = 60
 PARALLEL_TRACES_KEY = 'parallel_traces'  # catchall key PARALLEL_TRACES=<n> (matched case-insensitively)
 WAIT_INTERVAL = 1.0  # seconds between graceful stop checks while waiting for the remaining traces
 JOIN_MARGIN = 30  # extra seconds to wait for a parallel request beyond its time-out
@@ -122,6 +136,7 @@ class TraceSettings:
             before the final update when the sender is degraded.
         slow_threshold: A request taking longer than this (seconds) degrades the sender.
         final_wait: Maximum time in seconds to wait for the remaining traces before the final update.
+        batch_wait: Maximum time in seconds a trace is held for more traces to join it (0: send at once).
     """
 
     batch_size: int = DEFAULT_TRACE_BATCH_SIZE
@@ -129,6 +144,7 @@ class TraceSettings:
     timeout: int = DEFAULT_TRACE_TIMEOUT
     slow_threshold: int = DEFAULT_TRACE_SLOW_THRESHOLD
     final_wait: int = DEFAULT_TRACE_FINAL_WAIT
+    batch_wait: int = DEFAULT_TRACE_BATCH_WAIT
 
     @classmethod
     def from_config(cls) -> TraceSettings:
@@ -141,7 +157,8 @@ class TraceSettings:
                    max_parallel=get_trace_setting('trace_max_parallel', DEFAULT_TRACE_MAX_PARALLEL),
                    timeout=get_trace_setting('trace_timeout', DEFAULT_TRACE_TIMEOUT),
                    slow_threshold=get_trace_setting('trace_slow_threshold', DEFAULT_TRACE_SLOW_THRESHOLD),
-                   final_wait=get_trace_setting('trace_final_wait', DEFAULT_TRACE_FINAL_WAIT))
+                   final_wait=get_trace_setting('trace_final_wait', DEFAULT_TRACE_FINAL_WAIT),
+                   batch_wait=get_trace_setting('trace_batch_wait', DEFAULT_TRACE_BATCH_WAIT, minimum=0))
 
 
 @dataclass
@@ -224,7 +241,7 @@ def _is_set(event: threading.Event | None) -> bool:
     return bool(event is not None and event.is_set())
 
 
-class TraceSender:
+class TraceSender:  # pylint: disable=too-many-instance-attributes  # queue, hold and request state of one job
     """Sends the traces of one job in the background."""
 
     def __init__(self, job_id: str, workdir: str, parallel: int = DEFAULT_PARALLEL_TRACES,
@@ -248,6 +265,8 @@ class TraceSender:
         self._thread: threading.Thread | None = None
         self._state = RUNNING
         self._summary = TraceSummary()  # summary.degraded is also the live degraded flag
+        self._hold_start = 0.0  # when the oldest waiting trace was queued (set when a trace is added to an empty queue)
+        self._flushing = False  # set by finish(): send the waiting traces at once
 
     @property
     def parallel(self) -> int:
@@ -353,6 +372,8 @@ class TraceSender:
             Number of traces waiting to be sent.
         """
         self._records.extend(TraceRecord.from_trace(trace, INVALID) for trace in rejected)
+        if prepared and not self._pending:
+            self._hold_start = time.time()
         for trace in prepared:
             record = TraceRecord.from_trace(trace)
             self._records.append(record)
@@ -388,6 +409,8 @@ class TraceSender:
             if self._state == FINISHED:
                 return replace(self._summary)
             t0 = time.time()
+            self._flushing = True  # stop holding traces
+            self._cond.notify_all()
             self._wait_for_remaining(graceful_stop)  # returns at once if graceful stop has been set
             self._stats.final_wait = time.time() - t0
             # traces of a request still in flight are counted as abandoned, since the outcome is unknown
@@ -478,12 +501,16 @@ class TraceSender:
         """Send queued traces until the sender is stopped (worker thread)."""
         while True:
             with self._cond:
-                while not self._pending and self._state == RUNNING:
-                    self._cond.wait()
+                reason = self._send_reason()
+                while reason is None and self._state == RUNNING:
+                    self._cond.wait(self._hold_time())
+                    reason = self._send_reason()
                 if self._state != RUNNING:
                     return
                 batches = self._next_batches()
                 self._in_flight = [item for batch in batches for item in batch]
+                if self.settings.batch_wait > 0:
+                    logger.info(f'sending {len(self._in_flight)} trace(s) in {len(batches)} request(s) ({reason})')
 
             results = self._send_batches(batches)
 
@@ -492,6 +519,36 @@ class TraceSender:
                 if self._state == RUNNING:  # otherwise finish() has already counted these traces
                     self._record(results, batches)
                 self._cond.notify_all()
+
+    def _send_reason(self) -> str | None:
+        """Return why the waiting traces should be sent now, or None to keep waiting. Must be called with the lock held.
+
+        Returns:
+            The reason (for the log), or None if no traces are waiting or they are still held.
+        """
+        if not self._pending:
+            return None
+        if self._flushing:
+            return 'end of job'
+        if len(self._pending) >= self.settings.batch_size * self.parallel:
+            return 'requests full'
+        held = time.time() - self._hold_start
+        if held >= self.settings.batch_wait:
+            return f'held for {held:.0f} s'
+
+        return None
+
+    def _hold_time(self) -> float | None:
+        """Return how long the worker may sleep before the waiting traces are due. Must be called with the lock held.
+
+        Returns:
+            Seconds until the oldest waiting trace has been held for ``batch_wait`` seconds, or None (no time limit)
+            if no traces are waiting.
+        """
+        if not self._pending:
+            return None
+
+        return max(self._hold_start + self.settings.batch_wait - time.time(), 0.0)
 
     def _next_batches(self) -> list[list[tuple[dict[str, Any], TraceRecord]]]:
         """Take the traces for the next round of requests off the queue. Must be called with the lock held.
@@ -628,7 +685,8 @@ def get_or_create_sender(job: Any) -> TraceSender:
             parallel = get_parallel_traces(_get_catchall(job), settings.max_parallel)
             sender = TraceSender(job_id, job.workdir, parallel=parallel, settings=settings)
             _registry[job_id] = sender
-            logger.info(f'created background trace sender for job {job_id} ({parallel} trace request(s) at a time)')
+            hold = f'traces held for at most {settings.batch_wait} s' if settings.batch_wait > 0 else 'traces sent at once'
+            logger.info(f'created background trace sender for job {job_id} ({parallel} trace request(s) at a time, {hold})')
 
     return sender
 
