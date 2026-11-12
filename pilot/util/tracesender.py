@@ -117,7 +117,7 @@ DEFAULT_PARALLEL_TRACES = 1
 DEFAULT_TRACE_MAX_PARALLEL = 2
 DEFAULT_TRACE_SLOW_THRESHOLD = 20
 DEFAULT_TRACE_FINAL_WAIT = 600
-DEFAULT_TRACE_BATCH_WAIT = 60
+DEFAULT_TRACE_BATCH_WAIT = 300
 PARALLEL_TRACES_KEY = 'parallel_traces'  # catchall key PARALLEL_TRACES=<n> (matched case-insensitively)
 WAIT_INTERVAL = 1.0  # seconds between graceful stop checks while waiting for the remaining traces
 JOIN_MARGIN = 30  # extra seconds to wait for a parallel request beyond its time-out

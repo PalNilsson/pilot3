@@ -352,6 +352,20 @@ class TraceReport(dict):
             _uuid = uuidgen_t()  # 'uuidgen -t 2> /dev/null'
             self['uuid'] = _uuid.replace('-', '')
 
+    def start_file(self, start: float | None = None) -> None:
+        """Set the start time stamps for the transfer of a new file.
+
+        The copytools use one trace report for all the files of a stage-in or stage-out, so every file's
+        trace gets its own start time stamps here. ``timeStart``, ``catStart``, ``relativeStart`` and
+        ``transferStart`` are all set to the start of the transfer. ``validateStart`` is cleared; it is set
+        when the pilot verifies the file's checksum (it stays empty if the pilot does not verify it).
+
+        Args:
+            start: Start time (default: now).
+        """
+        start = time.time() if start is None else start
+        self.update(timeStart=start, catStart=start, relativeStart=start, transferStart=start, validateStart=None)
+
     def get_value(self, key: str) -> Any:
         """Return the trace report value for a given key.
 

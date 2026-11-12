@@ -151,7 +151,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
         trace_report.update(filename=fspec.lfn, guid=fspec.guid.replace('-', ''))
         trace_report.update(scope=fspec.scope, dataset=fspec.dataset)
         trace_report.update(url=fspec.turl if fspec.turl else fspec.surl)
-        trace_report.update(catStart=time())  ## is this metric still needed? LFC catalog
+        trace_report.start_file()  # every file's trace has its own start time stamps
         fspec.status_code = 0
         dst = fspec.workdir or kwargs.get('workdir') or '.'
 
@@ -198,6 +198,7 @@ def copy_in(files: list, **kwargs: dict) -> list:
         # verify checksum; compare local checksum with catalog value (fspec.checksum), use same checksum type
         destination = os.path.join(dst, fspec.lfn)
         if os.path.exists(destination):
+            trace_report.update(validateStart=time())
             state, diagnostics = verify_catalog_checksum(fspec, destination)
             if diagnostics != "" and not ignore_errors:
                 trace_report.update(clientState=state or 'STAGEIN_ATTEMPT_FAILED', stateReason=diagnostics,
@@ -337,6 +338,11 @@ def get_attempt_traces(trace_report: Any, attempts: list, rucio_failed: bool,
     STAGEIN_ATTEMPT_FAILED) and the reason, protocol and remote site of the attempt. If the transfer failed
     overall, the last failed attempt is the failure that the file's own trace reports, so it gets no extra trace.
 
+    Each attempt has its own start time stamps: the first attempt starts when the file's transfer started,
+    and every later attempt when the previous one failed (the client does not report when an attempt
+    started, but the attempts follow each other). ``validateStart`` is cleared, since a failed attempt
+    is not verified by the pilot.
+
     Args:
         trace_report: The file's trace report.
         attempts: Failed attempts (see :func:`get_attempt_snapshot` and :func:`get_upload_attempt_snapshot`).
@@ -351,11 +357,15 @@ def get_attempt_traces(trace_report: Any, attempts: list, rucio_failed: bool,
         snapshots = snapshots[:-1]
 
     traces = []
+    start = trace_report.get('transferStart')
     for snapshot in snapshots:
         trace = TraceReport(trace_report, ipv=getattr(trace_report, 'ipv', 'IPv6'),
                             workdir=getattr(trace_report, 'workdir', ''))
+        if start is not None:  # always set by the copytool, but never use the current time instead
+            trace.start_file(start)
         trace.update(clientState=state, stateReason=snapshot.get('stateReason'),
-                     timeEnd=snapshot.get('timeEnd'))
+                     timeEnd=snapshot.get('timeEnd'), validateStart=None)
+        start = snapshot.get('timeEnd') or start  # the next attempt starts when this one failed
         for key in ('protocol', 'remoteSite'):
             if snapshot.get(key):
                 trace[key] = snapshot[key]
@@ -623,7 +633,8 @@ def copy_out(files: list, **kwargs: dict) -> list:  # noqa: C901
         localsite = localsite if localsite else fspec.ddmendpoint
         trace_report.update(localSite=localsite, remoteSite=fspec.ddmendpoint)
         trace_report.update(scope=fspec.scope, dataset=fspec.dataset, url=fspec.surl, filesize=fspec.filesize)
-        trace_report.update(catStart=time(), filename=fspec.lfn, guid=fspec.guid.replace('-', ''))
+        trace_report.update(filename=fspec.lfn, guid=fspec.guid.replace('-', ''))
+        trace_report.start_file()  # every file's trace has its own start time stamps
         fspec.status_code = 0
 
         summary_file_path = None
@@ -701,6 +712,7 @@ def copy_out(files: list, **kwargs: dict) -> list:  # noqa: C901
         # continue
         # resolve final pfn (turl) from the summary JSON
         if summary and dat:
+            trace_report.update(validateStart=time())
             checksum = dat.get(config.File.checksum_type)
             local_checksum = fspec.checksum.get(config.File.checksum_type)
             if local_checksum and checksum and local_checksum != checksum:

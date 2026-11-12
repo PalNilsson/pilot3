@@ -16,7 +16,7 @@ What differs between the two alternatives is **when** the worker sends the trace
 
 ---
 
-## Alternative 1: hold traces (default, `trace_batch_wait: 60`)
+## Alternative 1: hold traces (default, `trace_batch_wait: 300`)
 
 A trace is held for at most `trace_batch_wait` seconds so that more traces can join it. The waiting traces are sent when the first of these happens:
 
@@ -61,20 +61,17 @@ Copy-to-scratch jobs whose copytool downloads one file at a time get **one reque
 
 ## Examples from production jobs
 
-Both jobs ran on MWT2_TEST with a pilot that sends at once (alternative 2).
+All three jobs ran on MWT2_TEST. The first two ran with a pilot that sends at once (alternative 2), the third with a pilot that holds traces for 300 s (alternative 1).
 
-| Job | Traces | Requests sent | Requests with holding (60 s) |
+| Job | Traces | Requests, sent at once | Requests, held for 300 s |
 |---|---|---|---|
-| 7381062698 (pile-up, 11 input files) | 11 stage-in + 2 stage-out | 13 | 2 |
-| 7386436637 (pile-up reco, 10 input files) | 10 stage-in + 2 stage-out | 12 | 3 |
+| 7381062698 (pile-up, 11 input files) | 11 stage-in + 2 stage-out | 13 (measured) | 2 (worked out) |
+| 7386436637 (pile-up reco, 10 input files) | 10 stage-in + 2 stage-out | 12 (measured) | 2 (worked out) |
+| 7389762158 (pile-up reco, 10 input files) | 10 stage-in + 3 stage-out | — | 2 (measured) |
 
-The sent requests are measured. The requests with holding are worked out from the times the traces were queued:
+The worked-out numbers come from the times the traces were queued. In job 7389762158, stage-in took 84 s, so its 10 stage-in traces were sent in one request 300 s after the first one, and the 3 stage-out traces in one request at the end of the job.
 
-- **Job 7381062698:** the 11 stage-in traces were queued between 21:35:52 and 21:36:30, within one hold time. They go in one request 60 s after the first one, and the 2 stage-out traces go in one request at the end of the job.
-- **Job 7386436637:** the stage-in traces were queued 3 to 10 s apart, from 00:17:42 to 00:18:44.
-  - The first 9 go in one request at 00:18:42.
-  - The 10th was queued after that request and is held for another 60 s, then sent alone.
-  - The 2 stage-out traces (12:02:04 and 12:02:22) are sent together when the job's traces are finished at 12:02:27.
+A hold time shorter than stage-in splits the stage-in traces. With the earlier test value of 60 s, job 7388118915 sent its 2 stage-in traces in 2 requests: downloading and checksumming its second, 22.6 GB, input file took 81 s.
 
 ---
 
@@ -84,7 +81,7 @@ All settings are in the `[Rucio]` section of `pilot/util/default.cfg`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `trace_batch_wait` | 60 | Maximum time (s) a trace is held for more traces; 0 sends at once (alternative 2). A negative or non-numeric value gives the default |
+| `trace_batch_wait` | 300 | Maximum time (s) a trace is held for more traces; 0 sends at once (alternative 2). A negative or non-numeric value gives the default |
 | `trace_batch_size` | 100 | Maximum number of traces per request |
 | `trace_max_parallel` | 2 | Cap for `PARALLEL_TRACES` |
 | `trace_timeout` | 30 | Request time-out (s) |
@@ -106,23 +103,36 @@ There is no per-queue switch for `trace_batch_wait`. Per queue, only the number 
 When the sender is created, the log says which alternative is used:
 
 ```
-created background trace sender for job 7386436637 (1 trace request(s) at a time, traces held for at most 60 s)
-created background trace sender for job 7386436637 (1 trace request(s) at a time, traces sent at once)
+created background trace sender for job 7389762158 (1 trace request(s) at a time, traces held for at most 300 s)
+created background trace sender for job 7389762158 (1 trace request(s) at a time, traces sent at once)
 ```
 
 With holding, each round of requests is logged with its reason:
 
 ```
-queued 1 trace(s) for sending in the background (1 waiting, job …)
-queued 1 trace(s) for sending in the background (2 waiting, job …)
+queued 1 trace(s) for sending in the background (1 waiting, job 7389762158)
+queued 1 trace(s) for sending in the background (2 waiting, job 7389762158)
 …
-sending 9 trace(s) in 1 request(s) (held for 60 s)
-sending 2 trace(s) in 1 request(s) (end of job)
+sending 10 trace(s) in 1 request(s) (held for 300 s)
+…
+sending 3 trace(s) in 1 request(s) (end of job)
 ```
 
 The trace report at the end of the job shows the result. Bulk sending happened when there are fewer requests than sent traces:
 
 ```
-*** rucio traces of job …: sent=12, failed=0, abandoned=0, invalid=0, time=… s
-*** requests: 3 (up to 1 at a time, not degraded), time sending: … s, final wait: … s
+*** rucio traces of job 7389762158: sent=13, failed=0, abandoned=0, invalid=0, time=… s
+*** requests: 2 (up to 1 at a time, not degraded), time sending: … s, final wait: … s
 ```
+
+---
+
+## Time stamps of a trace
+
+Every trace carries the time stamps of its own file, or of its own failed transfer attempt (`TraceReport.start_file()`, called by the copytools at the start of every file):
+
+- `timeStart`, `catStart`, `relativeStart` and `transferStart`: the start of the file's transfer. For a failed attempt inside the Rucio client or a failed stage-out attempt, the start of that attempt, i.e. the time the previous attempt failed.
+- `validateStart`: the start of the pilot's checksum verification of the file. Empty (null) where the pilot does not verify the checksum itself (gfal, lsm stage-out, the Rucio copytool without an upload summary) and for failed attempts.
+- `timeEnd`: the end of the transfer, including the checksum verification.
+
+Older pilot versions set `timeStart`, `relativeStart`, `transferStart` and `validateStart` once per stage-in or stage-out. In job 7389762158, the last of 10 input files therefore had `timeEnd - transferStart` = 91.0 s, while its own download and checksum verification took 12.9 s.

@@ -261,7 +261,7 @@ class TestTraceSetting(unittest.TestCase):
         with patch.object(config.Rucio, 'trace_batch_wait', 0):
             self.assertEqual(TraceSettings.from_config().batch_wait, 0)
         with patch.object(config.Rucio, 'trace_batch_wait', 'abc'):
-            self.assertEqual(TraceSettings.from_config().batch_wait, 60)
+            self.assertEqual(TraceSettings.from_config().batch_wait, 300)
         with patch.object(config.Rucio, 'trace_batch_wait', 15):
             self.assertEqual(TraceSettings.from_config().batch_wait, 15)
 
@@ -269,7 +269,7 @@ class TestTraceSetting(unittest.TestCase):
         """The values in default.cfg."""
         settings = TraceSettings.from_config()
         self.assertEqual((settings.batch_size, settings.max_parallel, settings.timeout, settings.slow_threshold,
-                          settings.final_wait, settings.batch_wait), (100, 2, 30, 20, 600, 60))
+                          settings.final_wait, settings.batch_wait), (100, 2, 30, 20, 600, 300))
 
 
 class TestPrepare(unittest.TestCase):
@@ -799,7 +799,7 @@ class TestHeldTraces(_StubServerTestCase):
         job.infosys.queuedata.catchall = ''
         with self.assertLogs('pilot.util.tracesender', level='INFO') as logs:
             get_or_create_sender(job)
-        self.assertIn('traces held for at most 60 s', '\n'.join(logs.output))
+        self.assertIn('traces held for at most 300 s', '\n'.join(logs.output))
         job.jobid = '12'
         with patch.object(config.Rucio, 'trace_batch_wait', 0), self.assertLogs('pilot.util.tracesender', level='INFO') as logs:
             get_or_create_sender(job)
