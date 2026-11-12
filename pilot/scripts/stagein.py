@@ -17,7 +17,7 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2020-24
+# - Paul Nilsson, paul.nilsson@cern.ch, 2020-26
 
 """This script is executed by the pilot in a container to perform stage-in of input files."""
 

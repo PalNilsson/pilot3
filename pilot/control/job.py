@@ -177,6 +177,7 @@ from pilot.util.tokenlifetime import (
 )
 from pilot.util.tracesender import (
     finish_traces,
+    get_trace_snapshot,
     remove_sender,
 )
 from pilot.util.workernode import (
@@ -4151,6 +4152,7 @@ def _update_server(job: Any, args: Any) -> None:
     # the rucio traces sent in the background must be done before the final update, since the job metrics are built
     # there (this is done before the timing measurement, so that the final update timing is not inflated by the wait)
     finish_traces(job, args)
+    trace_snapshot = get_trace_snapshot(job.jobid)  # for the telemetry (the sender is removed below)
 
     add_to_pilot_timing(job.jobid, PILOT_PRE_FINAL_UPDATE, time.time(), args)
     if job.fileinfo:
@@ -4164,7 +4166,7 @@ def _update_server(job: Any, args: Any) -> None:
     # job.completed was False on entry (see above), so it being set now means that this call was the accepted final
     # update. Since update_server() holds FINAL_UPDATE_LOCK, no other thread can have passed the same check, and the
     # telemetry is therefore sent at most once per job
-    handle_pilot_telemetry(job, args, accepted)
+    handle_pilot_telemetry(job, args, accepted, trace_snapshot=trace_snapshot)
 
 
 def pause_queue_monitor(delay: int) -> None:

@@ -228,10 +228,10 @@ class TestRucioCopytoolEndToEnd(unittest.TestCase):
             os.environ['RUCIO_LOGGING_FORMAT'] = self._env
 
     @staticmethod
-    def _incident_upload(*args):
+    def _incident_upload(*args, **_kwargs):
         """Behave like _stage_out_api() in the incident: rucio trace filled in, then PilotException.
 
-        Same positional arguments as _stage_out_api(); the fourth is the trace_report_out list.
+        Same arguments as _stage_out_api(); the fourth positional one is the trace_report_out list.
         """
         trace_report_out = args[3]
         trace_report_out.append({'clientState': 'FAILED', 'stateReason': INCIDENT_STATE_REASON, 'protocol': 'root'})

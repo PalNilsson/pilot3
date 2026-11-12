@@ -178,14 +178,14 @@ class TestJob7378803325(unittest.TestCase):
         """The second thread waits, finds the job completed, and sends nothing."""
         job, args, send_state, send = self._race(accepted=True)
         self.assertEqual(send_state.call_count, 1)
-        send.assert_called_once_with(job, args)
+        send.assert_called_once_with(job, args, trace_snapshot=None)
         self.assertTrue(job.completed)
 
     def test_second_thread_retries_when_first_update_was_rejected(self):
         """If the first final update was not accepted, the second thread still sends it (and the telemetry)."""
         job, args, send_state, send = self._race(accepted=False)
         self.assertEqual(send_state.call_count, 2)
-        send.assert_called_once_with(job, args)
+        send.assert_called_once_with(job, args, trace_snapshot=None)
         self.assertTrue(job.completed)
 
     def test_lock_released_after_exception(self):
@@ -220,7 +220,7 @@ class TestJob7378803325(unittest.TestCase):
                 patch.object(telemetry, 'send_pilot_telemetry') as send, \
                 patch.object(job_module.logger, 'info') as info:
             job_module.update_server(job, args)
-        send.assert_called_once_with(job, args)
+        send.assert_called_once_with(job, args, trace_snapshot=None)
         self.assertFalse(any('another thread' in str(call.args[0]) for call in info.call_args_list if call.args))
 
 

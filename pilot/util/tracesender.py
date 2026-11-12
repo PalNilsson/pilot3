@@ -76,7 +76,10 @@ import logging
 import threading
 import time
 
-from collections import deque
+from collections import (
+    Counter,
+    deque
+)
 from collections.abc import Iterable
 from dataclasses import (
     dataclass,
@@ -192,6 +195,24 @@ class TraceSummary:
 
 
 @dataclass(frozen=True)
+class TraceSnapshot:
+    """Final state of the trace sender of a job, for the pilot telemetry (see :func:`get_trace_snapshot`).
+
+    Attributes:
+        summary: Final counts.
+        stats: Request statistics.
+        records: One record per trace, in the order the traces were queued.
+        request_errors: Number of failed requests per error code (HTTP status code, or
+            :data:`~pilot.util.tracereport.GENERIC_TRACE_ERROR` if the reply had none).
+    """
+
+    summary: TraceSummary
+    stats: TraceStats
+    records: tuple[TraceRecord, ...]
+    request_errors: dict[int, int]
+
+
+@dataclass(frozen=True)
 class BatchResult:
     """Outcome of one trace request.
 
@@ -265,6 +286,7 @@ class TraceSender:  # pylint: disable=too-many-instance-attributes  # queue, hol
         self._thread: threading.Thread | None = None
         self._state = RUNNING
         self._summary = TraceSummary()  # summary.degraded is also the live degraded flag
+        self._request_errors: Counter = Counter()  # number of failed requests per error code
         self._hold_start = 0.0  # when the oldest waiting trace was queued (set when a trace is added to an empty queue)
         self._flushing = False  # set by finish(): send the waiting traces at once
 
@@ -304,6 +326,18 @@ class TraceSender:  # pylint: disable=too-many-instance-attributes  # queue, hol
         """
         with self._cond:
             return replace(self._summary)
+
+    def snapshot(self) -> TraceSnapshot:
+        """Return a copy of the counts, request statistics, trace records and request errors.
+
+        Returns:
+            The snapshot.
+        """
+        with self._cond:
+            return TraceSnapshot(summary=replace(self._summary),
+                                 stats=replace(self._stats),
+                                 records=tuple(replace(record) for record in self._records),
+                                 request_errors=dict(self._request_errors))
 
     def enqueue(self, traces: Iterable[dict[str, Any]]) -> int:
         """Prepare traces and queue them for sending.
@@ -629,6 +663,7 @@ class TraceSender:  # pylint: disable=too-many-instance-attributes  # queue, hol
                 self._summary.failed += result.size
                 logger.warning(f'failed to send {result.size} trace(s): {result.reply}')
                 code = get_trace_error_code(result.reply)
+                self._request_errors[code] += 1
                 store_trace_error(self.workdir, code)
                 outcome = f'{FAILED} (HTTP {code})' if code >= 100 else FAILED
                 self._degrade('a trace request failed')
@@ -721,6 +756,24 @@ def finish_traces(job: Any, args: Any = None) -> TraceSummary | None:
         return None
 
     return sender.finish(getattr(args, 'graceful_stop', None))
+
+
+def get_trace_snapshot(job_id: Any) -> TraceSnapshot | None:
+    """Return the final state of the trace sender of a job, for the pilot telemetry.
+
+    Must be called after :func:`finish_traces` and before :func:`remove_sender`.
+
+    Args:
+        job_id: PanDA job id.
+
+    Returns:
+        The snapshot, or None if the job has no finished trace sender.
+    """
+    sender = get_sender(job_id)
+    if sender is None or not sender.finished:
+        return None
+
+    return sender.snapshot()
 
 
 def get_lost_traces(job_id: Any) -> int:
