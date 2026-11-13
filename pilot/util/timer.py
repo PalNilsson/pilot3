@@ -32,6 +32,7 @@ Timer stops execution of wrapped function if it reaches the limit of provided ti
 from __future__ import print_function  # Python 2 (2to3 complains about this)
 
 import os
+import pickle
 import signal
 import sys
 
@@ -79,7 +80,7 @@ class TimedThread:
         """
         try:
             ret = (True, func(*args, **kwargs))
-        except Exception:  # pylint: disable=broad-exception-caught  # any error must reach the caller of run()
+        except Exception:  # any failure is the caller's to see, never a time-out
             ret = (False, sys.exc_info())
 
         self.result = ret
@@ -120,17 +121,14 @@ class TimedThread:
             self.is_timeout = True
             raise TimeoutException("Timeout reached", timeout=_timeout)
 
-        if not self.result:
-            # only reachable if the thread ended without storing a result (e.g. SystemExit in func)
+        if self.result:
+            ret = self.result
+            if ret[0]:
+                return ret[1]
+
+            raise ret[1][1].with_traceback(ret[1][2])
+        else:
             raise TimeoutException("Unknown time-out related error, see batch log for more info")
-
-        success, value = self.result
-        if success:
-            return value
-
-        # re-raise the original exception instance (type, message, error code and traceback preserved)
-        _, exc, _ = value
-        raise exc
 
 
 class TimedProcess:
@@ -172,9 +170,13 @@ class TimedProcess:
             try:
                 ret = func(*args, **kwargs)
                 queue.put((True, ret))
-            except (TypeError, ValueError, AttributeError, KeyError) as e:
+            except Exception as e:  # any failure is the caller's to see, never a time-out
                 print(f'exception occurred while executing {func}', file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
+                try:
+                    pickle.loads(pickle.dumps(e))
+                except Exception:  # the queue pickles; keep the type and message of one that cannot be
+                    e = RuntimeError(f'{type(e).__name__}: {e}')
                 queue.put((False, e))
 
         # do not put this import at the top since it can possibly interfere with some modules (esp. Google Cloud Logging modules)
