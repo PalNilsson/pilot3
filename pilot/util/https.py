@@ -2525,11 +2525,16 @@ def download_file(url: str, timeout: int = 20, headers: dict = None) -> str:
     req = urllib.request.Request(url, headers=headers)
 
     # download the file
+    # note: urlopen() wraps connection-phase failures in URLError, but failures while reading the
+    # response body are raised unwrapped: a socket read time-out raises TimeoutError (socket.timeout
+    # on Python < 3.10), a dropped connection raises ConnectionResetError, and a short body raises
+    # http.client.IncompleteRead. OSError covers URLError, ssl.SSLError and all socket-level errors,
+    # and HTTPException covers the http.client protocol errors (incl. RemoteDisconnected)
     try:
         with urllib.request.urlopen(req, context=ctx.ssl_context, timeout=timeout) as response:
             content = response.read()
-    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as exc:
-        logger.warning(f"error occurred with urlopen: {getattr(exc, 'reason', exc)}")
+    except (OSError, http_client.HTTPException) as exc:
+        logger.warning(f"error occurred with urlopen ({type(exc).__name__}): {getattr(exc, 'reason', exc)}")
         # Handle the error, set content to None or handle as needed
         content = ""
 
