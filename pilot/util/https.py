@@ -2462,7 +2462,7 @@ def request3(url: str, data: dict = None) -> str:
     return ret
 
 
-def upload_file(url: str, path: str) -> bool:
+def upload_file(url: str, path: str, timeout: float = 20) -> bool:
     """Upload the contents of a local file to *url* via HTTP POST.
 
     Reads the file as raw bytes and sends it with ``Content-Type:
@@ -2472,6 +2472,8 @@ def upload_file(url: str, path: str) -> bool:
     Args:
         url: Destination URL for the POST request.
         path: Local filesystem path of the file to upload.
+        timeout: Socket timeout in seconds, applied to the connection and to
+            each later send/receive on it (default 20).
 
     Returns:
         ``True`` if the server responded with ``'ok'``, ``False`` otherwise.
@@ -2489,20 +2491,19 @@ def upload_file(url: str, path: str) -> bool:
     # Define request object
     req = urllib.request.Request(url, data=file_content, headers=headers, method='POST')
 
-    # Set timeouts
-    req.timeout = 20
-    req.socket_timeout = 120
-
     # Perform the request
+    # note: the timeout must be passed to urlopen() - attributes set on the Request object (e.g. req.timeout)
+    # are ignored. OSError covers URLError (incl. HTTPError), ssl.SSLError, TimeoutError/socket.timeout and
+    # connection resets, and HTTPException covers the http.client protocol errors (incl. RemoteDisconnected)
     ret = 'notok'
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             response_data = response.read()
             # Handle response
-            ret = response_data.decode('utf-8')
-    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as e:
+            ret = response_data.decode('utf-8', errors='replace')
+    except (OSError, http_client.HTTPException) as e:
         # Handle URL errors
-        logger.warning(f"exception caught in urlopen: {e}")
+        logger.warning(f"exception caught in urlopen ({type(e).__name__}): {e}")
         ret = str(e)
 
     if ret == 'ok':

@@ -174,7 +174,8 @@ def download_transform(url: str, transform_name: str, workdir: str) -> tuple[boo
     path = os.path.join(workdir, transform_name)
     ip_version = os.environ.get('PILOT_IP_VERSION', 'IPv6')
     command = 'curl' if ip_version == 'IPv6' else 'curl -4'
-    cmd = f'{command} -sS \"{url}\" > {path}'
+    # -f: fail (exit 22, no output) on HTTP errors, rather than saving the server's error page as the transform
+    cmd = f'{command} -sSf \"{url}\" > {path}'
     trial = 1
     max_trials = 3
 

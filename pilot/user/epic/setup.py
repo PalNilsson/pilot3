@@ -173,7 +173,8 @@ def download_transform(url: str, transform_name: str, workdir: str) -> tuple[boo
     status = False
     diagnostics = ""
     path = os.path.join(workdir, transform_name)
-    cmd = f'curl -sS "{url}" > {path}'
+    # -f: fail (exit 22, no output) on HTTP errors, rather than saving the server's error page as the transform
+    cmd = f'curl -sSf "{url}" > {path}'
     trial = 1
     max_trials = 3
 

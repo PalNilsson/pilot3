@@ -32,6 +32,9 @@ The same review found that ``download_transform()`` created the transform file b
 whether any data had arrived (an empty file was left behind after a failed download, and the
 curl-based plugins left whatever the shell redirection produced), and that
 ``get_urlopen_output()`` had neither a socket timeout nor handling for unwrapped socket errors.
+The curl-based plugins ran curl without ``-f``, so an HTTP error page was saved as the transform and
+reported as a successful download, and ``upload_file()`` set its time-outs as attributes on the
+request object, which ``urlopen()`` ignores.
 """
 
 from __future__ import annotations
@@ -42,8 +45,10 @@ import shutil
 import socket
 import ssl
 import tempfile
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
@@ -367,6 +372,152 @@ class TestGetUrlopenOutput(unittest.TestCase):
         exc = urllib.error.HTTPError(TRF_URL, 503, "Service Unavailable", {}, body)
         (exitcode, output), _ = self._open(side_effect=exc)
         self.assertEqual((exitcode, output), (-1, ""))
+
+
+class TrfHandler(BaseHTTPRequestHandler):
+    """Serve the transform at /trf/ok, and 404 for anything else."""
+
+    def do_GET(self):  # pylint: disable=invalid-name
+        """Answer a GET request."""
+        if self.path.endswith("/ok"):
+            body, code = b"#!/bin/bash\n", 200
+        else:
+            body, code = b"<html><body>404 Not Found</body></html>", 404
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002
+        """Silence the request log."""
+
+
+@unittest.skipIf(shutil.which("curl") is None, "curl is not available")
+class TestCurlHttpError(unittest.TestCase):
+    """With real curl against a local server: an HTTP error must fail the download, not save the error page."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Start a local HTTP server."""
+        cls.server = HTTPServer(("127.0.0.1", 0), TrfHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}/trf"
+
+    @classmethod
+    def tearDownClass(cls):
+        """Stop the local HTTP server."""
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        """Create a work directory and use IPv4 curl in the rubin plugin (the server listens on 127.0.0.1)."""
+        self.workdir = tempfile.mkdtemp()
+        self._harvester = os.environ.pop("HARVESTER_WORKDIR", None)
+        self._ip_version = os.environ.get("PILOT_IP_VERSION")
+        os.environ["PILOT_IP_VERSION"] = "IPv4"
+
+    def tearDown(self):
+        """Remove the work directory and restore the environment."""
+        shutil.rmtree(self.workdir, ignore_errors=True)
+        if self._harvester is not None:
+            os.environ["HARVESTER_WORKDIR"] = self._harvester
+        if self._ip_version is None:
+            os.environ.pop("PILOT_IP_VERSION", None)
+        else:
+            os.environ["PILOT_IP_VERSION"] = self._ip_version
+
+    def test_http_404_fails_the_download(self):
+        """A 404 makes curl exit 22; no error page is left behind as the transform."""
+        for module in CURL_PLUGINS:
+            with self.subTest(plugin=module.__name__):
+                with patch.object(module, "sleep") as mock_sleep:
+                    status, diagnostics = module.download_transform(f"{self.base}/missing", TRF_NAME, self.workdir)
+
+                self.assertFalse(status)
+                self.assertIn("curl command failed: 22", diagnostics)
+                self.assertEqual(mock_sleep.call_count, 2)  # three trials
+                self.assertFalse(os.path.exists(os.path.join(self.workdir, TRF_NAME)))
+
+    def test_http_200_saves_the_transform(self):
+        """A successful download saves the transform unchanged."""
+        for module in CURL_PLUGINS:
+            with self.subTest(plugin=module.__name__):
+                with patch.object(module, "sleep"):
+                    status, _ = module.download_transform(f"{self.base}/ok", TRF_NAME, self.workdir)
+
+                path = os.path.join(self.workdir, TRF_NAME)
+                self.assertTrue(status)
+                with open(path, "rb") as _file:
+                    self.assertEqual(_file.read(), b"#!/bin/bash\n")
+                os.remove(path)
+
+
+class TestUploadFile(unittest.TestCase):
+    """upload_file() must apply its timeout and never raise on a transport failure."""
+
+    def setUp(self):
+        """Create a JSON file to upload."""
+        handle, self.path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(handle, "wb") as _file:
+            _file.write(b'{"maxRSS": 1}')
+
+    def tearDown(self):
+        """Remove the JSON file."""
+        os.remove(self.path)
+
+    def _upload(self, read_side_effect: BaseException | None = None, data: bytes = b"ok",
+                urlopen_side_effect: BaseException | None = None, **kwargs):
+        """Call upload_file() with a patched urlopen().
+
+        Args:
+            read_side_effect: exception raised while reading the response.
+            data: response body.
+            urlopen_side_effect: exception raised by urlopen() itself.
+            **kwargs: extra arguments for upload_file().
+
+        Returns:
+            tuple: (upload_file() result, the urlopen mock).
+        """
+        if urlopen_side_effect is not None:
+            mock_urlopen = MagicMock(side_effect=urlopen_side_effect)
+        else:
+            mock_urlopen = MagicMock(return_value=make_response(read_side_effect, data=data))
+        with patch.object(https.urllib.request, "urlopen", mock_urlopen):
+            status = https.upload_file("https://pilot.atlas-ml.org", self.path, **kwargs)
+        return status, mock_urlopen
+
+    def test_success_and_timeout(self):
+        """An 'ok' response succeeds, and the timeout is passed to urlopen() (it was ignored before)."""
+        status, mock_urlopen = self._upload()
+        self.assertTrue(status)
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 20)
+        self.assertEqual(mock_urlopen.call_args.args[0].data, b'{"maxRSS": 1}')
+
+    def test_explicit_timeout(self):
+        """An explicit timeout is passed through to urlopen()."""
+        _, mock_urlopen = self._upload(timeout=5)
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 5)
+
+    def test_not_ok_response(self):
+        """Any other response is a failure."""
+        self.assertFalse(self._upload(data=b"error")[0])
+
+    def test_undecodable_response(self):
+        """A non-UTF-8 response is a failure, not an exception."""
+        self.assertFalse(self._upload(data=b"\xff\xfe")[0])
+
+    def test_transport_failures_are_caught(self):
+        """Read time-outs, resets, protocol errors and HTTP errors return False instead of raising."""
+        for kwargs in ({"read_side_effect": TimeoutError("timed out")},
+                       {"read_side_effect": socket.timeout("timed out")},
+                       {"read_side_effect": ConnectionResetError(104, "reset")},
+                       {"read_side_effect": http.client.IncompleteRead(b"", 2)},
+                       {"urlopen_side_effect": http.client.RemoteDisconnected("closed")},
+                       {"urlopen_side_effect": urllib.error.HTTPError("u", 500, "err", {}, BytesIO(b""))},
+                       {"urlopen_side_effect": urllib.error.URLError("timed out")}):
+            with self.subTest(**{k: type(v).__name__ for k, v in kwargs.items()}):
+                self.assertFalse(self._upload(**kwargs)[0])
 
 
 if __name__ == "__main__":
