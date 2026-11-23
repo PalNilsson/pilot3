@@ -17,7 +17,7 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-26
 
 """Job setup and environment preparation for the Rubin experiment plugin."""
 
@@ -40,6 +40,7 @@ from pilot.util.container import execute
 from pilot.util.filehandling import (
     copy,
     head,
+    remove,
 )
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,11 @@ def download_transform(url: str, transform_name: str, workdir: str) -> tuple[boo
             status = True
             break
         trial += 1
+
+    # never leave a partial or empty transform behind after a failed download (the shell
+    # redirection creates the file even when curl fails)
+    if not status and os.path.exists(path):
+        remove(path)
 
     return status, diagnostics
 

@@ -657,12 +657,18 @@ def execute_urllib(url: str, data: dict, plain: bool, secure: bool) -> urllib.re
     return req
 
 
-def get_urlopen_output(req: urllib.request.Request, context: ssl.SSLContext) -> tuple[int, str]:
+def get_urlopen_output(req: urllib.request.Request, context: ssl.SSLContext, timeout: float | None = None) -> tuple[int, Any]:
     """Open *req* with :func:`~urllib.request.urlopen` and return the response.
+
+    The caller owns the returned response object: it must read and close it, and
+    must be prepared for the read to fail (e.g. ``TimeoutError``), since only the
+    connection phase and the response headers are handled here.
 
     Args:
         req: Prepared :class:`urllib.request.Request` to send.
         context: SSL context to use, or ``None`` for no TLS verification.
+        timeout: Socket timeout in seconds for the connection and for each later
+            read on the response; defaults to ``config.Pilot.http_maxtime``.
 
     Returns:
         A two-element tuple ``(exitcode, output)`` where *exitcode* is ``0``
@@ -671,13 +677,22 @@ def get_urlopen_output(req: urllib.request.Request, context: ssl.SSLContext) -> 
     """
     exitcode = -1
     output = ""
+    if timeout is None:
+        timeout = int(config.Pilot.http_maxtime)
     logger.debug('ok about to open url')
+    # note: HTTPError must be caught first since it is a subclass of URLError (and so of OSError).
+    # OSError covers URLError, ssl.SSLError, TimeoutError/socket.timeout and connection resets,
+    # and HTTPException covers the http.client protocol errors (incl. RemoteDisconnected)
     try:
-        output = urllib.request.urlopen(req, context=context)  # pylint: disable=consider-using-with
+        output = urllib.request.urlopen(req, context=context, timeout=timeout)  # pylint: disable=consider-using-with
     except urllib.error.HTTPError as exc:
-        logger.warning(f'server error ({exc.code}): {exc.read()}')
-    except (urllib.error.URLError, http_client.RemoteDisconnected, ssl.SSLError) as exc:
-        logger.warning(f'connection error: {getattr(exc, "reason", exc)}')
+        try:
+            body = exc.read()
+        except (OSError, http_client.HTTPException) as read_exc:
+            body = f'(could not read error body: {read_exc})'
+        logger.warning(f'server error ({exc.code}): {body}')
+    except (OSError, http_client.HTTPException) as exc:
+        logger.warning(f'connection error ({type(exc).__name__}): {getattr(exc, "reason", exc)}')
     else:
         exitcode = 0
     logger.debug(f'ok url opened: exitcode={exitcode}')

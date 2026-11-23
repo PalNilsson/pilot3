@@ -17,7 +17,7 @@
 # under the License.
 #
 # Authors:
-# - Paul Nilsson, paul.nilsson@cern.ch, 2017-25
+# - Paul Nilsson, paul.nilsson@cern.ch, 2017-26
 
 """Job setup and environment preparation for the generic experiment plugin."""
 
@@ -43,6 +43,7 @@ from pilot.util.auxiliary import find_pattern_in_list
 from pilot.util.filehandling import (
     copy,
     head,
+    remove,
 )
 from pilot.util.https import download_file
 
@@ -194,12 +195,12 @@ def download_transform(url: str, transform_name: str, workdir: str) -> tuple[boo
         logger.info(f"downloading file {transform_name} [trial {trial}/{max_trials}]")
 
         content = download_file(url)
-        with open(path, "wb+") as _file:  # note: binary mode, so no encoding is needed (or, encoding=None)
-            if content:
-                _file.write(content)
-                logger.info(f'saved data from \"{url}\" resource into file {path}, '
-                            f'length={len(content) / 1024.:.1f} kB')
-                status = True
+        if content:
+            # only create the file once there is data to write, so that a failed download never
+            # leaves an empty transform behind in the work directory
+            status, diagnostics = save_transform(path, content, url)
+            if not status:
+                break  # a local write failure (e.g. disk full) will not be cured by downloading again
 
         if not status:
             # Analyze exit code / output
@@ -217,6 +218,34 @@ def download_transform(url: str, transform_name: str, workdir: str) -> tuple[boo
         trial += 1
 
     return status, diagnostics
+
+
+def save_transform(path: str, content: bytes, url: str) -> tuple[bool, str]:
+    """Write the downloaded transform to file.
+
+    A partially written file is removed, so that a failed write never leaves a truncated
+    transform behind in the work directory.
+
+    Args:
+        path: path of the transform file.
+        content: downloaded transform.
+        url: download URL (for logging).
+
+    Returns:
+        tuple[bool, str]: status, diagnostics.
+    """
+    try:
+        with open(path, "wb") as _file:  # note: binary mode, so no encoding is needed (or, encoding=None)
+            _file.write(content)
+    except OSError as error:
+        diagnostics = f'failed to write transform to {path}: {error}'
+        logger.warning(diagnostics)
+        if os.path.exists(path):
+            remove(path)
+        return False, diagnostics
+
+    logger.info(f'saved data from \"{url}\" resource into file {path}, length={len(content) / 1024.:.1f} kB')
+    return True, ""
 
 
 def get_end_setup_time(path: str, pattern: str = r'(\d{2}\:\d{2}\:\d{2}\ \d{4}\/\d{2}\/\d{2})') -> float:
